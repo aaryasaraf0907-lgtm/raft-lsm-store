@@ -12,4 +12,5 @@ FetchContent_MakeAvailable(googletest)
 
 enable_testing()
 add_subdirectory(src/storage)
+add_subdirectory(src/raft)
 add_subdirectory(tests)
