@@ -1,5 +1,6 @@
 #include "raft/raft_node.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace raftkv {
@@ -11,7 +12,7 @@ RaftNodeImpl::RaftNodeImpl(NodeId id, std::vector<NodeId> peers, Transport* tran
       transport_(transport),
       cfg_(cfg),
       rng_(cfg.random_seed + id) {
-  log_.push_back(LogEntry{0, 0, Command{CommandType::kPut, "", ""}});  // dummy entry at index 0
+  log_.push_back(LogEntry{0, 0, Command{CommandType::kNoop, "", ""}});  // dummy entry at index 0
 }
 
 RaftNodeImpl::~RaftNodeImpl() { Stop(); }
@@ -25,27 +26,37 @@ void RaftNodeImpl::Start() {
     ResetElectionDeadlineLocked();
   }
   ticker_ = std::thread(&RaftNodeImpl::TickerLoop, this);
+  applier_ = std::thread(&RaftNodeImpl::ApplierLoop, this);
 }
 
 void RaftNodeImpl::Stop() {
   if (!running_.exchange(false)) return;
+  {
+    std::lock_guard<std::mutex> lk(mu_);  // makes sure no waiter misses the wake-up below
+  }
   cv_.notify_all();
+  apply_cv_.notify_all();
   if (ticker_.joinable()) ticker_.join();
+  if (applier_.joinable()) applier_.join();
   transport_->Stop();
 }
 
 ProposeResponse RaftNodeImpl::Propose(const Command& cmd) {
   std::lock_guard<std::mutex> lk(mu_);
   if (role_ != Role::kLeader) return {ProposeResult::kNotLeader, 0, leader_hint_};
-  // Appends locally only for now. Replication and commit come in the next PR.
   LogIndex index = LastLogIndexLocked() + 1;
   log_.push_back(LogEntry{current_term_, index, cmd});
+  AdvanceCommitIndexLocked();       // a single-node cluster commits immediately
+  BroadcastAppendEntriesLocked();   // replicate now instead of waiting for the next heartbeat
   return {ProposeResult::kAccepted, index, id_};
 }
 
 void RaftNodeImpl::SetApplyCallback(ApplyCallback cb) {
-  std::lock_guard<std::mutex> lk(mu_);
-  apply_cb_ = std::move(cb);
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    apply_cb_ = std::move(cb);
+  }
+  apply_cv_.notify_all();
 }
 
 bool RaftNodeImpl::IsLeader() const {
@@ -63,7 +74,17 @@ Role RaftNodeImpl::GetRole() const {
   return role_;
 }
 
-// ---- background timer ----
+LogIndex RaftNodeImpl::CommitIndex() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return commit_index_;
+}
+
+LogIndex RaftNodeImpl::LastApplied() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return last_applied_;
+}
+
+// ---- background threads ----
 
 void RaftNodeImpl::TickerLoop() {
   std::unique_lock<std::mutex> lk(mu_);
@@ -72,10 +93,32 @@ void RaftNodeImpl::TickerLoop() {
     if (!running_) break;
     Clock::time_point now = Clock::now();
     if (role_ == Role::kLeader) {
-      if (now >= next_heartbeat_) SendHeartbeatsLocked();
+      if (now >= next_heartbeat_) BroadcastAppendEntriesLocked();
     } else if (now >= election_deadline_) {
       StartElectionLocked();
     }
+  }
+}
+
+// Delivers committed entries to the apply callback, in order, without holding the lock.
+void RaftNodeImpl::ApplierLoop() {
+  std::unique_lock<std::mutex> lk(mu_);
+  while (running_) {
+    apply_cv_.wait(lk, [this] {
+      return !running_ || (apply_cb_ != nullptr && last_applied_ < commit_index_);
+    });
+    if (!running_) break;
+
+    std::vector<LogEntry> batch;  // committed entries are never truncated, so copying is safe
+    for (LogIndex i = last_applied_ + 1; i <= commit_index_; ++i) batch.push_back(log_[i]);
+    ApplyCallback cb = apply_cb_;
+
+    lk.unlock();
+    for (const LogEntry& e : batch) {
+      if (e.command.type != CommandType::kNoop) cb(e);
+    }
+    lk.lock();
+    last_applied_ += batch.size();
   }
 }
 
@@ -136,23 +179,89 @@ void RaftNodeImpl::OnRequestVoteReply(Term election_term, const RequestVoteReply
 void RaftNodeImpl::BecomeLeaderLocked() {
   role_ = Role::kLeader;
   leader_hint_ = id_;
-  SendHeartbeatsLocked();  // announce leadership right away
+  for (NodeId peer : peers_) {
+    next_index_[peer] = LastLogIndexLocked() + 1;  // optimistic: assume followers are caught up
+    match_index_[peer] = 0;                        // nothing is known to be replicated yet
+  }
+  // A leader may only commit entries from its OWN term by counting replicas. Appending a
+  // no-op in the new term lets entries from earlier terms commit right after an election
+  // (Raft paper, section 8) instead of waiting for the next client write.
+  log_.push_back(LogEntry{current_term_, LastLogIndexLocked() + 1,
+                          Command{CommandType::kNoop, "", ""}});
+  AdvanceCommitIndexLocked();  // a single-node cluster commits the no-op immediately
+  BroadcastAppendEntriesLocked();
 }
 
-void RaftNodeImpl::SendHeartbeatsLocked() {
+// ---- replication (leader side) ----
+
+void RaftNodeImpl::BroadcastAppendEntriesLocked() {
   next_heartbeat_ = Clock::now() + std::chrono::milliseconds(cfg_.heartbeat_interval_ms);
-  // Heartbeats carry no entries. prev_log_index/term are 0 until replication is added.
-  AppendEntriesRequest req{current_term_, id_, 0, 0, {}, commit_index_};
-  for (NodeId peer : peers_) {
-    transport_->SendAppendEntries(
-        peer, req, [this](const AppendEntriesReply& reply) { OnAppendEntriesReply(reply); });
+  for (NodeId peer : peers_) SendAppendEntriesToLocked(peer);
+}
+
+// Sends the follower everything from next_index_ onwards (empty = plain heartbeat).
+void RaftNodeImpl::SendAppendEntriesToLocked(NodeId peer) {
+  LogIndex next = next_index_[peer];
+  LogIndex prev = next - 1;  // next_index_ is never below 1
+  AppendEntriesRequest req{current_term_, id_, prev, log_[prev].term, {}, commit_index_};
+  LogIndex last = LastLogIndexLocked();
+  for (LogIndex i = next; i <= last && req.entries.size() < cfg_.max_entries_per_append; ++i) {
+    req.entries.push_back(log_[i]);
+  }
+  Term sent_term = current_term_;
+  size_t n_entries = req.entries.size();
+  transport_->SendAppendEntries(
+      peer, req,
+      [this, peer, sent_term, prev, n_entries](const AppendEntriesReply& reply) {
+        OnAppendEntriesReply(peer, sent_term, prev, n_entries, reply);
+      });
+}
+
+void RaftNodeImpl::OnAppendEntriesReply(NodeId peer, Term sent_term, LogIndex prev_index,
+                                        size_t n_entries, const AppendEntriesReply& reply) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!running_) return;
+  if (reply.term > current_term_) {  // we are a stale leader
+    BecomeFollowerLocked(reply.term);
+    return;
+  }
+  // Ignore replies to requests sent in an older term, or if we are no longer the leader.
+  if (role_ != Role::kLeader || current_term_ != sent_term) return;
+
+  if (reply.success) {
+    LogIndex matched = prev_index + n_entries;
+    if (matched > match_index_[peer]) {
+      match_index_[peer] = matched;
+      AdvanceCommitIndexLocked();
+    }
+    next_index_[peer] = std::max(next_index_[peer], match_index_[peer] + 1);
+    if (next_index_[peer] <= LastLogIndexLocked()) SendAppendEntriesToLocked(peer);  // more to send
+  } else {
+    // The follower's log does not match at prev_index: back up (using its last index as a hint
+    // to skip ahead when it is far behind) and retry straight away.
+    LogIndex backed_up = next_index_[peer] > 1 ? next_index_[peer] - 1 : 1;
+    LogIndex hinted = reply.match_index + 1;
+    next_index_[peer] = std::max<LogIndex>(std::min(backed_up, hinted), match_index_[peer] + 1);
+    SendAppendEntriesToLocked(peer);
   }
 }
 
-void RaftNodeImpl::OnAppendEntriesReply(const AppendEntriesReply& reply) {
-  std::lock_guard<std::mutex> lk(mu_);
-  if (!running_) return;
-  if (reply.term > current_term_) BecomeFollowerLocked(reply.term);  // we are a stale leader
+// Commit rule: an entry is committed once a majority stores it AND it is from the current
+// term. Entries from earlier terms become committed indirectly, when a later one does.
+void RaftNodeImpl::AdvanceCommitIndexLocked() {
+  size_t cluster_size = peers_.size() + 1;
+  for (LogIndex n = LastLogIndexLocked(); n > commit_index_; --n) {
+    if (log_[n].term != current_term_) break;  // older terms below this point cannot commit yet
+    size_t replicas = 1;                       // the leader itself
+    for (NodeId peer : peers_) {
+      if (match_index_[peer] >= n) ++replicas;
+    }
+    if (replicas > cluster_size / 2) {
+      commit_index_ = n;
+      apply_cv_.notify_all();
+      break;
+    }
+  }
 }
 
 // ---- incoming RPCs ----
@@ -190,12 +299,33 @@ AppendEntriesReply RaftNodeImpl::HandleAppendEntries(const AppendEntriesRequest&
   leader_hint_ = req.leader_id;
 
   // Consistency check: our log must contain the entry just before the new ones.
+  // On failure we report our last index so the leader can skip back quickly.
   if (req.prev_log_index > LastLogIndexLocked() ||
       log_[req.prev_log_index].term != req.prev_log_term) {
-    return AppendEntriesReply{current_term_, false, 0};
+    return AppendEntriesReply{current_term_, false, LastLogIndexLocked()};
   }
-  // Appending entries and advancing commit_index come in the next PR.
-  return AppendEntriesReply{current_term_, true, req.prev_log_index};
+
+  // Append the new entries. If an existing entry conflicts (same index, different term) it and
+  // everything after it are dropped. Entries we already have are left alone, so duplicated or
+  // reordered messages are harmless. Committed entries can never conflict.
+  LogIndex index = req.prev_log_index;
+  for (const LogEntry& entry : req.entries) {
+    ++index;
+    if (index <= LastLogIndexLocked()) {
+      if (log_[index].term == entry.term) continue;
+      log_.erase(log_.begin() + static_cast<std::ptrdiff_t>(index), log_.end());
+    }
+    log_.push_back(entry);
+  }
+
+  // Follow the leader's commit point, but never past what this message verified.
+  LogIndex last_new = req.prev_log_index + req.entries.size();
+  LogIndex new_commit = std::min(req.leader_commit, last_new);
+  if (new_commit > commit_index_) {
+    commit_index_ = new_commit;
+    apply_cv_.notify_all();
+  }
+  return AppendEntriesReply{current_term_, true, last_new};
 }
 
 LogIndex RaftNodeImpl::LastLogIndexLocked() const { return log_.back().index; }

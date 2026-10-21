@@ -7,70 +7,13 @@
 #include <thread>
 #include <vector>
 
-#include "raft/fake_transport.h"
-#include "raft/raft_node.h"
+#include "test_cluster.h"
 
 using namespace raftkv;
+using raftkv::testing_util::Cluster;
+using raftkv::testing_util::WaitFor;
 using namespace std::chrono_literals;
 
-namespace {
-
-bool WaitFor(const std::function<bool()>& pred, std::chrono::milliseconds timeout) {
-  auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (pred()) return true;
-    std::this_thread::sleep_for(10ms);
-  }
-  return pred();
-}
-
-// n nodes (ids 1..n) on one FakeNetwork.
-// Member order matters: nodes are destroyed before transports, transports before the network.
-struct Cluster {
-  FakeNetwork net;
-  std::vector<std::unique_ptr<FakeTransport>> transports;
-  std::vector<std::unique_ptr<RaftNodeImpl>> nodes;
-
-  explicit Cluster(int n) {
-    std::vector<NodeId> ids;
-    for (int i = 1; i <= n; ++i) ids.push_back(static_cast<NodeId>(i));
-    for (NodeId id : ids) {
-      std::vector<NodeId> peers;
-      for (NodeId p : ids) {
-        if (p != id) peers.push_back(p);
-      }
-      transports.push_back(net.MakeTransport(id));
-      RaftConfig cfg;
-      cfg.random_seed = 42;
-      nodes.push_back(std::make_unique<RaftNodeImpl>(id, peers, transports.back().get(), cfg));
-    }
-    for (auto& node : nodes) node->Start();
-  }
-
-  ~Cluster() {
-    for (auto& node : nodes) node->Stop();
-    net.Shutdown();
-  }
-
-  RaftNodeImpl* Node(NodeId id) { return nodes[id - 1].get(); }
-
-  int CountLeaders(const std::set<NodeId>& exclude = {}) {
-    int count = 0;
-    for (auto& node : nodes) {
-      if (exclude.count(node->Id()) == 0 && node->GetRole() == Role::kLeader) ++count;
-    }
-    return count;
-  }
-
-  NodeId FindLeader(const std::set<NodeId>& exclude = {}) {
-    for (auto& node : nodes) {
-      if (exclude.count(node->Id()) == 0 && node->GetRole() == Role::kLeader) return node->Id();
-    }
-    return 0;
-  }
-};
-
-}  // namespace
 
 TEST(RaftElection, ElectsExactlyOneLeader) {
   Cluster c(3);
