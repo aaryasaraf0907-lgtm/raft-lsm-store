@@ -9,7 +9,7 @@ using Term = uint64_t;
 using LogIndex = uint64_t;
 using NodeId = uint32_t;
 
-enum class CommandType : uint8_t { kPut, kDelete };
+enum class CommandType : uint8_t { kPut, kDelete, kNoop };
 
 struct Command {
   CommandType type;
