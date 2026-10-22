@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 #include <gtest/gtest.h>
 
@@ -71,11 +72,35 @@ TEST(ProtoConversionsTest, PreservesEmptyAppendEntriesHeartbeat) {
   EXPECT_EQ(decoded.leader_commit, heartbeat.leader_commit);
 }
 
+TEST(ProtoConversionsTest, PreservesBinaryCommandDataOnWireRoundTrip) {
+  const std::string key{"k\xff\xfe", 3};
+  const std::string value{"v\0x\0", 4};
+  const AppendEntriesRequest request{
+      1, 1, 0, 0, {{1, 1, {CommandType::kPut, key, value}}}, 1};
+
+  std::string serialized;
+  ASSERT_TRUE(ToProto(request).SerializeToString(&serialized));
+
+  proto::AppendEntriesRequest parsed;
+  ASSERT_TRUE(parsed.ParseFromString(serialized));
+  const auto decoded = FromProto(parsed);
+
+  ASSERT_EQ(decoded.entries.size(), 1);
+  EXPECT_EQ(decoded.entries[0].command.key, key);
+  EXPECT_EQ(decoded.entries[0].command.value, value);
+}
+
 TEST(ProtoConversionsTest, RejectsInvalidOrMissingCommand) {
   LogEntry invalid{1, 1, {static_cast<CommandType>(255), "", ""}};
 
   EXPECT_THROW(ToProto(AppendEntriesRequest{1, 1, 0, 0, {invalid}, 0}),
                std::invalid_argument);
+
+  proto::AppendEntriesRequest unknown_command_type;
+  unknown_command_type.add_entries()->mutable_command()->set_type(
+      static_cast<proto::CommandType>(255));
+
+  EXPECT_THROW(FromProto(unknown_command_type), std::invalid_argument);
 
   // Test missing commands through the public AppendEntries conversion.
   proto::AppendEntriesRequest missing_command;
