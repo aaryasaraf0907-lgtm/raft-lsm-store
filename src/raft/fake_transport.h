@@ -35,8 +35,9 @@ class FakeTransport : public Transport {
 // A single worker thread delivers all messages, so tests are repeatable.
 // Disconnect(id) drops every message to or from that node (a crash or partition).
 //
-// Shutdown order in tests: stop all nodes, then Shutdown() the network,
-// then destroy the nodes. (Cluster in the tests does exactly this.)
+// A node may be stopped and destroyed while the network keeps running (to simulate a crash and
+// restart): unregistering a node waits until any delivery in progress has finished, and replies
+// to a node that has since been stopped or replaced are dropped.
 class FakeNetwork {
  public:
   FakeNetwork();
@@ -58,12 +59,17 @@ class FakeNetwork {
 
   bool Reachable(NodeId a, NodeId b);
   RpcHandler* Lookup(NodeId from, NodeId to);
+  uint64_t GenerationOf(NodeId id);
+  bool SenderStillCurrent(NodeId id, uint64_t generation);
   void Post(std::function<void()> task);
   void WorkerLoop();
 
   std::mutex mu_;
   std::condition_variable cv_;
+  std::condition_variable idle_cv_;  // signalled when the worker finishes a delivery
   std::deque<std::function<void()>> queue_;
+  std::map<NodeId, uint64_t> generation_;  // bumped on every register/unregister of a node
+  bool busy_ = false;                      // worker is running a delivery
   std::map<NodeId, RpcHandler*> handlers_;
   std::set<NodeId> disconnected_;
   bool stop_ = false;

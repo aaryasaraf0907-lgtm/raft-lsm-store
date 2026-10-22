@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 #include "raft/raft_interface.h"
+#include "raft/raft_storage.h"
 #include "raft/transport.h"
 
 namespace raftkv {
@@ -22,16 +23,26 @@ struct RaftConfig {
 
 enum class Role { kFollower, kCandidate, kLeader };
 
-// Raft node: leader election, log replication, commit and in-order apply.
-// Persistence (surviving restarts) and snapshots come in later PRs.
+// Raft node: leader election, log replication, commit and in-order apply, with optional
+// persistence. Snapshots come in a later PR.
+//
+// Persistence: pass a RaftStorage and the node reloads its term, vote and log from it on
+// construction, and saves them BEFORE answering any RPC that changed them (a vote, an appended
+// or truncated log entry) and before a leader replicates a new entry. With no storage the node
+// is volatile (used by the in-memory tests). A storage failure is fatal (the node aborts):
+// carrying on without being able to remember a vote or an entry would break Raft's guarantees.
+// After a restart commit_index/last_applied start at 0 and are re-learned from the leader, so
+// the apply callback sees the committed log again; the state machine must tolerate replays
+// (Put/Delete of the same entries in the same order give the same result).
 //
 // Usage: construct, SetApplyCallback(...), then Start().
 // Node ids must be >= 1 (0 is used internally to mean "nobody").
 // Transport sends must not block (see transport.h): they are called with the node lock held.
 class RaftNodeImpl : public RaftNode, public RpcHandler {
  public:
+  // `storage` is not owned and must outlive the node. nullptr = no persistence.
   RaftNodeImpl(NodeId id, std::vector<NodeId> peers, Transport* transport,
-               RaftConfig cfg = RaftConfig());
+               RaftConfig cfg = RaftConfig(), RaftStorage* storage = nullptr);
   ~RaftNodeImpl() override;
 
   // RaftNode
@@ -62,7 +73,7 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   void TickerLoop();
   void ApplierLoop();
   void StartElectionLocked();
-  void BecomeFollowerLocked(Term term);
+  void BecomeFollowerLocked(Term term, bool persist = true);
   void BecomeLeaderLocked();
   void BroadcastAppendEntriesLocked();
   void SendAppendEntriesToLocked(NodeId peer);
@@ -74,10 +85,16 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   LogIndex LastLogIndexLocked() const;
   Term LastLogTermLocked() const;
 
+  // Persistence helpers: no-ops without storage, abort if the storage fails.
+  void PersistHardStateLocked();
+  void PersistAppendLocked(const std::vector<LogEntry>& entries);
+  void PersistTruncateLocked(LogIndex from_index);
+
   const NodeId id_;
   const std::vector<NodeId> peers_;
   Transport* transport_;
   const RaftConfig cfg_;
+  RaftStorage* storage_;
   std::mt19937 rng_;
 
   mutable std::mutex mu_;
