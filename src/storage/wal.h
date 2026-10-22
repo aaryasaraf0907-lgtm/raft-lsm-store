@@ -52,6 +52,7 @@ class WAL {
   explicit WAL(int fd) : fd_(fd) {}
   Status Append(uint8_t type, const std::string& key, const std::string& value, bool sync);
   int fd_;
+  bool failed_ = false;  // set after any failed write/fsync; the log may end in a partial record
 };
 
 }  // namespace raftkv

@@ -74,7 +74,14 @@ WAL::~WAL() {
   if (fd_ >= 0) ::close(fd_);
 }
 
-Status WAL::Sync() { return FullSync(fd_) ? Status::kOk : Status::kIOError; }
+Status WAL::Sync() {
+  if (failed_) return Status::kIOError;
+  if (!FullSync(fd_)) {  // after a failed fsync the state of the file is unknown: stop using it
+    failed_ = true;
+    return Status::kIOError;
+  }
+  return Status::kOk;
+}
 
 Status WAL::AppendPut(const std::string& key, const std::string& value, bool sync) {
   return Append(kPut, key, value, sync);
@@ -85,6 +92,7 @@ Status WAL::AppendDelete(const std::string& key, bool sync) {
 }
 
 Status WAL::Append(uint8_t type, const std::string& key, const std::string& value, bool sync) {
+  if (failed_) return Status::kIOError;  // an earlier failure may have left a partial record
   const size_t payload_len = 1 + 4 + key.size() + value.size();
   if (payload_len > kMaxPayloadBytes) return Status::kIOError;
 
@@ -102,8 +110,12 @@ Status WAL::Append(uint8_t type, const std::string& key, const std::string& valu
   record += payload;
 
   // One write() per record keeps a torn write confined to the tail.
-  if (!WriteAll(fd_, record.data(), record.size())) return Status::kIOError;
-  if (sync && !FullSync(fd_)) return Status::kIOError;
+  // If this fails midway the file ends in a partial record. Later appends would sit behind it
+  // and be thrown away by Replay even though they were reported as durable, so stop here.
+  if (!WriteAll(fd_, record.data(), record.size()) || (sync && !FullSync(fd_))) {
+    failed_ = true;
+    return Status::kIOError;
+  }
   return Status::kOk;
 }
 
@@ -138,7 +150,14 @@ Status WAL::Replay(const std::string& path, const std::function<void(const Entry
     const uint32_t len = GetU32(data.data() + pos + 4);
     if (len < 5 || len > kMaxPayloadBytes || len > data.size() - pos - kHeaderBytes) break;
     const char* payload = data.data() + pos + kHeaderBytes;
-    if (Crc32(payload, len) != crc) break;
+    // A crash can only damage the LAST record. A complete record that fails its checksum but is
+    // followed by more data means the middle of the log is corrupt: report it and do not delete
+    // the (possibly intact) records after it.
+    const bool is_last = pos + kHeaderBytes + len == data.size();
+    if (Crc32(payload, len) != crc) {
+      if (!is_last) return Status::kCorruption;
+      break;
+    }
 
     const uint8_t type = static_cast<uint8_t>(payload[0]);
     const uint32_t key_len = GetU32(payload + 1);

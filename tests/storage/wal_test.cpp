@@ -1,9 +1,11 @@
 #include "storage/wal.h"
 
 #include <gtest/gtest.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <csignal>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -163,22 +165,46 @@ TEST_F(WalTest, CorruptByteInLastRecordDropsOnlyThatRecord) {
   EXPECT_EQ(FileSize(), end_of_one);
 }
 
-TEST_F(WalTest, CorruptionInMiddleStopsReplayThere) {
-  uint64_t end_of_one = 0;
+TEST_F(WalTest, CorruptionInMiddleIsReportedAndNothingIsDeleted) {
+  uint64_t end_of_one = 0, full = 0;
   {
     auto w = OpenWal();
     ASSERT_EQ(w->AppendPut("a", "1"), Status::kOk);
     end_of_one = FileSize();
     ASSERT_EQ(w->AppendPut("b", "2"), Status::kOk);
     ASSERT_EQ(w->AppendPut("c", "3"), Status::kOk);
+    full = FileSize();
   }
   {
     std::fstream f(path_, std::ios::in | std::ios::out | std::ios::binary);
     f.seekp(static_cast<std::streamoff>(end_of_one + 8 + 1));  // inside record 2's payload
     f.put('\x7f');
   }
+  std::vector<Entry> out;
+  EXPECT_EQ(WAL::Replay(path_, [&](const Entry& e) { out.push_back(e); }), Status::kCorruption);
+  EXPECT_EQ(FileSize(), full) << "intact records after the damage must not be deleted";
+}
+
+TEST_F(WalTest, FailedWriteStopsTheLogInsteadOfHidingLaterRecords) {
+  std::signal(SIGXFSZ, SIG_IGN);  // exceeding the file-size limit then fails write() with EFBIG
+  auto w = OpenWal();
+  ASSERT_EQ(w->AppendPut("a", "1"), Status::kOk);
+  uint64_t one_record = FileSize();
+
+  struct rlimit original;
+  ASSERT_EQ(getrlimit(RLIMIT_FSIZE, &original), 0);
+  struct rlimit tiny = {static_cast<rlim_t>(one_record + 10), original.rlim_max};
+  ASSERT_EQ(setrlimit(RLIMIT_FSIZE, &tiny), 0);
+  Status failed = w->AppendPut("b", "2");  // runs out of room halfway through the record
+  ASSERT_EQ(setrlimit(RLIMIT_FSIZE, &original), 0);  // the "disk" has space again
+  EXPECT_EQ(failed, Status::kIOError);
+
+  // The log may now end in a partial record, so it must refuse to acknowledge anything else.
+  EXPECT_EQ(w->AppendPut("c", "3"), Status::kIOError);
+  EXPECT_EQ(w->Sync(), Status::kIOError);
+  w.reset();
   auto r = Replay();
-  ASSERT_EQ(r.size(), 1u);  // records after the first bad one are not trusted
+  ASSERT_EQ(r.size(), 1u);
   EXPECT_EQ(r[0].key, "a");
 }
 
