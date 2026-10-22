@@ -1,18 +1,41 @@
 #include "raft/raft_node.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 
 namespace raftkv {
 
+namespace {
+// A node that cannot save its state must stop: answering RPCs without having remembered a
+// vote or an entry could make it contradict itself after a restart.
+void MustSucceed(bool ok, const char* what) {
+  if (ok) return;
+  std::fprintf(stderr, "raft: fatal storage error: %s\n", what);
+  std::abort();
+}
+}  // namespace
+
 RaftNodeImpl::RaftNodeImpl(NodeId id, std::vector<NodeId> peers, Transport* transport,
-                           RaftConfig cfg)
+                           RaftConfig cfg, RaftStorage* storage)
     : id_(id),
       peers_(std::move(peers)),
       transport_(transport),
       cfg_(cfg),
+      storage_(storage),
       rng_(cfg.random_seed + id) {
   log_.push_back(LogEntry{0, 0, Command{CommandType::kNoop, "", ""}});  // dummy entry at index 0
+  if (storage_ != nullptr) {  // recover what we saved before the last crash
+    PersistentState saved;
+    MustSucceed(storage_->Load(&saved), "load persistent state");
+    current_term_ = saved.term;
+    voted_for_ = saved.voted_for;
+    for (LogEntry& entry : saved.log) {
+      MustSucceed(entry.index == log_.size(), "stored log is not contiguous");
+      log_.push_back(std::move(entry));
+    }
+  }
 }
 
 RaftNodeImpl::~RaftNodeImpl() { Stop(); }
@@ -46,6 +69,7 @@ ProposeResponse RaftNodeImpl::Propose(const Command& cmd) {
   if (role_ != Role::kLeader) return {ProposeResult::kNotLeader, 0, leader_hint_};
   LogIndex index = LastLogIndexLocked() + 1;
   log_.push_back(LogEntry{current_term_, index, cmd});
+  PersistAppendLocked({log_.back()});  // durable on the leader before we replicate or count it
   AdvanceCommitIndexLocked();       // a single-node cluster commits immediately
   BroadcastAppendEntriesLocked();   // replicate now instead of waiting for the next heartbeat
   return {ProposeResult::kAccepted, index, id_};
@@ -130,13 +154,15 @@ void RaftNodeImpl::ResetElectionDeadlineLocked() {
   election_deadline_ = Clock::now() + std::chrono::milliseconds(dist(rng_));
 }
 
-void RaftNodeImpl::BecomeFollowerLocked(Term term) {
-  if (term > current_term_) {
+void RaftNodeImpl::BecomeFollowerLocked(Term term, bool persist) {
+  bool term_changed = term > current_term_;
+  if (term_changed) {
     current_term_ = term;
     voted_for_ = 0;  // a new term means we have not voted yet
   }
   role_ = Role::kFollower;
   ResetElectionDeadlineLocked();
+  if (term_changed && persist) PersistHardStateLocked();
 }
 
 void RaftNodeImpl::StartElectionLocked() {
@@ -146,6 +172,7 @@ void RaftNodeImpl::StartElectionLocked() {
   votes_ = 1;
   leader_hint_ = 0;
   ResetElectionDeadlineLocked();
+  PersistHardStateLocked();  // our new term and our own vote must be durable before asking for votes
 
   if (peers_.empty()) {  // single-node cluster wins immediately
     BecomeLeaderLocked();
@@ -188,6 +215,7 @@ void RaftNodeImpl::BecomeLeaderLocked() {
   // (Raft paper, section 8) instead of waiting for the next client write.
   log_.push_back(LogEntry{current_term_, LastLogIndexLocked() + 1,
                           Command{CommandType::kNoop, "", ""}});
+  PersistAppendLocked({log_.back()});
   AdvanceCommitIndexLocked();  // a single-node cluster commits the no-op immediately
   BroadcastAppendEntriesLocked();
 }
@@ -268,7 +296,11 @@ void RaftNodeImpl::AdvanceCommitIndexLocked() {
 
 RequestVoteReply RaftNodeImpl::HandleRequestVote(const RequestVoteRequest& req) {
   std::lock_guard<std::mutex> lk(mu_);
-  if (req.term > current_term_) BecomeFollowerLocked(req.term);
+  bool state_changed = false;
+  if (req.term > current_term_) {
+    BecomeFollowerLocked(req.term, /*persist=*/false);  // saved once, below
+    state_changed = true;
+  }
 
   RequestVoteReply reply{current_term_, false};
   if (req.term < current_term_) return reply;  // candidate is behind
@@ -281,8 +313,12 @@ RequestVoteReply RaftNodeImpl::HandleRequestVote(const RequestVoteRequest& req) 
   if (can_vote && log_ok) {
     voted_for_ = req.candidate_id;
     reply.vote_granted = true;
+    state_changed = true;
     ResetElectionDeadlineLocked();  // granting a vote counts as hearing from a live candidate
   }
+  // The vote (and any term change) must be on disk before the candidate hears about it, or a
+  // restart could make us vote twice in the same term.
+  if (state_changed) PersistHardStateLocked();
   return reply;
 }
 
@@ -309,14 +345,18 @@ AppendEntriesReply RaftNodeImpl::HandleAppendEntries(const AppendEntriesRequest&
   // everything after it are dropped. Entries we already have are left alone, so duplicated or
   // reordered messages are harmless. Committed entries can never conflict.
   LogIndex index = req.prev_log_index;
+  std::vector<LogEntry> appended;
   for (const LogEntry& entry : req.entries) {
     ++index;
     if (index <= LastLogIndexLocked()) {
       if (log_[index].term == entry.term) continue;
       log_.erase(log_.begin() + static_cast<std::ptrdiff_t>(index), log_.end());
+      PersistTruncateLocked(index);
     }
     log_.push_back(entry);
+    appended.push_back(entry);
   }
+  if (!appended.empty()) PersistAppendLocked(appended);  // durable before we acknowledge
 
   // Follow the leader's commit point, but never past what this message verified.
   LogIndex last_new = req.prev_log_index + req.entries.size();
@@ -326,6 +366,18 @@ AppendEntriesReply RaftNodeImpl::HandleAppendEntries(const AppendEntriesRequest&
     apply_cv_.notify_all();
   }
   return AppendEntriesReply{current_term_, true, last_new};
+}
+
+void RaftNodeImpl::PersistHardStateLocked() {
+  if (storage_ != nullptr) MustSucceed(storage_->SaveHardState(current_term_, voted_for_), "save term/vote");
+}
+
+void RaftNodeImpl::PersistAppendLocked(const std::vector<LogEntry>& entries) {
+  if (storage_ != nullptr) MustSucceed(storage_->AppendEntries(entries), "append log entries");
+}
+
+void RaftNodeImpl::PersistTruncateLocked(LogIndex from_index) {
+  if (storage_ != nullptr) MustSucceed(storage_->TruncateSuffix(from_index), "truncate log");
 }
 
 LogIndex RaftNodeImpl::LastLogIndexLocked() const { return log_.back().index; }

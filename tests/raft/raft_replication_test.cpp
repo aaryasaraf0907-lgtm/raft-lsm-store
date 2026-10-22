@@ -13,41 +13,11 @@
 using namespace raftkv;
 using namespace std::chrono_literals;
 using raftkv::testing_util::Cluster;
+using raftkv::testing_util::PrefixConsistent;
+using raftkv::testing_util::ProposeUntilApplied;
+using raftkv::testing_util::Put;
 using raftkv::testing_util::WaitFor;
 
-namespace {
-
-Command Put(const std::string& key) { return Command{CommandType::kPut, key, "v"}; }
-
-bool Contains(const std::vector<std::string>& keys, const std::string& key) {
-  for (const auto& k : keys) {
-    if (k == key) return true;
-  }
-  return false;
-}
-
-// Keeps proposing `key` on whichever node is leader until every node has applied it.
-bool ProposeUntilApplied(Cluster& c, const std::string& key, std::chrono::milliseconds timeout) {
-  auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
-    NodeId leader = c.FindLeader();
-    if (leader != 0 && c.Node(leader)->Propose(Put(key)).result == ProposeResult::kAccepted) {
-      bool everywhere = WaitFor(
-          [&] {
-            for (auto& node : c.nodes) {
-              if (!Contains(c.Keys(node->Id()), key)) return false;
-            }
-            return true;
-          },
-          1500ms);
-      if (everywhere) return true;
-    }
-    std::this_thread::sleep_for(50ms);
-  }
-  return false;
-}
-
-}  // namespace
 
 TEST(RaftReplication, WriteReachesEveryNode) {
   Cluster c(3);
@@ -157,18 +127,6 @@ TEST(RaftReplication, CommittedEntriesSurviveLeaderFailure) {
   ASSERT_TRUE(WaitFor([&] { return c.Keys(old_leader) == expected; }, 8000ms));
 }
 
-namespace {
-
-// True if one sequence is a prefix of the other (nodes may lag, but must never disagree).
-bool PrefixConsistent(const std::vector<std::string>& a, const std::vector<std::string>& b) {
-  size_t n = std::min(a.size(), b.size());
-  for (size_t i = 0; i < n; ++i) {
-    if (a[i] != b[i]) return false;
-  }
-  return true;
-}
-
-}  // namespace
 
 // Chaos test: 5 nodes, random disconnects/reconnects while writes flow. Whatever happens,
 // no two nodes may ever apply different entries at the same position, and nothing may be

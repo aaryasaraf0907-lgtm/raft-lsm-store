@@ -46,16 +46,30 @@ void FakeNetwork::Shutdown() {
     stop_ = true;
   }
   cv_.notify_all();
+  idle_cv_.notify_all();
   if (worker_.joinable()) worker_.join();
 }
 
 void FakeNetwork::Register(NodeId id, RpcHandler* handler) {
-  std::lock_guard<std::mutex> lk(mu_);
+  std::unique_lock<std::mutex> lk(mu_);
+  ++generation_[id];  // replies owed to the previous incarnation of this node are now void
   if (handler == nullptr) {
     handlers_.erase(id);
+    // The node is about to be destroyed: wait until no delivery is touching it.
+    idle_cv_.wait(lk, [this] { return !busy_ || stop_; });
   } else {
     handlers_[id] = handler;
   }
+}
+
+uint64_t FakeNetwork::GenerationOf(NodeId id) {
+  std::lock_guard<std::mutex> lk(mu_);
+  return generation_[id];
+}
+
+bool FakeNetwork::SenderStillCurrent(NodeId id, uint64_t generation) {
+  std::lock_guard<std::mutex> lk(mu_);
+  return generation_[id] == generation;
 }
 
 bool FakeNetwork::Reachable(NodeId a, NodeId b) {
@@ -81,21 +95,23 @@ void FakeNetwork::Post(std::function<void()> task) {
 
 void FakeNetwork::SendRequestVote(NodeId from, NodeId to, const RequestVoteRequest& req,
                                   std::function<void(const RequestVoteReply&)> on_reply) {
-  Post([this, from, to, req, on_reply = std::move(on_reply)]() {
+  uint64_t gen = GenerationOf(from);
+  Post([this, from, to, gen, req, on_reply = std::move(on_reply)]() {
     RpcHandler* handler = Lookup(from, to);
     if (handler == nullptr) return;  // dropped: silence, like a real timeout
     RequestVoteReply reply = handler->HandleRequestVote(req);
-    if (Reachable(to, from)) on_reply(reply);
+    if (Reachable(to, from) && SenderStillCurrent(from, gen)) on_reply(reply);
   });
 }
 
 void FakeNetwork::SendAppendEntries(NodeId from, NodeId to, const AppendEntriesRequest& req,
                                     std::function<void(const AppendEntriesReply&)> on_reply) {
-  Post([this, from, to, req, on_reply = std::move(on_reply)]() {
+  uint64_t gen = GenerationOf(from);
+  Post([this, from, to, gen, req, on_reply = std::move(on_reply)]() {
     RpcHandler* handler = Lookup(from, to);
     if (handler == nullptr) return;
     AppendEntriesReply reply = handler->HandleAppendEntries(req);
-    if (Reachable(to, from)) on_reply(reply);
+    if (Reachable(to, from) && SenderStillCurrent(from, gen)) on_reply(reply);
   });
 }
 
@@ -108,8 +124,14 @@ void FakeNetwork::WorkerLoop() {
       if (stop_) return;
       task = std::move(queue_.front());
       queue_.pop_front();
+      busy_ = true;
     }
     task();  // run without holding the lock
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      busy_ = false;
+    }
+    idle_cv_.notify_all();
   }
 }
 
