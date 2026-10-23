@@ -51,6 +51,7 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   // Leader only. Appends to the log and starts replicating. Returns once the entry is in
   // the leader's log, NOT when it is committed; commit shows up as the apply callback.
   ProposeResponse Propose(const Command& cmd) override;
+  CommitResponse ProposeAndWait(const Command& cmd, std::chrono::milliseconds timeout) override;
   // Called once per committed entry, in log order, from a dedicated thread (never with the
   // node lock held, so it may call back into the node). kNoop entries are not delivered.
   // Set it before Start(); committed entries wait until a callback is set.
@@ -78,6 +79,7 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   void BroadcastAppendEntriesLocked();
   void SendAppendEntriesToLocked(NodeId peer);
   void AdvanceCommitIndexLocked();
+  LogIndex AppendAsLeaderLocked(const Command& cmd);
   void ResetElectionDeadlineLocked();
   void OnRequestVoteReply(Term election_term, const RequestVoteReply& reply);
   void OnAppendEntriesReply(NodeId peer, Term sent_term, LogIndex prev_index, size_t n_entries,
@@ -100,6 +102,7 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   mutable std::mutex mu_;
   std::condition_variable cv_;        // wakes the ticker on Stop
   std::condition_variable apply_cv_;  // wakes the applier on commit / callback / Stop
+  std::condition_variable wait_cv_;   // wakes ProposeAndWait callers: applied / overwritten / Stop
   std::thread ticker_;
   std::thread applier_;
   std::atomic<bool> running_{false};
