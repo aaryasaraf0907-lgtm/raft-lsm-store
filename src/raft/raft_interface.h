@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -31,6 +32,21 @@ struct ProposeResponse {
   NodeId leader_hint;   // best-known leader (useful if kNotLeader)
 };
 
+// Outcome of RaftNode::ProposeAndWait.
+enum class CommitResult {
+  kApplied,    // committed by a majority AND already applied to the state machine
+  kNotLeader,  // this node is not the leader; try leader_hint
+  kLost,       // another leader overwrote the entry: it was NOT committed, so retrying is safe
+  kTimeout,    // outcome unknown: the entry may still commit later (e.g. leader cut off)
+  kStopped,    // the node shut down while waiting
+};
+
+struct CommitResponse {
+  CommitResult result;
+  LogIndex index;      // log index assigned to the entry (0 if it was never proposed)
+  NodeId leader_hint;  // best-known leader (useful if kNotLeader)
+};
+
 // Called once per entry, in log order, only after the entry is COMMITTED
 // (majority replicated). The server wires this to KVStore::Put/Delete.
 using ApplyCallback = std::function<void(const LogEntry&)>;
@@ -46,6 +62,16 @@ class RaftNode {
   // Returns when the entry is accepted into the log, NOT when committed.
   // Commit is signalled later through the ApplyCallback.
   virtual ProposeResponse Propose(const Command& cmd) = 0;
+
+  // Leader only. Like Propose, but blocks until the entry has been committed AND applied (the
+  // apply callback has returned for it), the entry is known to be lost, or `timeout` passes.
+  // This is what a server calls to answer a client write.
+  //   kApplied : the write is durable on a majority and visible in the state machine.
+  //   kLost    : leadership changed and the entry was overwritten: it never committed.
+  //   kTimeout : unknown. A retry of a non-idempotent command could apply it twice, so a real
+  //              client needs request ids for de-duplication (a later piece of work).
+  virtual CommitResponse ProposeAndWait(const Command& cmd,
+                                        std::chrono::milliseconds timeout) = 0;
 
   virtual void SetApplyCallback(ApplyCallback cb) = 0;
   virtual bool IsLeader() const = 0;

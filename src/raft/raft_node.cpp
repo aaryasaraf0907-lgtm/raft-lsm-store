@@ -59,20 +59,56 @@ void RaftNodeImpl::Stop() {
   }
   cv_.notify_all();
   apply_cv_.notify_all();
+  wait_cv_.notify_all();  // release anyone blocked in ProposeAndWait
   if (ticker_.joinable()) ticker_.join();
   if (applier_.joinable()) applier_.join();
   transport_->Stop();
 }
 
-ProposeResponse RaftNodeImpl::Propose(const Command& cmd) {
-  std::lock_guard<std::mutex> lk(mu_);
-  if (role_ != Role::kLeader) return {ProposeResult::kNotLeader, 0, leader_hint_};
+LogIndex RaftNodeImpl::AppendAsLeaderLocked(const Command& cmd) {
   LogIndex index = LastLogIndexLocked() + 1;
   log_.push_back(LogEntry{current_term_, index, cmd});
   PersistAppendLocked({log_.back()});  // durable on the leader before we replicate or count it
   AdvanceCommitIndexLocked();       // a single-node cluster commits immediately
   BroadcastAppendEntriesLocked();   // replicate now instead of waiting for the next heartbeat
+  return index;
+}
+
+ProposeResponse RaftNodeImpl::Propose(const Command& cmd) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (role_ != Role::kLeader) return {ProposeResult::kNotLeader, 0, leader_hint_};
+  LogIndex index = AppendAsLeaderLocked(cmd);
   return {ProposeResult::kAccepted, index, id_};
+}
+
+CommitResponse RaftNodeImpl::ProposeAndWait(const Command& cmd, std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lk(mu_);
+  if (!running_) return {CommitResult::kStopped, 0, leader_hint_};
+  if (role_ != Role::kLeader) return {CommitResult::kNotLeader, 0, leader_hint_};
+
+  const Term term = current_term_;  // the entry is identified by (index, term)
+  const LogIndex index = AppendAsLeaderLocked(cmd);
+
+  CommitResult outcome = CommitResult::kTimeout;
+  auto resolved = [&] {
+    if (!running_) {
+      outcome = CommitResult::kStopped;
+      return true;
+    }
+    // If a different leader replaced our entry at this index, ours can never commit.
+    if (log_.size() <= index || log_[index].term != term) {
+      outcome = CommitResult::kLost;
+      return true;
+    }
+    // Applied means the callback has returned for it, so the state machine already reflects it.
+    if (last_applied_ >= index) {
+      outcome = CommitResult::kApplied;
+      return true;
+    }
+    return false;
+  };
+  wait_cv_.wait_for(lk, timeout, resolved);  // on timeout `outcome` stays kTimeout
+  return {outcome, index, leader_hint_};
 }
 
 void RaftNodeImpl::SetApplyCallback(ApplyCallback cb) {
@@ -143,6 +179,7 @@ void RaftNodeImpl::ApplierLoop() {
     }
     lk.lock();
     last_applied_ += batch.size();
+    wait_cv_.notify_all();  // wake ProposeAndWait callers whose entry is now applied
   }
 }
 
@@ -346,17 +383,20 @@ AppendEntriesReply RaftNodeImpl::HandleAppendEntries(const AppendEntriesRequest&
   // reordered messages are harmless. Committed entries can never conflict.
   LogIndex index = req.prev_log_index;
   std::vector<LogEntry> appended;
+  bool truncated = false;
   for (const LogEntry& entry : req.entries) {
     ++index;
     if (index <= LastLogIndexLocked()) {
       if (log_[index].term == entry.term) continue;
       log_.erase(log_.begin() + static_cast<std::ptrdiff_t>(index), log_.end());
       PersistTruncateLocked(index);
+      truncated = true;
     }
     log_.push_back(entry);
     appended.push_back(entry);
   }
   if (!appended.empty()) PersistAppendLocked(appended);  // durable before we acknowledge
+  if (truncated) wait_cv_.notify_all();  // entries a waiter proposed may just have been replaced
 
   // Follow the leader's commit point, but never past what this message verified.
   LogIndex last_new = req.prev_log_index + req.entries.size();
