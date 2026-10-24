@@ -16,6 +16,12 @@ struct Command {
   CommandType type;
   std::string key;
   std::string value;  // empty for kDelete
+  // Identifies the client request, for exactly-once writes. A client picks a random non-zero
+  // client_id and numbers its requests 1, 2, 3, ...; a retry reuses the same seq. The state
+  // machine skips a (client_id, seq) it has already applied. client_id == 0 or seq == 0 means
+  // "no request id": the command is always applied (used for internal entries).
+  uint64_t client_id = 0;
+  uint64_t seq = 0;
 };
 
 struct LogEntry {

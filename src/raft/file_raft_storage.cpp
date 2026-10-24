@@ -18,6 +18,7 @@ namespace {
 constexpr uint8_t kRecHardState = 1;
 constexpr uint8_t kRecEntry = 2;
 constexpr uint8_t kRecTruncate = 3;
+constexpr uint8_t kRecEntryV2 = 4;  // entry + client_id + seq (kRecEntry is the older layout)
 constexpr uint32_t kMaxRecordBytes = 64u * 1024u * 1024u;  // sanity limit when reading
 
 uint32_t Crc32(const char* data, size_t n) {
@@ -115,13 +116,18 @@ bool ApplyRecord(const char* payload, size_t len, PersistentState* st) {
       st->voted_for = r.U32();
       return r.ok;
     }
-    case kRecEntry: {
+    case kRecEntry:    // older files: no client request id
+    case kRecEntryV2: {
       LogEntry e;
       e.index = r.U64();
       e.term = r.U64();
       uint8_t cmd = r.U8();
       e.command.key = r.Str();
       e.command.value = r.Str();
+      if (type == kRecEntryV2) {
+        e.command.client_id = r.U64();
+        e.command.seq = r.U64();
+      }
       if (!r.ok || cmd > static_cast<uint8_t>(CommandType::kNoop)) return false;
       e.command.type = static_cast<CommandType>(cmd);
       if (e.index != st->log.size() + 1) return false;  // log must be contiguous
@@ -222,12 +228,14 @@ bool FileRaftStorage::AppendEntries(const std::vector<LogEntry>& entries) {
   std::string frames;  // all entries go out in one write + one fsync
   for (const LogEntry& e : entries) {
     std::string payload;
-    PutU8(&payload, kRecEntry);
+    PutU8(&payload, kRecEntryV2);
     PutU64(&payload, e.index);
     PutU64(&payload, e.term);
     PutU8(&payload, static_cast<uint8_t>(e.command.type));
     PutStr(&payload, e.command.key);
     PutStr(&payload, e.command.value);
+    PutU64(&payload, e.command.client_id);
+    PutU64(&payload, e.command.seq);
     AppendFrame(&frames, payload);
   }
   return WriteRecords(frames);
