@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -171,4 +172,87 @@ TEST(FileRaftStorage, FlippedBitInLastRecordIsDetected) {
   WriteFile(path, bytes);
   PersistentState state = LoadFrom(dir.path.string());
   EXPECT_EQ(state.log.size(), 1u) << "record with a bad checksum must not be trusted";
+}
+
+// ---- client request ids (client_id / seq) ----
+
+namespace {
+
+// Test-local helpers that write the OLDER entry layout (record type 2, no client id), the way
+// files were written before request ids existed.
+uint32_t TestCrc32(const std::string& data) {
+  uint32_t crc = 0xFFFFFFFFu;
+  for (unsigned char byte : data) {
+    crc ^= byte;
+    for (int k = 0; k < 8; ++k) crc = (crc & 1) ? (0xEDB88320u ^ (crc >> 1)) : (crc >> 1);
+  }
+  return crc ^ 0xFFFFFFFFu;
+}
+
+void PutLittleEndian(std::string* out, uint64_t value, int bytes) {
+  for (int i = 0; i < bytes; ++i) out->push_back(static_cast<char>((value >> (8 * i)) & 0xFF));
+}
+
+std::string LegacyEntryFrame(uint64_t index, uint64_t term, const std::string& key,
+                             const std::string& value) {
+  std::string payload;
+  payload.push_back(2);  // old record type: entry without client id
+  PutLittleEndian(&payload, index, 8);
+  PutLittleEndian(&payload, term, 8);
+  payload.push_back(0);  // CommandType::kPut
+  PutLittleEndian(&payload, key.size(), 4);
+  payload += key;
+  PutLittleEndian(&payload, value.size(), 4);
+  payload += value;
+  std::string frame;
+  PutLittleEndian(&frame, payload.size(), 4);
+  PutLittleEndian(&frame, TestCrc32(payload), 4);
+  return frame + payload;
+}
+
+}  // namespace
+
+TEST(FileRaftStorage, ClientRequestIdsRoundTrip) {
+  TempDir dir;
+  LogEntry with_id = MakeEntry(1, 1, "k", "v");
+  with_id.command.client_id = 0xDEADBEEFCAFEF00Dull;  // large values must survive intact
+  with_id.command.seq = 42;
+  LogEntry without_id = MakeEntry(2, 1, "k2", "v2");
+  {
+    FileRaftStorage s(dir.path.string());
+    PersistentState st;
+    ASSERT_TRUE(s.Load(&st));
+    ASSERT_TRUE(s.AppendEntries({with_id, without_id}));
+  }
+  PersistentState state = LoadFrom(dir.path.string());
+  ASSERT_EQ(state.log.size(), 2u);
+  EXPECT_EQ(state.log[0].command.client_id, 0xDEADBEEFCAFEF00Dull);
+  EXPECT_EQ(state.log[0].command.seq, 42u);
+  EXPECT_EQ(state.log[1].command.client_id, 0u);
+  EXPECT_EQ(state.log[1].command.seq, 0u);
+}
+
+TEST(FileRaftStorage, FilesWrittenBeforeRequestIdsStillLoad) {
+  TempDir dir;
+  std::filesystem::create_directories(dir.path);
+  WriteFile((dir.path / "raft.log").string(),
+            LegacyEntryFrame(1, 1, "old1", "a") + LegacyEntryFrame(2, 1, "old2", "b"));
+
+  {
+    FileRaftStorage s(dir.path.string());
+    PersistentState st;
+    ASSERT_TRUE(s.Load(&st));
+    ASSERT_EQ(st.log.size(), 2u);
+    EXPECT_EQ(st.log[1].command.key, "old2");
+    EXPECT_EQ(st.log[1].command.client_id, 0u);  // old entries carry no request id
+    LogEntry newer = MakeEntry(3, 2, "new", "c");
+    newer.command.client_id = 7;
+    newer.command.seq = 9;
+    ASSERT_TRUE(s.AppendEntries({newer}));  // new-format records continue after old ones
+  }
+  PersistentState state = LoadFrom(dir.path.string());
+  ASSERT_EQ(state.log.size(), 3u);
+  EXPECT_EQ(state.log[0].command.key, "old1");
+  EXPECT_EQ(state.log[2].command.client_id, 7u);
+  EXPECT_EQ(state.log[2].command.seq, 9u);
 }

@@ -10,6 +10,8 @@ namespace raftkv {
 // where payload[0] is the record type:
 //   1 = hard state {u64 term, u32 voted_for}     the last one wins
 //   2 = log entry  {u64 index, u64 term, u8 command type, string key, string value}
+//                  (older layout, still readable: loads with client_id = seq = 0)
+//   4 = log entry  {... same as 2 ..., u64 client_id, u64 seq}       what is written now
 //   3 = truncate   {u64 from_index}              drops that entry and all after it
 // Load() replays the records. A torn or corrupt record at the end (a crash in the middle of a
 // write) is detected by its length/checksum and cut off, so the node restarts from the last
