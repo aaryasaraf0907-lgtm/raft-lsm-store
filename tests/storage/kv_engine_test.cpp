@@ -1,10 +1,13 @@
 #include "storage/kv_engine.h"
 
 #include <gtest/gtest.h>
+#ifndef _WIN32
 #include <sys/resource.h>
 #include <unistd.h>
+#endif
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
@@ -20,9 +23,16 @@ using raftkv::Status;
 class KVEngineTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    std::string tmpl = (std::filesystem::temp_directory_path() / "raftkv_eng_XXXXXX").string();
-    ASSERT_NE(::mkdtemp(&tmpl[0]), nullptr);
-    dir_ = tmpl;
+    static std::atomic<uint64_t> next_id{0};
+    const auto timestamp = std::chrono::high_resolution_clock::now()
+                              .time_since_epoch()
+                              .count();
+    dir_ = (std::filesystem::temp_directory_path() /
+            ("raftkv_eng_" + std::to_string(timestamp) + "_" +
+             std::to_string(next_id++))).string();
+    std::error_code ec;
+    ASSERT_TRUE(std::filesystem::create_directories(dir_, ec));
+    ASSERT_FALSE(ec);
   }
   void TearDown() override { std::filesystem::remove_all(dir_); }
 
@@ -181,6 +191,7 @@ TEST_F(KVEngineTest, MidLogCorruptionRefusesToOpen) {
 // If the WAL write fails, the write must not become visible, and the engine
 // must keep refusing writes (the WAL may end in a partial record).
 TEST_F(KVEngineTest, FailedWalWriteIsNotAppliedToMemtable) {
+#ifndef _WIN32
   std::signal(SIGXFSZ, SIG_IGN);
   auto e = Open();
   ASSERT_EQ(e->Put("a", "1"), Status::kOk);
@@ -198,6 +209,10 @@ TEST_F(KVEngineTest, FailedWalWriteIsNotAppliedToMemtable) {
   EXPECT_EQ(e->Put("c", "3"), Status::kIOError);
   EXPECT_EQ(e->Delete("a"), Status::kIOError);
   EXPECT_EQ(Get(*e, "a"), "1");  // reads still work
+#else
+  GTEST_SKIP() << "KVEngine does not expose WAL I/O injection; "
+                  "the WAL-level injected partial-write test covers this path";
+#endif
 }
 
 TEST_F(KVEngineTest, ConcurrentWritersAndReaders) {

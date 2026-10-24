@@ -1,14 +1,22 @@
 #include "raft/file_raft_storage.h"
 
 #include <fcntl.h>
+#ifdef _WIN32
+#include <io.h>
+#include <sys/stat.h>
+#include <windows.h>
+#else
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <utility>
 
 namespace raftkv {
@@ -43,7 +51,90 @@ bool SyncFd(int fd) {
 #ifdef F_FULLFSYNC
   if (fcntl(fd, F_FULLFSYNC) == 0) return true;
 #endif
+#ifdef _WIN32
+  const intptr_t raw_handle = ::_get_osfhandle(fd);
+  if (raw_handle == -1) return false;
+  return ::FlushFileBuffers(reinterpret_cast<HANDLE>(raw_handle)) != 0;
+#else
   return fsync(fd) == 0;
+#endif
+}
+
+int TruncateFd(int fd, uint64_t length) {
+#ifdef _WIN32
+  if (length > static_cast<uint64_t>(std::numeric_limits<__int64>::max())) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  return ::_chsize_s(fd, static_cast<__int64>(length)) == 0 ? 0 : -1;
+#else
+  if (length > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  return ::ftruncate(fd, static_cast<off_t>(length));
+#endif
+}
+
+// Reads at most min(size, SSIZE_MAX) bytes. A short positive result is valid and
+// the caller must advance both its buffer and offset; zero means EOF, and -1 means
+// an error with errno set. Windows uses the shared file pointer, so callers must
+// hold io_mutex_ across this call and all other operations on this descriptor.
+ssize_t ReadAt(int fd, char* buffer, size_t size, uint64_t offset) {
+  if (size == 0) return 0;
+#ifdef _WIN32
+  if (offset > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  const intptr_t raw_handle = ::_get_osfhandle(fd);
+  if (raw_handle == -1) {
+    errno = EBADF;
+    return -1;
+  }
+  LARGE_INTEGER position;
+  position.QuadPart = static_cast<LONGLONG>(offset);
+  if (!::SetFilePointerEx(reinterpret_cast<HANDLE>(raw_handle), position, nullptr,
+                          FILE_BEGIN)) {
+    switch (::GetLastError()) {
+      case ERROR_INVALID_HANDLE:
+        errno = EBADF;
+        break;
+      case ERROR_INVALID_PARAMETER:
+        errno = EINVAL;
+        break;
+      case ERROR_OPERATION_ABORTED:
+        errno = EINTR;
+        break;
+      default:
+        errno = EIO;
+        break;
+    }
+    return -1;
+  }
+  const DWORD requested = static_cast<DWORD>(
+      std::min<size_t>(size, std::min<size_t>(
+                                std::numeric_limits<DWORD>::max(),
+                                static_cast<size_t>(
+                                    std::numeric_limits<ssize_t>::max()))));
+  DWORD received = 0;
+  if (!::ReadFile(reinterpret_cast<HANDLE>(raw_handle), buffer, requested,
+                  &received, nullptr)) {
+    const DWORD error = ::GetLastError();
+    if (error == ERROR_HANDLE_EOF) return 0;
+    errno = error == ERROR_OPERATION_ABORTED ? EINTR : EIO;
+    return -1;
+  }
+  return static_cast<ssize_t>(received);
+#else
+  if (offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  const size_t requested = std::min<size_t>(
+      size, static_cast<size_t>(std::numeric_limits<ssize_t>::max()));
+  return ::pread(fd, buffer, requested, static_cast<off_t>(offset));
+#endif
 }
 
 // ---- encoding helpers (little endian) ----
@@ -152,14 +243,24 @@ FileRaftStorage::FileRaftStorage(std::string dir, bool sync) : dir_(std::move(di
   std::filesystem::create_directories(dir_, ec);
   if (ec) return;
   path_ = dir_ + "/raft.log";
-  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_APPEND, 0644);
+  int file_flags = O_RDWR | O_CREAT | O_APPEND;
+#ifdef _WIN32
+  file_flags |= O_BINARY;
+#endif
+  fd_ = ::open(path_.c_str(), file_flags, 0644);
   if (fd_ < 0) return;
-  if (sync_) {  // make the new file's directory entry durable too
-    int dfd = ::open(dir_.c_str(), O_RDONLY);
+  if (sync_) {
+#ifndef _WIN32
+    // Best-effort directory-entry durability where directory fsync is supported.
+    int directory_flags = O_RDONLY;
+    int dfd = ::open(dir_.c_str(), directory_flags);
     if (dfd >= 0) {
       SyncFd(dfd);
       ::close(dfd);
     }
+#else
+    // FlushFileBuffers on the log file does not guarantee its directory entry is durable.
+#endif
   }
 }
 
@@ -168,15 +269,26 @@ FileRaftStorage::~FileRaftStorage() {
 }
 
 bool FileRaftStorage::Load(PersistentState* out) {
+  std::lock_guard<std::mutex> lock(io_mutex_);
   if (fd_ < 0) return false;
   *out = PersistentState();
 
+#ifdef _WIN32
+  struct _stat64 sb;
+  if (::_fstat64(fd_, &sb) != 0) return false;
+#else
   struct stat sb;
-  if (fstat(fd_, &sb) != 0) return false;
+  if (::fstat(fd_, &sb) != 0) return false;
+#endif
+  if (sb.st_size < 0 ||
+      static_cast<uint64_t>(sb.st_size) >
+          static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+    return false;
+  }
   std::string buf(static_cast<size_t>(sb.st_size), '\0');
   size_t got = 0;
   while (got < buf.size()) {
-    ssize_t r = ::pread(fd_, &buf[got], buf.size() - got, static_cast<off_t>(got));
+    ssize_t r = ReadAt(fd_, &buf[got], buf.size() - got, got);
     if (r < 0 && errno == EINTR) continue;
     if (r <= 0) return false;
     got += static_cast<size_t>(r);
@@ -197,13 +309,14 @@ bool FileRaftStorage::Load(PersistentState* out) {
   }
 
   if (good_end < buf.size()) {  // cut off the incomplete record so new writes follow clean data
-    if (ftruncate(fd_, static_cast<off_t>(good_end)) != 0) return false;
+    if (TruncateFd(fd_, static_cast<uint64_t>(good_end)) != 0) return false;
     if (sync_ && !SyncFd(fd_)) return false;
   }
   return true;
 }
 
 bool FileRaftStorage::WriteRecords(const std::string& bytes) {
+  std::lock_guard<std::mutex> lock(io_mutex_);
   if (fd_ < 0) return false;
   size_t done = 0;
   while (done < bytes.size()) {

@@ -1,4 +1,5 @@
 #pragma once
+#include <mutex>
 #include <string>
 #include "raft/raft_storage.h"
 
@@ -40,6 +41,7 @@ class FileRaftStorage : public RaftStorage {
   std::string path_;
   bool sync_;
   int fd_ = -1;
+  std::mutex io_mutex_;
 };
 
 }  // namespace raftkv

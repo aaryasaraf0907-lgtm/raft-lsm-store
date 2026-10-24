@@ -1,11 +1,17 @@
 #include "storage/wal.h"
 
 #include <fcntl.h>
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <limits>
 
 namespace raftkv {
 namespace {
@@ -24,13 +30,17 @@ uint32_t GetU32(const char* p) {
   return v;
 }
 
-bool WriteAll(int fd, const char* p, size_t n) {
+bool WriteAll(int fd, const char* p, size_t n,
+              const WAL::WriteFunction& write_function) {
   while (n > 0) {
-    ssize_t w = ::write(fd, p, n);
+    std::ptrdiff_t w = write_function
+                           ? write_function(fd, p, n)
+                           : static_cast<std::ptrdiff_t>(::write(fd, p, n));
     if (w < 0) {
       if (errno == EINTR) continue;
       return false;
     }
+    if (w == 0 || static_cast<size_t>(w) > n) return false;
     p += w;
     n -= static_cast<size_t>(w);
   }
@@ -42,7 +52,29 @@ bool FullSync(int fd) {
   // On macOS fsync() does not force data out of the drive cache; F_FULLFSYNC does.
   if (::fcntl(fd, F_FULLFSYNC) == 0) return true;
 #endif
+#ifdef _WIN32
+  const intptr_t raw_handle = ::_get_osfhandle(fd);
+  if (raw_handle == -1) return false;
+  return ::FlushFileBuffers(reinterpret_cast<HANDLE>(raw_handle)) != 0;
+#else
   return ::fsync(fd) == 0;
+#endif
+}
+
+int TruncateFd(int fd, uint64_t length) {
+#ifdef _WIN32
+  if (length > static_cast<uint64_t>(std::numeric_limits<__int64>::max())) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  return ::_chsize_s(fd, static_cast<__int64>(length)) == 0 ? 0 : -1;
+#else
+  if (length > static_cast<uint64_t>(std::numeric_limits<off_t>::max())) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  return ::ftruncate(fd, static_cast<off_t>(length));
+#endif
 }
 
 }  // namespace
@@ -64,9 +96,26 @@ uint32_t Crc32(const void* data, size_t n) {
 }
 
 Status WAL::Open(const std::string& path, std::unique_ptr<WAL>* out) {
-  int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+  int flags = O_WRONLY | O_CREAT | O_APPEND;
+#ifdef _WIN32
+  flags |= O_BINARY;
+#endif
+  int fd = ::open(path.c_str(), flags, 0644);
   if (fd < 0) return Status::kIOError;
   out->reset(new WAL(fd));
+  return Status::kOk;
+}
+
+Status WAL::OpenForTesting(const std::string& path, std::unique_ptr<WAL>* out,
+                           WriteFunction write_function) {
+  if (!write_function) return Status::kIOError;
+  int flags = O_WRONLY | O_CREAT | O_APPEND;
+#ifdef _WIN32
+  flags |= O_BINARY;
+#endif
+  int fd = ::open(path.c_str(), flags, 0644);
+  if (fd < 0) return Status::kIOError;
+  out->reset(new WAL(fd, std::move(write_function)));
   return Status::kOk;
 }
 
@@ -112,7 +161,8 @@ Status WAL::Append(uint8_t type, const std::string& key, const std::string& valu
   // One write() per record keeps a torn write confined to the tail.
   // If this fails midway the file ends in a partial record. Later appends would sit behind it
   // and be thrown away by Replay even though they were reported as durable, so stop here.
-  if (!WriteAll(fd_, record.data(), record.size()) || (sync && !FullSync(fd_))) {
+  if (!WriteAll(fd_, record.data(), record.size(), write_function_) ||
+      (sync && !FullSync(fd_))) {
     failed_ = true;
     return Status::kIOError;
   }
@@ -122,7 +172,11 @@ Status WAL::Append(uint8_t type, const std::string& key, const std::string& valu
 Status WAL::Replay(const std::string& path, const std::function<void(const Entry&)>& apply,
                    ReplayStats* stats) {
   ReplayStats local;
-  int fd = ::open(path.c_str(), O_RDONLY);
+  int flags = O_RDONLY;
+#ifdef _WIN32
+  flags |= O_BINARY;
+#endif
+  int fd = ::open(path.c_str(), flags);
   if (fd < 0) {
     if (errno == ENOENT) {
       if (stats != nullptr) *stats = local;
@@ -177,9 +231,13 @@ Status WAL::Replay(const std::string& path, const std::function<void(const Entry
   local.valid_bytes = pos;
   local.discarded_bytes = data.size() - pos;
   if (local.discarded_bytes > 0) {  // drop the torn tail so new appends follow clean data
-    int wfd = ::open(path.c_str(), O_WRONLY);
+    int write_flags = O_WRONLY;
+#ifdef _WIN32
+    write_flags |= O_BINARY;
+#endif
+    int wfd = ::open(path.c_str(), write_flags);
     if (wfd < 0) return Status::kIOError;
-    bool ok = ::ftruncate(wfd, static_cast<off_t>(pos)) == 0 && FullSync(wfd);
+    bool ok = TruncateFd(wfd, static_cast<uint64_t>(pos)) == 0 && FullSync(wfd);
     ::close(wfd);
     if (!ok) return Status::kIOError;
   }
