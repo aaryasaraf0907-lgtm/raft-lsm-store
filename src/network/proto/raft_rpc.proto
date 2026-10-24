@@ -46,3 +46,8 @@ message AppendEntriesReply {
   bool success = 2;
   uint64 match_index = 3;
 }
+
+service RaftRpc {
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteReply);
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesReply);
+}
