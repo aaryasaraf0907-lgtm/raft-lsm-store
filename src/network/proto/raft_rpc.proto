@@ -12,6 +12,8 @@ message Command {
   CommandType type = 1;
   bytes key = 2;
   bytes value = 3;
+  uint64 client_id = 4;
+  uint64 seq = 5;
 }
 
 message LogEntry {

@@ -39,6 +39,8 @@ proto::LogEntry ToProto(const LogEntry& entry) {
   command->set_type(ToProto(entry.command.type));
   command->set_key(entry.command.key);
   command->set_value(entry.command.value);
+  command->set_client_id(entry.command.client_id);
+  command->set_seq(entry.command.seq);
   return converted;
 }
 
@@ -50,7 +52,9 @@ LogEntry FromProto(const proto::LogEntry& entry) {
           entry.index(),
           {FromProto(entry.command().type()),
            entry.command().key(),
-           entry.command().value()}};
+           entry.command().value(),
+           entry.command().client_id(),
+           entry.command().seq()}};
 }
 
 }  // namespace
