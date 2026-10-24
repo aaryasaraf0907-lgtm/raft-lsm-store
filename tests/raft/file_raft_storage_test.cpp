@@ -74,7 +74,8 @@ TEST(FileRaftStorage, EntriesRoundTrip) {
   std::vector<LogEntry> entries = {
       MakeEntry(1, 1, "", "", CommandType::kNoop),
       MakeEntry(2, 1, "key", "value"),
-      MakeEntry(3, 2, std::string("bin\0key", 7), std::string("\0\xff\x01", 3)),
+      MakeEntry(3, 2, std::string("bin\0key\x1a\n\r", 10),
+                std::string("\0\xff\x01\n\x1a\r", 6)),
       MakeEntry(4, 2, "gone", "", CommandType::kDelete),
       MakeEntry(5, 3, "big", std::string(100000, 'x')),
   };
