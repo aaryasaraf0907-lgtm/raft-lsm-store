@@ -33,16 +33,18 @@ RaftNodeImpl::RaftNodeImpl(NodeId id, std::vector<NodeId> peers, Transport* tran
     MustSucceed(storage_->Load(&saved), "load persistent state");
     current_term_ = saved.term;
     voted_for_ = saved.voted_for;
-    base_index_ = saved.snapshot_index;
-    base_term_ = saved.snapshot_term;
+    base_index_ = saved.log_base_index;
+    base_term_ = saved.log_base_term;
+    snapshot_index_ = saved.snapshot_index;
+    snapshot_term_ = saved.snapshot_term;
     snapshot_data_ = std::move(saved.snapshot_data);
     log_[0] = LogEntry{base_term_, base_index_, Command{CommandType::kNoop, "", ""}};
     for (LogEntry& entry : saved.log) {
       MustSucceed(entry.index == log_.back().index + 1, "stored log is not contiguous");
       log_.push_back(std::move(entry));
     }
-    if (base_index_ > 0) {  // a snapshot only ever holds committed state
-      commit_index_ = base_index_;
+    if (snapshot_index_ > 0) {  // a snapshot only ever holds committed state
+      commit_index_ = snapshot_index_;
       restore_pending_ = true;  // the applier restores the state machine before applying more
     }
   }
@@ -201,7 +203,7 @@ void RaftNodeImpl::SetSnapshotCallbacks(SnapshotTaker take, SnapshotRestorer res
 
 LogIndex RaftNodeImpl::SnapshotIndex() const {
   std::lock_guard<std::mutex> lk(mu_);
-  return base_index_;
+  return snapshot_index_;
 }
 
 size_t RaftNodeImpl::LogLength() const {
@@ -266,7 +268,7 @@ void RaftNodeImpl::ApplierLoop() {
     if (restore_pending_) {
       restore_pending_ = false;  // a snapshot installed while we restore sets it again
       std::string data = snapshot_data_;
-      const LogIndex index = base_index_;
+      const LogIndex index = snapshot_index_;
       SnapshotRestorer restore = snap_restorer_;
       lk.unlock();
       restore(data);
@@ -290,13 +292,13 @@ void RaftNodeImpl::ApplierLoop() {
     wait_cv_.notify_all();  // wake ProposeAndWait callers whose entry is now applied
 
     if (cfg_.snapshot_threshold_entries > 0 && snap_taker_ != nullptr && !restore_pending_ &&
-        last_applied_ >= base_index_ + cfg_.snapshot_threshold_entries) {
+        last_applied_ >= snapshot_index_ + cfg_.snapshot_threshold_entries) {
       const LogIndex at = last_applied_;
       SnapshotTaker take = snap_taker_;
       lk.unlock();
       std::string data = take();
       lk.lock();
-      if (!restore_pending_ && last_applied_ == at && at > base_index_) {
+      if (!restore_pending_ && last_applied_ == at && at > snapshot_index_) {
         CompactLocked(at, std::move(data));
       }
     }
@@ -425,13 +427,13 @@ void RaftNodeImpl::SendSnapshotChunkLocked(NodeId peer) {
   const size_t n = std::min<size_t>(chunk, snapshot_data_.size() - static_cast<size_t>(offset));
   InstallSnapshotRequest req{current_term_,
                              id_,
-                             base_index_,
-                             base_term_,
+                             snapshot_index_,
+                             snapshot_term_,
                              offset,
                              snapshot_data_.substr(static_cast<size_t>(offset), n),
                              offset + n == snapshot_data_.size()};
   const Term sent_term = current_term_;
-  const LogIndex snapshot_index = base_index_;
+  const LogIndex snapshot_index = snapshot_index_;
   const uint64_t seq = ++send_seq_;
   transport_->SendInstallSnapshot(
       peer, req, [this, peer, sent_term, seq, snapshot_index](const InstallSnapshotReply& reply) {
@@ -450,7 +452,7 @@ void RaftNodeImpl::OnInstallSnapshotReply(NodeId peer, Term sent_term, uint64_t 
   }
   if (role_ != Role::kLeader || current_term_ != sent_term) return;
   RecordAckLocked(peer, seq);
-  if (snapshot_index != base_index_) return;  // we have a newer snapshot now; heartbeat restarts
+  if (snapshot_index != snapshot_index_) return;  // we have a newer snapshot now; heartbeat restarts
   if (reply.installed) {
     snap_offset_[peer] = 0;
     if (snapshot_index > match_index_[peer]) {
@@ -573,7 +575,7 @@ AppendEntriesReply RaftNodeImpl::HandleAppendEntries(const AppendEntriesRequest&
   bool truncated = false;
   for (const LogEntry& entry : req.entries) {
     ++index;
-    if (index <= base_index_) continue;  // already inside our snapshot
+    if (index <= base_index_) continue;  // already dropped from our log (committed)
     if (index <= LastLogIndexLocked()) {
       if (EntryLocked(index).term == entry.term) continue;
       log_.erase(log_.begin() + static_cast<std::ptrdiff_t>(index - base_index_), log_.end());
@@ -641,6 +643,8 @@ void RaftNodeImpl::InstallSnapshotLocked(LogIndex index, Term term, std::string 
   for (LogEntry& e : suffix) log_.push_back(std::move(e));
   base_index_ = index;
   base_term_ = term;
+  snapshot_index_ = index;
+  snapshot_term_ = term;
   snapshot_data_ = std::move(data);
   commit_index_ = std::max(commit_index_, index);
   restore_pending_ = true;  // the applier restores the state machine, then continues after `index`
@@ -649,18 +653,24 @@ void RaftNodeImpl::InstallSnapshotLocked(LogIndex index, Term term, std::string 
 }
 
 // Applier thread: the state machine has applied exactly the entries up to `index` and `data` is
-// its serialized state. Save it and drop the log up to `index`.
+// its serialized state. Save it and drop the log, except for the last snapshot_trailing_entries
+// entries up to `index`, which stay so that a slightly slow follower needs no snapshot.
 void RaftNodeImpl::CompactLocked(LogIndex index, std::string data) {
   const Term term = EntryLocked(index).term;
+  LogIndex new_base = index > cfg_.snapshot_trailing_entries ? index - cfg_.snapshot_trailing_entries : 0;
+  new_base = std::max(new_base, base_index_);  // the log never grows backwards
+  const Term new_base_term = EntryLocked(new_base).term;
   if (storage_ != nullptr) {
-    std::vector<LogEntry> suffix(log_.begin() + static_cast<std::ptrdiff_t>(index - base_index_ + 1),
-                                 log_.end());
-    MustSucceed(storage_->SaveSnapshot(index, term, data, suffix), "save snapshot");
+    std::vector<LogEntry> kept(log_.begin() + static_cast<std::ptrdiff_t>(new_base - base_index_ + 1),
+                               log_.end());
+    MustSucceed(storage_->SaveSnapshot(index, term, data, new_base, new_base_term, kept), "save snapshot");
   }
-  log_.erase(log_.begin(), log_.begin() + static_cast<std::ptrdiff_t>(index - base_index_));
-  log_[0] = LogEntry{term, index, Command{CommandType::kNoop, "", ""}};
-  base_index_ = index;
-  base_term_ = term;
+  log_.erase(log_.begin(), log_.begin() + static_cast<std::ptrdiff_t>(new_base - base_index_));
+  log_[0] = LogEntry{new_base_term, new_base, Command{CommandType::kNoop, "", ""}};
+  base_index_ = new_base;
+  base_term_ = new_base_term;
+  snapshot_index_ = index;
+  snapshot_term_ = term;
   snapshot_data_ = std::move(data);
   snap_offset_.clear();  // any transfer in progress was of the older snapshot
 }

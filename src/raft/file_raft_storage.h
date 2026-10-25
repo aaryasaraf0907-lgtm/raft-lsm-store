@@ -13,8 +13,12 @@ namespace raftkv {
 //                  (older layout, still readable: loads with client_id = seq = 0)
 //   4 = log entry  {... same as 2 ..., u64 client_id, u64 seq}       what is written now
 //   3 = truncate   {u64 from_index}              drops that entry and all after it
-//   5 = log base   {u64 snapshot_index, u64 snapshot_term}   the entries that follow start at
-//                  snapshot_index + 1; the snapshot itself is in <dir>/snapshot-<index>.bin
+//   5 = log base   {u64 index, u64 term}   the entries that follow start at index + 1 and the
+//                  snapshot is exactly at that index (older layout, still readable)
+//   6 = log base   {u64 log_base_index, u64 log_base_term, u64 snapshot_index, u64 snapshot_term}
+//                  the entries that follow start at log_base_index + 1; the snapshot may be later
+//                  (entries below it are kept for slow followers); it is in
+//                  <dir>/snapshot-<snapshot_index>.bin     what is written now
 // Load() replays the records. A torn or corrupt record at the end (a crash in the middle of a
 // write) is detected by its length/checksum and cut off, so the node restarts from the last
 // complete record.
@@ -38,8 +42,10 @@ class FileRaftStorage : public RaftStorage {
   bool SaveHardState(Term term, NodeId voted_for) override;
   bool AppendEntries(const std::vector<LogEntry>& entries) override;
   bool TruncateSuffix(LogIndex from_index) override;
-  bool SaveSnapshot(LogIndex index, Term term, const std::string& data,
-                    const std::vector<LogEntry>& entries_after) override;
+  using RaftStorage::SaveSnapshot;
+  bool SaveSnapshot(LogIndex snapshot_index, Term snapshot_term, const std::string& data,
+                    LogIndex log_base_index, Term log_base_term,
+                    const std::vector<LogEntry>& entries_after_base) override;
 
  private:
   bool WriteRecords(const std::string& bytes);

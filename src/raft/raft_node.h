@@ -27,6 +27,10 @@ struct RaftConfig {
   // Take a snapshot and drop the log prefix once this many entries have been applied since the
   // last one. 0 = never (also needs SetSnapshotCallbacks).
   size_t snapshot_threshold_entries = 0;
+  // After a snapshot at index A, keep the log entries from A - snapshot_trailing_entries + 1
+  // onwards instead of dropping everything up to A. A follower that is behind by no more than
+  // that is then caught up with plain log entries instead of a whole snapshot. 0 = drop them all.
+  size_t snapshot_trailing_entries = 0;
 };
 
 enum class Role { kFollower, kCandidate, kLeader };
@@ -152,13 +156,17 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   NodeId voted_for_ = 0;
   NodeId leader_hint_ = 0;
   int votes_ = 0;
-  // log_[0] stands for the last entry covered by the snapshot (index base_index_, term
-  // base_term_; both 0 when there is no snapshot), so the entry with index i is
+  // log_[0] stands for the last entry that has been dropped from the log (index base_index_, term
+  // base_term_; both 0 if nothing was dropped), so the entry with index i is
   // log_[i - base_index_] and real entries start at base_index_ + 1.
   std::vector<LogEntry> log_;
   LogIndex base_index_ = 0;
   Term base_term_ = 0;
-  std::string snapshot_data_;  // the snapshot at base_index_, kept to send to slow followers
+  // The snapshot covers everything up to snapshot_index_ >= base_index_ (the log may keep a few
+  // entries below it, see snapshot_trailing_entries). 0 = no snapshot.
+  LogIndex snapshot_index_ = 0;
+  Term snapshot_term_ = 0;
+  std::string snapshot_data_;  // the snapshot at snapshot_index_, kept to send to slow followers
   SnapshotTaker snap_taker_;
   SnapshotRestorer snap_restorer_;
   bool restore_pending_ = false;  // the state machine must be restored from snapshot_data_

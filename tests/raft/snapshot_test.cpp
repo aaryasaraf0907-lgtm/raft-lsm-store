@@ -124,6 +124,7 @@ struct Options {
   bool persistent = false;
   size_t threshold = 10;
   size_t max_bytes = 1 << 20;
+  size_t trailing = 0;  // log entries kept below each snapshot
 };
 
 class SnapCluster {
@@ -197,6 +198,7 @@ class SnapCluster {
     cfg.random_seed = 42;
     cfg.snapshot_threshold_entries = opt_.threshold;
     cfg.max_bytes_per_append = opt_.max_bytes;
+    cfg.snapshot_trailing_entries = opt_.trailing;
     s.node = std::make_unique<RaftNodeImpl>(id, peers, transports_[id - 1].get(), cfg, s.storage.get());
     MapStateMachine* sm = s.sm.get();
     s.node->SetApplyCallback([sm](const LogEntry& e) { sm->Apply(e); });
@@ -344,9 +346,10 @@ TEST(RaftSnapshot, ExactlyOnceSurvivesSnapshotInstall) {
 // Random crashes and partitions while a client writes, with snapshots every 8 entries and tiny
 // messages. Every acknowledged write must end up on every node, also after a final full restart.
 TEST(RaftSnapshot, ChaosWithSnapshotsLosesNothing) {
-  for (uint32_t seed : {1u, 2u, 3u}) {
-    SCOPED_TRACE("seed=" + std::to_string(seed));
-    SnapCluster c({3, true, 8, /*max_bytes=*/512});
+  for (uint32_t seed : {1u, 2u, 3u, 4u, 5u, 6u}) {
+    const size_t trailing = seed % 2 == 0 ? 6 : 0;  // half the runs keep entries below snapshots
+    SCOPED_TRACE("seed=" + std::to_string(seed) + " trailing=" + std::to_string(trailing));
+    SnapCluster c({3, true, 8, /*max_bytes=*/512, trailing});
     ASSERT_TRUE(WaitFor([&] { return c.Leader() != 0; }, 8000ms));
     constexpr uint64_t kN = 100;
     std::atomic<unsigned> down{0};
@@ -411,6 +414,69 @@ TEST(RaftSnapshot, ChaosWithSnapshotsLosesNothing) {
     ASSERT_TRUE(WaitFor([&] { return c.Leader() != 0; }, 10000ms));
     ASSERT_TRUE(WaitFor([&] { return AllHave(c, 1, kN, {1, 2, 3}); }, 30000ms))
         << "lost a write across a full restart";
+  }
+}
+
+
+// ---- trailing entries ----
+
+// A follower that is only a little behind is caught up with plain log entries when the leader
+// keeps entries below its snapshot, and needs a whole snapshot when it does not.
+TEST(RaftSnapshotTrailing, SlowFollowerNeedsNoSnapshotWhenEntriesAreKept) {
+  for (size_t trailing : {size_t{0}, size_t{200}}) {
+    SCOPED_TRACE("trailing=" + std::to_string(trailing));
+    SnapCluster c({3, false, 10, 1 << 20, trailing});
+    ASSERT_TRUE(WaitFor([&] { return c.Leader() != 0; }, 8000ms));
+    NodeId leader = c.Leader();
+    NodeId follower = leader % 3 + 1;
+    std::atomic<unsigned> none{0};
+    for (uint64_t s = 1; s <= 5; ++s) ASSERT_TRUE(Write(c, PutCmd(s), none));
+    ASSERT_TRUE(WaitFor([&] { return AllHave(c, 1, 5, {follower}); }, 8000ms));
+    c.net().Disconnect(follower);
+    std::atomic<unsigned> down{1u << follower};
+    for (uint64_t s = 6; s <= 50; ++s) ASSERT_TRUE(Write(c, PutCmd(s), down));
+    ASSERT_GT(c.Node(leader)->SnapshotIndex(), 5u) << "the leader should have snapshotted past the follower";
+    c.net().Reconnect(follower);
+    ASSERT_TRUE(WaitFor([&] { return AllHave(c, 1, 50, {follower}); }, 15000ms));
+    if (trailing == 0) {
+      EXPECT_GE(c.Sm(follower)->Restores(), 1) << "control: without trailing entries a snapshot is needed";
+    } else {
+      EXPECT_EQ(c.Sm(follower)->Restores(), 0) << "the follower should be caught up from the log";
+    }
+  }
+}
+
+TEST(RaftSnapshotTrailing, LogKeepsOnlyTheTrailingEntries) {
+  SnapCluster c({3, false, 10, 1 << 20, /*trailing=*/20});
+  ASSERT_TRUE(WaitFor([&] { return c.Leader() != 0; }, 8000ms));
+  const std::atomic<unsigned> none{0};
+  for (uint64_t s = 1; s <= 100; ++s) ASSERT_TRUE(Write(c, PutCmd(s), none));
+  ASSERT_TRUE(WaitFor([&] { return AllHave(c, 1, 100, {1, 2, 3}); }, 10000ms));
+  for (NodeId id = 1; id <= 3; ++id) {
+    EXPECT_GT(c.Node(id)->SnapshotIndex(), 0u) << "node " << id;
+    EXPECT_GE(c.Node(id)->LogLength(), 10u) << "node " << id << " dropped entries it should keep";
+    EXPECT_LE(c.Node(id)->LogLength(), 45u) << "node " << id << " never dropped its old log";
+  }
+}
+
+// Entries kept below the snapshot are already reflected in it: after a restart the state machine
+// is restored from the snapshot and must NOT be fed those entries again.
+TEST(RaftSnapshotTrailing, RestartDoesNotReapplyEntriesCoveredByTheSnapshot) {
+  SnapCluster c({3, true, 10, 1 << 20, /*trailing=*/500});  // the log keeps everything
+  ASSERT_TRUE(WaitFor([&] { return c.Leader() != 0; }, 8000ms));
+  const std::atomic<unsigned> none{0};
+  for (uint64_t s = 1; s <= 45; ++s) ASSERT_TRUE(Write(c, PutCmd(s), none));
+  ASSERT_TRUE(WaitFor([&] { return AllHave(c, 1, 45, {1, 2, 3}); }, 10000ms));
+  for (NodeId id = 1; id <= 3; ++id) ASSERT_GT(c.Node(id)->SnapshotIndex(), 5u);
+  c.RestartAll();
+  ASSERT_TRUE(WaitFor([&] { return c.Leader() != 0; }, 8000ms));
+  ASSERT_TRUE(WaitFor([&] { return AllHave(c, 1, 45, {1, 2, 3}); }, 15000ms));
+  for (NodeId id = 1; id <= 3; ++id) {
+    EXPECT_GE(c.Sm(id)->Restores(), 1) << "node " << id;
+    EXPECT_EQ(c.Sm(id)->PutsOf(KeyOf(1)), 0) << "node " << id << " re-applied an entry the snapshot covers";
+    // The restored session table would silently filter re-delivered entries as duplicates, so also
+    // check that none were delivered: no client resent anything here.
+    EXPECT_EQ(c.Sm(id)->Duplicates(), 0u) << "node " << id << " was fed entries the snapshot already covers";
   }
 }
 
@@ -493,4 +559,36 @@ TEST(FileRaftStorageSnapshot, CorruptSnapshotFileMakesLoadFail) {
   FileRaftStorage st(dir.path.string(), false);
   PersistentState ps;
   EXPECT_FALSE(st.Load(&ps));
+}
+
+TEST(FileRaftStorageSnapshot, LogMayStartBelowTheSnapshot) {
+  TempDir dir;
+  {
+    FileRaftStorage st(dir.path.string(), false);
+    PersistentState ps;
+    ASSERT_TRUE(st.Load(&ps));
+    ASSERT_TRUE(st.SaveHardState(6, 3));
+    std::vector<LogEntry> all;
+    for (LogIndex i = 1; i <= 10; ++i) all.push_back(Entry(i, 2, "k" + std::to_string(i)));
+    ASSERT_TRUE(st.AppendEntries(all));
+    // snapshot at 8, but entries 6..10 stay in the log (the log is dropped only up to 5)
+    ASSERT_TRUE(st.SaveSnapshot(8, 2, "state-at-8", 5, 2, {all.begin() + 5, all.end()}));
+    ASSERT_TRUE(st.AppendEntries({Entry(11, 3, "k11")}));
+    ASSERT_TRUE(st.TruncateSuffix(11));
+    ASSERT_TRUE(st.AppendEntries({Entry(11, 4, "k11b")}));
+  }
+  FileRaftStorage st(dir.path.string(), false);
+  PersistentState ps;
+  ASSERT_TRUE(st.Load(&ps));
+  EXPECT_EQ(ps.term, 6u);
+  EXPECT_EQ(ps.voted_for, 3u);
+  EXPECT_EQ(ps.snapshot_index, 8u);
+  EXPECT_EQ(ps.snapshot_term, 2u);
+  EXPECT_EQ(ps.snapshot_data, "state-at-8");
+  EXPECT_EQ(ps.log_base_index, 5u);
+  EXPECT_EQ(ps.log_base_term, 2u);
+  ASSERT_EQ(ps.log.size(), 6u);  // 6..11
+  EXPECT_EQ(ps.log.front().index, 6u);
+  EXPECT_EQ(ps.log.back().index, 11u);
+  EXPECT_EQ(ps.log.back().command.key, "k11b");
 }
