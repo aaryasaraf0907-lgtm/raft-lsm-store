@@ -27,6 +27,19 @@ class GrpcTransport final : public Transport {
   void SendAppendEntries(
       NodeId to, const AppendEntriesRequest& req,
       std::function<void(const AppendEntriesReply&)> on_reply) override;
+  // PreVote is carried over gRPC, so nodes run PreVote rounds before real elections.
+  bool SupportsPreVote() const override { return true; }
+  void SendPreVote(
+      NodeId to, const PreVoteRequest& req,
+      std::function<void(const PreVoteReply&)> on_reply) override;
+  // Sends one snapshot chunk. Raft resends the current chunk on every heartbeat until it is
+  // acknowledged, so at most ONE snapshot RPC per peer is in flight: while one is outstanding,
+  // further sends to that peer are dropped (Raft treats silence as a failed send and retries).
+  // Without this, a peer that never answers would fill the worker pool with duplicate snapshot
+  // RPCs and starve heartbeats to the healthy peers.
+  void SendInstallSnapshot(
+      NodeId to, const InstallSnapshotRequest& req,
+      std::function<void(const InstallSnapshotReply&)> on_reply) override;
   // Non-owning: the handler must remain alive until Stop() has completed.
   // Replacing or clearing it while running must be synchronized with requests.
   void SetHandler(RpcHandler* handler) override;

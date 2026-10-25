@@ -49,7 +49,39 @@ message AppendEntriesReply {
   uint64 match_index = 3;
 }
 
+// PreVote: "would you vote for me in a real election at `term`?" Changes no state on the receiver.
+message PreVoteRequest {
+  uint64 term = 1;  // the term the candidate would use (its own term + 1)
+  uint32 candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+
+message PreVoteReply {
+  uint64 term = 1;  // the replier's current term
+  bool granted = 2;
+}
+
+// One chunk of a snapshot. `data` is opaque bytes (bytes, not string: it is binary).
+message InstallSnapshotRequest {
+  uint64 term = 1;
+  uint32 leader_id = 2;
+  uint64 last_included_index = 3;
+  uint64 last_included_term = 4;
+  uint64 offset = 5;
+  bytes data = 6;
+  bool done = 7;
+}
+
+message InstallSnapshotReply {
+  uint64 term = 1;
+  uint64 next_offset = 2;
+  bool installed = 3;
+}
+
 service RaftRpc {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteReply);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesReply);
+  rpc PreVote(PreVoteRequest) returns (PreVoteReply);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotReply);
 }

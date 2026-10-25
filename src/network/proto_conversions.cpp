@@ -96,6 +96,42 @@ proto::AppendEntriesReply ToProto(const AppendEntriesReply& message) {
   return converted;
 }
 
+proto::PreVoteRequest ToProto(const PreVoteRequest& message) {
+  proto::PreVoteRequest converted;
+  converted.set_term(message.term);
+  converted.set_candidate_id(message.candidate_id);
+  converted.set_last_log_index(message.last_log_index);
+  converted.set_last_log_term(message.last_log_term);
+  return converted;
+}
+
+proto::PreVoteReply ToProto(const PreVoteReply& message) {
+  proto::PreVoteReply converted;
+  converted.set_term(message.term);
+  converted.set_granted(message.granted);
+  return converted;
+}
+
+proto::InstallSnapshotRequest ToProto(const InstallSnapshotRequest& message) {
+  proto::InstallSnapshotRequest converted;
+  converted.set_term(message.term);
+  converted.set_leader_id(message.leader_id);
+  converted.set_last_included_index(message.last_included_index);
+  converted.set_last_included_term(message.last_included_term);
+  converted.set_offset(message.offset);
+  converted.set_data(message.data);
+  converted.set_done(message.done);
+  return converted;
+}
+
+proto::InstallSnapshotReply ToProto(const InstallSnapshotReply& message) {
+  proto::InstallSnapshotReply converted;
+  converted.set_term(message.term);
+  converted.set_next_offset(message.next_offset);
+  converted.set_installed(message.installed);
+  return converted;
+}
+
 RequestVoteRequest FromProto(const proto::RequestVoteRequest& message) {
   return {message.term(), message.candidate_id(), message.last_log_index(),
           message.last_log_term()};
@@ -122,6 +158,29 @@ AppendEntriesRequest FromProto(const proto::AppendEntriesRequest& message) {
 
 AppendEntriesReply FromProto(const proto::AppendEntriesReply& message) {
   return {message.term(), message.success(), message.match_index()};
+}
+
+PreVoteRequest FromProto(const proto::PreVoteRequest& message) {
+  return {message.term(), message.candidate_id(), message.last_log_index(),
+          message.last_log_term()};
+}
+
+PreVoteReply FromProto(const proto::PreVoteReply& message) {
+  return {message.term(), message.granted()};
+}
+
+InstallSnapshotRequest FromProto(const proto::InstallSnapshotRequest& message) {
+  return {message.term(),
+          message.leader_id(),
+          message.last_included_index(),
+          message.last_included_term(),
+          message.offset(),
+          message.data(),
+          message.done()};
+}
+
+InstallSnapshotReply FromProto(const proto::InstallSnapshotReply& message) {
+  return {message.term(), message.next_offset(), message.installed()};
 }
 
 }  // namespace raftkv::network
