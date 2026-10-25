@@ -113,13 +113,13 @@ TEST(BloomFilterTest, NumBitsSizing) {
 
 TEST(BloomFilterTest, NumBitsRejectsInvalidBitsPerKeyAndOverflow) {
   uint64_t m = 12345;
-  EXPECT_EQ(BloomFilter::ComputeNumBits(10, 0, &m), Status::kCorruption);
-  EXPECT_EQ(BloomFilter::ComputeNumBits(10, 65, &m), Status::kCorruption);
+  EXPECT_EQ(BloomFilter::ComputeNumBits(10, 0, &m), Status::kInvalidArgument);
+  EXPECT_EQ(BloomFilter::ComputeNumBits(10, 65, &m), Status::kInvalidArgument);
   const uint64_t max = std::numeric_limits<uint64_t>::max();
   // §7.4: n <= (2^64 - 1 - 7) / bits_per_key, checked before multiplying.
-  EXPECT_EQ(BloomFilter::ComputeNumBits((max - 7) / 10 + 1, 10, &m), Status::kCorruption);
-  EXPECT_EQ(BloomFilter::ComputeNumBits(uint64_t{1} << 58, 64, &m), Status::kCorruption);
-  EXPECT_EQ(BloomFilter::ComputeNumBits(max, 1, &m), Status::kCorruption);
+  EXPECT_EQ(BloomFilter::ComputeNumBits((max - 7) / 10 + 1, 10, &m), Status::kInvalidArgument);
+  EXPECT_EQ(BloomFilter::ComputeNumBits(uint64_t{1} << 58, 64, &m), Status::kInvalidArgument);
+  EXPECT_EQ(BloomFilter::ComputeNumBits(max, 1, &m), Status::kInvalidArgument);
   EXPECT_EQ(m, 12345u) << "output untouched on error";
   if (sizeof(size_t) >= 8) {  // the bit array fits in memory on 64-bit platforms
     ASSERT_EQ(BloomFilter::ComputeNumBits((max - 7) / 10, 10, &m), Status::kOk);
@@ -131,8 +131,8 @@ TEST(BloomFilterTest, NumBitsRejectsInvalidBitsPerKeyAndOverflow) {
 TEST(BloomFilterTest, BuildRejectsInvalidBitsPerKey) {
   BloomFilter f = BuildOrDie({"x"});
   const std::string before = f.Serialize();
-  EXPECT_EQ(BloomFilter::Build(Hashes({"a"}), 0, &f), Status::kCorruption);
-  EXPECT_EQ(BloomFilter::Build(Hashes({"a"}), 65, &f), Status::kCorruption);
+  EXPECT_EQ(BloomFilter::Build(Hashes({"a"}), 0, &f), Status::kInvalidArgument);
+  EXPECT_EQ(BloomFilter::Build(Hashes({"a"}), 65, &f), Status::kInvalidArgument);
   EXPECT_EQ(f.Serialize(), before) << "output untouched on error";
 }
 
