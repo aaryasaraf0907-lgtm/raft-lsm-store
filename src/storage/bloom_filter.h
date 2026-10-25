@@ -10,8 +10,9 @@
 // MayContain() == false means the key is definitely absent; true means "possibly present".
 // A filter never reports an inserted key as absent.
 //
-// Errors use the existing Status values. Invalid build parameters and malformed serialized
-// data both return kCorruption (spec §10.3; pending team decision M3).
+// Errors (team decision M3): invalid build parameters (bits_per_key outside [1, 64]) and
+// filter-size overflow return kInvalidArgument; malformed serialized data passed to Parse
+// returns kCorruption.
 #pragma once
 
 #include <cstddef>
@@ -46,11 +47,12 @@ class BloomFilter {
   static uint32_t ProbesForBitsPerKey(uint32_t bits_per_key);
 
   // num_bits = max(64, round_up_to_8(num_keys * bits_per_key)); 64 when num_keys == 0.
-  // kCorruption if bits_per_key is outside [1, 64] or the product would overflow.
+  // kInvalidArgument if bits_per_key is outside [1, 64] or the size would overflow.
   static Status ComputeNumBits(uint64_t num_keys, uint32_t bits_per_key, uint64_t* num_bits);
 
   // Builds a filter containing every hash in `key_hashes` (values from Hash()).
-  // An empty vector yields an empty filter. On error *out is left unchanged.
+  // An empty vector yields an empty filter. kInvalidArgument for the same cases as
+  // ComputeNumBits. On error *out is left unchanged.
   static Status Build(const std::vector<uint64_t>& key_hashes, uint32_t bits_per_key,
                       BloomFilter* out);
 
