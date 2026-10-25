@@ -101,7 +101,7 @@ The record header is 9 bytes; the smallest record (empty key, empty value) is 9 
 rejects `1 + 4 + key + value > WAL::kMaxPayloadBytes (2^26)`, i.e. the WAL accepts
 `key + value <= 2^26 - 5`. Therefore every entry that reached the MemTable through the WAL fits
 in an SSTable record. `MemTable::Put` itself has no limit; an entry inserted without the WAL that
-exceeds `kMaxKeyValueBytes` is rejected by the writer (§12.1).
+exceeds `kMaxKeyValueBytes` is rejected by the writer with `kInvalidArgument` (§12.1, W3).
 
 **Deletion semantics.** The tombstone bit is the only deletion marker:
 
@@ -110,7 +110,7 @@ exceeds `kMaxKeyValueBytes` is rejected by the writer (§12.1).
 | 0 | 0 | Key present with an **empty value** (a valid stored value, not a delete). |
 | 0 | > 0 | Key present with that value. |
 | 1 | 0 | Tombstone: key deleted. |
-| 1 | > 0 | Invalid — writer rejects, reader reports `kCorruption`. |
+| 1 | > 0 | Invalid — writer rejects the entry with `kInvalidArgument` (W2); reader reports `kCorruption`. |
 
 Within one file each key appears at most once (§5.2).
 
@@ -219,10 +219,12 @@ ascending index order.
 
 ### 7.4 Building (writer)
 
-- `bits_per_key` is a writer option in `[1, 64]`; default 10. Other values are rejected.
+- `bits_per_key` is a writer option in `[1, 64]`; default 10. Other values are rejected with
+  `kInvalidArgument`.
 - `k = clamp(bits_per_key * 69 / 100, 1, 30)` using integer division (default → 6).
 - For `n >= 1` keys: `m = max(64, round_up_to_multiple_of_8(n * bits_per_key))`. The writer
-  MUST check `n <= (2^64 - 1 - 7) / bits_per_key` before multiplying and fail otherwise.
+  MUST check `n <= (2^64 - 1 - 7) / bits_per_key` before multiplying and otherwise fail with
+  `kInvalidArgument` (likewise if the `m / 8`-byte bit array cannot be addressed by `size_t`).
 - Every key written to the file is inserted, **tombstones included** (a tombstone must be found
   so that it shadows older files).
 - The writer keeps one u64 `BloomHash` per key while writing (8 bytes of memory per key) and
@@ -346,9 +348,13 @@ equals `entry_count`.
 | `open`, `fstat`, `pread`, `write`, `fsync`, `mkstemp`, `link`, `unlink` system-call failure (incl. missing file); `EINTR` is retried | `kIOError` |
 | Any structural, CRC, limit, ordering or count violation; unsupported `version`; non-zero reserved field | `kCorruption` |
 | `pread` returning fewer bytes than a range already validated against the open-time file size | `kCorruption` |
-| Invalid writer input (§12.1) or invalid compaction metadata (§13.2) | `kCorruption` (pending decision M3, Appendix A.8) |
+| Invalid API arguments or caller-supplied metadata, detected before any file data is trusted: Bloom `bits_per_key` or sizing overflow (§7.4); builder parameters and `Add` rules W1–W4 (§12.1); compaction checks C1–C7, including zero inputs (§13.2) | `kInvalidArgument` |
 
-`kNotFound` is never used for a file-level problem.
+`kNotFound` is never used for a file-level problem. The split between the last row and the
+`kCorruption` rows is by **where the bad value comes from**: a value supplied by the caller
+through the API is `kInvalidArgument`; a value read from a file (footer, index, filter or block
+bytes) is `kCorruption`, even when the caller wrote that file earlier. `kInvalidArgument` is never
+retryable with the same arguments (see `kv_store.h`).
 
 ## 11. Reader and iterator
 
@@ -400,18 +406,20 @@ concrete class only: `Status status() const`.
 ### 12.1 Builder input
 
 The builder is created with `final_path`, `file_number`, `min_seq`, `max_seq` (`min_seq <=
-max_seq`, else rejected) and `bits_per_key` (§7.4). It exposes `Add(entry)`, `Finish()` and
+max_seq`, else rejected with `kInvalidArgument`) and `bits_per_key` (§7.4). It exposes `Add(entry)`, `Finish()` and
 `Abandon()`; destroying an unfinished builder is equivalent to `Abandon()`. A convenience
 function MAY drain a `KVIterator` into a builder (used by flush; `MemTable::Iterator` cannot fail).
 
-`Add` rejects, and puts the builder into a failed state, when:
+`Add` returns `kInvalidArgument`, and puts the builder into a failed state, when:
 
 - **W1** the key is not strictly greater than the previous key (duplicates included);
 - **W2** `tombstone == true` and `value` is non-empty;
 - **W3** `key.size() + value.size() > kMaxKeyValueBytes`;
 - **W4** the builder has already failed, finished or been abandoned.
 
-After any failure every later call fails and `Finish()` MUST NOT publish.
+After any failure every later call fails and `Finish()` MUST NOT publish. A later call rejected
+under W4 returns `kInvalidArgument`; the original failure (including any `kIOError`) was already
+returned by the call that caused it.
 
 ### 12.2 Publication protocol
 
@@ -465,7 +473,7 @@ Let `S` be `live_files` sorted by `min_seq`.
 
 - **C1** `live_files` file numbers are unique; every entry has `min_seq <= max_seq`.
 - **C2** Ranges in `S` are pairwise disjoint: `S[j].max_seq < S[j+1].min_seq` for all `j`.
-- **C3** `inputs` is non-empty (zero inputs are rejected; pending M3).
+- **C3** `inputs` is non-empty (zero inputs are rejected).
 - **C4** Input identity: each input's footer `{file_number, min_seq, max_seq}` equals exactly one
   entry of `live_files` (matched by `file_number`, all three fields compared). No input appears
   twice.
@@ -475,7 +483,10 @@ Let `S` be `live_files` sorted by `min_seq`.
 - **C7** If `drop_tombstones`, then `a == 0` (the run starts at the oldest live file).
   Otherwise the call is rejected; it is never silently downgraded to retaining tombstones.
 
-Any violation returns `kCorruption` before any file is created.
+Any violation returns `kInvalidArgument` before any file is created. These checks compare
+caller-supplied metadata (`live_files`, `output_file_number`, `drop_tombstones`, the set of
+inputs) with footers that `Open` has already validated; corruption in an input file is reported
+as `kCorruption` by `Open` or by the input's iterator (§10, §13.4), never by these checks.
 
 ### 13.3 Output sequence range
 
@@ -601,8 +612,10 @@ deliberately carries no applied-index field.
 ### A.8 Open decisions
 
 - **M2** Record limit `key + value <= 2^26` (§4).
-- **M3** Map invalid writer input, invalid compaction metadata and zero-input compaction to
-  `kCorruption` (no `kInvalidArgument` exists), or add a `Status` value (shared-header change).
+- **M3** *Resolved.* `Status::kInvalidArgument` now exists in `kv_store.h`. Invalid API
+  arguments and caller-supplied metadata (Bloom parameters, writer input W1–W4, compaction
+  checks C1–C7 including zero inputs) return `kInvalidArgument`; malformed or corrupted
+  serialized SSTable data remains `kCorruption` (§10.3).
 - **M4** Reuse `raftkv::Crc32` from `wal.h`; keep a private full-sync helper in the SSTable code
   (`FullSync` in `wal.cpp` is file-local) or extract a shared helper.
 - **M5** Publication protocol of §12.2, and that flush/engine code never opens builder temporary files (`<final_path>.tmp.XXXXXX`, identified by the `.tmp.` segment after the final SSTable path).

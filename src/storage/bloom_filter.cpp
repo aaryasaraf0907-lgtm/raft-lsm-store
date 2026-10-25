@@ -59,15 +59,17 @@ uint32_t BloomFilter::ProbesForBitsPerKey(uint32_t bits_per_key) {
 }
 
 Status BloomFilter::ComputeNumBits(uint64_t num_keys, uint32_t bits_per_key, uint64_t* num_bits) {
-  if (bits_per_key < kMinBitsPerKey || bits_per_key > kMaxBitsPerKey) return Status::kCorruption;
+  if (bits_per_key < kMinBitsPerKey || bits_per_key > kMaxBitsPerKey) {
+    return Status::kInvalidArgument;
+  }
   if (num_keys == 0) {
     *num_bits = kMinBits;
     return Status::kOk;
   }
-  if (num_keys > (kU64Max - 7) / bits_per_key) return Status::kCorruption;  // §7.4 overflow check
-  const uint64_t rounded = (num_keys * bits_per_key + 7) / 8 * 8;            // cannot overflow now
+  if (num_keys > (kU64Max - 7) / bits_per_key) return Status::kInvalidArgument;  // §7.4 overflow
+  const uint64_t rounded = (num_keys * bits_per_key + 7) / 8 * 8;  // cannot overflow now
   const uint64_t m = rounded < kMinBits ? kMinBits : rounded;
-  if (m / 8 > std::numeric_limits<size_t>::max()) return Status::kCorruption;  // bit array must fit
+  if (m / 8 > std::numeric_limits<size_t>::max()) return Status::kInvalidArgument;  // must fit
   *num_bits = m;
   return Status::kOk;
 }
