@@ -31,6 +31,10 @@ struct RaftConfig {
   // onwards instead of dropping everything up to A. A follower that is behind by no more than
   // that is then caught up with plain log entries instead of a whole snapshot. 0 = drop them all.
   size_t snapshot_trailing_entries = 0;
+  // Run a PreVote round before every real election (and only if the transport supports it, see
+  // Transport::SupportsPreVote). A node that is cut off then cannot inflate its term while it is
+  // away and force a healthy leader to step down when it returns.
+  bool enable_pre_vote = true;
 };
 
 enum class Role { kFollower, kCandidate, kLeader };
@@ -101,6 +105,9 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   // RpcHandler
   RequestVoteReply HandleRequestVote(const RequestVoteRequest& req) override;
   AppendEntriesReply HandleAppendEntries(const AppendEntriesRequest& req) override;
+  // Answers "would you vote for me in a real election at req.term?" WITHOUT changing any state:
+  // no term update, no recorded vote, no timer reset, nothing persisted.
+  PreVoteReply HandlePreVote(const PreVoteRequest& req) override;
   InstallSnapshotReply HandleInstallSnapshot(const InstallSnapshotRequest& req) override;
 
  private:
@@ -109,6 +116,10 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   void TickerLoop();
   void ApplierLoop();
   void StartElectionLocked();
+  void StartElectionOrPreVoteLocked();
+  void StartPreVoteLocked();
+  void OnPreVoteReply(uint64_t round, const PreVoteReply& reply);
+  void NoteLeaderContactLocked();
   void BecomeFollowerLocked(Term term, bool persist = true);
   void BecomeLeaderLocked();
   void BroadcastAppendEntriesLocked();
@@ -191,6 +202,16 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   uint64_t send_seq_ = 0;
   std::map<NodeId, uint64_t> acked_seq_;
   LogIndex term_start_index_ = 0;  // index of the no-op this leader appended when elected
+
+  // PreVote state (guarded by mu_). A round is identified by prevote_round_ so late replies from
+  // an earlier round are ignored.
+  bool prevote_active_ = false;
+  uint64_t prevote_round_ = 0;
+  int prevotes_ = 0;
+  // When we last heard from a valid leader. A node that heard one within the minimum election
+  // timeout refuses to pre-vote: the leader is alive, so nobody should be starting an election.
+  bool have_leader_contact_ = false;
+  Clock::time_point last_leader_contact_;
 
   Clock::time_point election_deadline_;
   Clock::time_point next_heartbeat_;

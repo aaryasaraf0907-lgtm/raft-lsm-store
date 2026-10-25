@@ -13,6 +13,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "raft/fake_transport.h"
@@ -80,9 +81,11 @@ struct Cluster {
   std::vector<std::unique_ptr<FileRaftStorage>> storages;  // null entries when not persistent
   std::vector<std::unique_ptr<RaftNodeImpl>> nodes;
   int size;
+  std::function<void(RaftConfig&)> tweak_;
 
-  explicit Cluster(int n, bool persistent = false)
-      : applied(static_cast<size_t>(n)), size(n) {
+  // `tweak` may adjust each node's RaftConfig before it is built (e.g. to turn PreVote off).
+  explicit Cluster(int n, bool persistent = false, std::function<void(RaftConfig&)> tweak = nullptr)
+      : applied(static_cast<size_t>(n)), size(n), tweak_(std::move(tweak)) {
     if (persistent) tmp = std::make_unique<TempDir>();
     storages.resize(static_cast<size_t>(n));
     for (int id = 1; id <= n; ++id) transports.push_back(net.MakeTransport(static_cast<NodeId>(id)));
@@ -166,6 +169,7 @@ struct Cluster {
     }
     RaftConfig cfg;
     cfg.random_seed = 42;
+    if (tweak_) tweak_(cfg);
     auto node = std::make_unique<RaftNodeImpl>(id, peers, transports[id - 1].get(), cfg, storage);
     node->SetApplyCallback([this, id](const LogEntry& e) {
       std::lock_guard<std::mutex> lk(applied_mu);

@@ -51,4 +51,19 @@ struct InstallSnapshotReply {
   bool installed;        // the follower now has (or already had) the state this snapshot covers
 };
 
+// PreVote: before a real election, a node asks whether it WOULD win one at `term` (its own term
+// + 1). Nobody changes their term or vote because of it, so a node that is cut off from the
+// cluster cannot keep inflating its term and disrupt the leader when it comes back.
+struct PreVoteRequest {
+  Term term;  // the term the candidate would use in a real election
+  NodeId candidate_id;
+  LogIndex last_log_index;
+  Term last_log_term;
+};
+
+struct PreVoteReply {
+  Term term;  // the replier's CURRENT term (a candidate that is behind learns it from here)
+  bool granted;
+};
+
 }  // namespace raftkv

@@ -17,6 +17,8 @@ class RpcHandler {
   virtual InstallSnapshotReply HandleInstallSnapshot(const InstallSnapshotRequest&) {
     return InstallSnapshotReply{0, 0, false};
   }
+  // Not pure on purpose, like the one above. The default refuses; the Raft node overrides it.
+  virtual PreVoteReply HandlePreVote(const PreVoteRequest&) { return PreVoteReply{0, false}; }
 };
 
 // Contract for node-to-node messaging.
@@ -41,6 +43,14 @@ class Transport {
   // failed send; a transport that supports snapshots overrides it.
   virtual void SendInstallSnapshot(NodeId, const InstallSnapshotRequest&,
                                    std::function<void(const InstallSnapshotReply&)>) {}
+
+  // Whether this transport can carry PreVote. A node only runs PreVote rounds if it can: with a
+  // transport that drops them, no node could ever collect a majority and no leader would be
+  // elected. The default is false, so a transport that has not implemented it keeps working with
+  // plain elections. FakeTransport returns true; GrpcTransport returns false until it implements it.
+  virtual bool SupportsPreVote() const { return false; }
+  virtual void SendPreVote(NodeId, const PreVoteRequest&,
+                           std::function<void(const PreVoteReply&)>) {}
 
   // Register the node that handles incoming requests. Call before Start().
   virtual void SetHandler(RpcHandler* handler) = 0;
