@@ -17,6 +17,12 @@ add_executable(raft_tests ${RAFT_TESTS})
 target_link_libraries(raft_tests raftkv_raft GTest::gtest_main)
 gtest_discover_tests(raft_tests)
 
+# Any *_test.cpp in tests/integration/ is picked up automatically.
+file(GLOB INTEGRATION_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/integration/*_test.cpp)
+add_executable(integration_tests ${INTEGRATION_TESTS})
+target_link_libraries(integration_tests raftkv_raft raftkv_storage GTest::gtest_main)
+gtest_discover_tests(integration_tests)
+
 if(RAFTKV_BUILD_NETWORK)
   add_executable(network_proto_tests
     network/proto_conversions_test.cpp
