@@ -2,6 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <random>
@@ -23,12 +24,23 @@ struct RaftConfig {
   // well below the transport's message limit (gRPC's default is 4 MB).
   size_t max_bytes_per_append = 1 << 20;
   uint32_t random_seed = 1;            // seed is combined with the node id
+  // Take a snapshot and drop the log prefix once this many entries have been applied since the
+  // last one. 0 = never (also needs SetSnapshotCallbacks).
+  size_t snapshot_threshold_entries = 0;
 };
 
 enum class Role { kFollower, kCandidate, kLeader };
 
 // Raft node: leader election, log replication, commit and in-order apply, with optional
-// persistence. Snapshots come in a later PR.
+// persistence, snapshots and log compaction.
+//
+// Snapshots: the state machine hands Raft an opaque byte string through SetSnapshotCallbacks.
+// Once `snapshot_threshold_entries` entries were applied since the last snapshot, the applier
+// thread asks for one (between applies, so it matches exactly the entries applied so far), saves
+// it and drops the log up to that index. A follower that is behind the dropped prefix is sent the
+// snapshot in chunks (InstallSnapshot) instead of log entries, and restores its state machine
+// from it. The snapshot MUST contain everything the state machine needs to continue from that
+// index, including the client session table used for exactly-once (ClientSessionTable::Serialize).
 //
 // Persistence: pass a RaftStorage and the node reloads its term, vote and log from it on
 // construction, and saves them BEFORE answering any RPC that changed them (a vote, an appended
@@ -60,6 +72,13 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   // node lock held, so it may call back into the node). kNoop entries are not delivered.
   // Set it before Start(); committed entries wait until a callback is set.
   void SetApplyCallback(ApplyCallback cb) override;
+  // `take` returns the state machine's state as of the last entry delivered to the apply callback
+  // (it is called on the apply thread, so nothing is applied meanwhile). `restore` replaces the
+  // state machine's state with a snapshot (also on the apply thread) and is called on startup if
+  // a snapshot was saved, and when a leader sends one. Set both before Start().
+  using SnapshotTaker = std::function<std::string()>;
+  using SnapshotRestorer = std::function<void(const std::string&)>;
+  void SetSnapshotCallbacks(SnapshotTaker take, SnapshotRestorer restore);
   bool IsLeader() const override;
   Term CurrentTerm() const override;
 
@@ -67,10 +86,13 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   NodeId Id() const { return id_; }
   LogIndex CommitIndex() const;
   LogIndex LastApplied() const;
+  LogIndex SnapshotIndex() const;  // last log index covered by the snapshot (0 = none)
+  size_t LogLength() const;        // log entries still stored (after the snapshot)
 
   // RpcHandler
   RequestVoteReply HandleRequestVote(const RequestVoteRequest& req) override;
   AppendEntriesReply HandleAppendEntries(const AppendEntriesRequest& req) override;
+  InstallSnapshotReply HandleInstallSnapshot(const InstallSnapshotRequest& req) override;
 
  private:
   using Clock = std::chrono::steady_clock;
@@ -82,6 +104,13 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   void BecomeLeaderLocked();
   void BroadcastAppendEntriesLocked();
   void SendAppendEntriesToLocked(NodeId peer);
+  void SendSnapshotChunkLocked(NodeId peer);
+  void OnInstallSnapshotReply(NodeId peer, Term sent_term, LogIndex snapshot_index,
+                              const InstallSnapshotReply& reply);
+  void InstallSnapshotLocked(LogIndex index, Term term, std::string data);
+  void CompactLocked(LogIndex index, std::string data);
+  LogEntry& EntryLocked(LogIndex index) { return log_[index - base_index_]; }
+  const LogEntry& EntryLocked(LogIndex index) const { return log_[index - base_index_]; }
   void AdvanceCommitIndexLocked();
   LogIndex AppendAsLeaderLocked(const Command& cmd);
   void ResetElectionDeadlineLocked();
@@ -117,7 +146,22 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   NodeId voted_for_ = 0;
   NodeId leader_hint_ = 0;
   int votes_ = 0;
-  std::vector<LogEntry> log_;  // log_[0] is a dummy entry so real indexes start at 1
+  // log_[0] stands for the last entry covered by the snapshot (index base_index_, term
+  // base_term_; both 0 when there is no snapshot), so the entry with index i is
+  // log_[i - base_index_] and real entries start at base_index_ + 1.
+  std::vector<LogEntry> log_;
+  LogIndex base_index_ = 0;
+  Term base_term_ = 0;
+  std::string snapshot_data_;  // the snapshot at base_index_, kept to send to slow followers
+  SnapshotTaker snap_taker_;
+  SnapshotRestorer snap_restorer_;
+  bool restore_pending_ = false;  // the state machine must be restored from snapshot_data_
+  struct IncomingSnapshot {       // follower: a snapshot being received chunk by chunk
+    bool active = false;
+    LogIndex index = 0;
+    Term term = 0;
+    std::string data;
+  } incoming_;
   LogIndex commit_index_ = 0;
   LogIndex last_applied_ = 0;
   ApplyCallback apply_cb_;
@@ -125,6 +169,7 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   // Leader-only state, re-initialised on every election win.
   std::map<NodeId, LogIndex> next_index_;   // next entry to send to each follower
   std::map<NodeId, LogIndex> match_index_;  // highest entry known replicated on each follower
+  std::map<NodeId, uint64_t> snap_offset_;  // next snapshot byte to send to each follower
 
   Clock::time_point election_deadline_;
   Clock::time_point next_heartbeat_;

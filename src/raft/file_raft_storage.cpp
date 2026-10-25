@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <filesystem>
 #include <utility>
 
@@ -19,6 +20,8 @@ constexpr uint8_t kRecHardState = 1;
 constexpr uint8_t kRecEntry = 2;
 constexpr uint8_t kRecTruncate = 3;
 constexpr uint8_t kRecEntryV2 = 4;  // entry + client_id + seq (kRecEntry is the older layout)
+constexpr uint8_t kRecBase = 5;     // snapshot index + term: the log starts right after it
+constexpr uint32_t kSnapshotMagic = 0x504E5352u;  // "RSNP"
 constexpr uint32_t kMaxRecordBytes = 64u * 1024u * 1024u;  // sanity limit when reading
 
 uint32_t Crc32(const char* data, size_t n) {
@@ -130,18 +133,141 @@ bool ApplyRecord(const char* payload, size_t len, PersistentState* st) {
       }
       if (!r.ok || cmd > static_cast<uint8_t>(CommandType::kNoop)) return false;
       e.command.type = static_cast<CommandType>(cmd);
-      if (e.index != st->log.size() + 1) return false;  // log must be contiguous
+      if (e.index != st->snapshot_index + st->log.size() + 1) return false;  // contiguous
       st->log.push_back(std::move(e));
       return true;
     }
     case kRecTruncate: {
       uint64_t from = r.U64();
-      if (!r.ok || from < 1 || from > st->log.size() + 1) return false;
-      st->log.erase(st->log.begin() + static_cast<std::ptrdiff_t>(from - 1), st->log.end());
+      if (!r.ok || from <= st->snapshot_index || from > st->snapshot_index + st->log.size() + 1) {
+        return false;
+      }
+      st->log.erase(st->log.begin() + static_cast<std::ptrdiff_t>(from - st->snapshot_index - 1),
+                    st->log.end());
       return true;
+    }
+    case kRecBase: {
+      st->snapshot_index = r.U64();
+      st->snapshot_term = r.U64();
+      st->log.clear();
+      return r.ok && st->snapshot_index > 0;
     }
     default:
       return false;
+  }
+}
+
+
+void EncodeEntryFrame(std::string* out, const LogEntry& e) {
+  std::string payload;
+  PutU8(&payload, kRecEntryV2);
+  PutU64(&payload, e.index);
+  PutU64(&payload, e.term);
+  PutU8(&payload, static_cast<uint8_t>(e.command.type));
+  PutStr(&payload, e.command.key);
+  PutStr(&payload, e.command.value);
+  PutU64(&payload, e.command.client_id);
+  PutU64(&payload, e.command.seq);
+  AppendFrame(out, payload);
+}
+
+void SyncDir(const std::string& dir) {
+  int dfd = ::open(dir.c_str(), O_RDONLY);
+  if (dfd >= 0) {
+    SyncFd(dfd);
+    ::close(dfd);
+  }
+}
+
+std::string SnapshotFileName(uint64_t index) { return "snapshot-" + std::to_string(index) + ".bin"; }
+
+// Writes `bytes` to a temp file, fsyncs it, renames it over `path` and fsyncs the directory, so
+// `path` is always either the complete old file or the complete new one.
+bool WriteFileAtomic(const std::string& dir, const std::string& path, const std::string& bytes,
+                     bool sync) {
+  std::string tmp = path + ".tmp";
+  int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) return false;
+  bool ok = true;
+  size_t done = 0;
+  while (done < bytes.size()) {
+    ssize_t w = ::write(fd, bytes.data() + done, bytes.size() - done);
+    if (w < 0 && errno == EINTR) continue;
+    if (w <= 0) {
+      ok = false;
+      break;
+    }
+    done += static_cast<size_t>(w);
+  }
+  if (ok && sync) ok = SyncFd(fd);
+  ::close(fd);
+  if (!ok || ::rename(tmp.c_str(), path.c_str()) != 0) {
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  if (sync) SyncDir(dir);
+  return true;
+}
+
+bool ReadWholeFile(const std::string& path, std::string* out) {
+  int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) return false;
+  struct stat sb;
+  if (fstat(fd, &sb) != 0) {
+    ::close(fd);
+    return false;
+  }
+  out->assign(static_cast<size_t>(sb.st_size), '\0');
+  size_t got = 0;
+  while (got < out->size()) {
+    ssize_t r = ::pread(fd, &(*out)[got], out->size() - got, static_cast<off_t>(got));
+    if (r < 0 && errno == EINTR) continue;
+    if (r <= 0) {
+      ::close(fd);
+      return false;
+    }
+    got += static_cast<size_t>(r);
+  }
+  ::close(fd);
+  return true;
+}
+
+// snapshot file = [u32 magic][u64 index][u64 term][u64 length][data][u32 crc of all before]
+std::string EncodeSnapshotFile(uint64_t index, uint64_t term, const std::string& data) {
+  std::string f;
+  PutU32(&f, kSnapshotMagic);
+  PutU64(&f, index);
+  PutU64(&f, term);
+  PutU64(&f, data.size());
+  f.append(data);
+  PutU32(&f, Crc32(f.data(), f.size()));
+  return f;
+}
+
+bool DecodeSnapshotFile(const std::string& f, uint64_t want_index, uint64_t want_term,
+                        std::string* data) {
+  constexpr size_t kHeader = 4 + 8 + 8 + 8;
+  if (f.size() < kHeader + 4) return false;
+  Reader tail(f.data() + f.size() - 4, 4);
+  if (Crc32(f.data(), f.size() - 4) != tail.U32()) return false;
+  Reader r(f.data(), kHeader);
+  if (r.U32() != kSnapshotMagic) return false;
+  uint64_t index = r.U64(), term = r.U64(), len = r.U64();
+  if (!r.ok || index != want_index || term != want_term) return false;
+  if (len != f.size() - kHeader - 4) return false;
+  data->assign(f.data() + kHeader, static_cast<size_t>(len));
+  return true;
+}
+
+// Deletes snapshot files (and temp files) left by a crashed or superseded SaveSnapshot.
+void RemoveStaleFiles(const std::string& dir, uint64_t keep_index) {
+  const std::string keep = keep_index > 0 ? SnapshotFileName(keep_index) : std::string();
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+    std::string name = entry.path().filename().string();
+    bool snapshot = name.rfind("snapshot-", 0) == 0;
+    bool temp = name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0;
+    if ((snapshot || temp) && name != keep) std::filesystem::remove(entry.path(), ec);
   }
 }
 
@@ -200,6 +326,17 @@ bool FileRaftStorage::Load(PersistentState* out) {
     if (ftruncate(fd_, static_cast<off_t>(good_end)) != 0) return false;
     if (sync_ && !SyncFd(fd_)) return false;
   }
+
+  if (out->snapshot_index > 0) {  // the log base points at a snapshot file that must be intact
+    std::string file;
+    if (!ReadWholeFile(dir_ + "/" + SnapshotFileName(out->snapshot_index), &file)) return false;
+    if (!DecodeSnapshotFile(file, out->snapshot_index, out->snapshot_term, &out->snapshot_data)) {
+      return false;
+    }
+  }
+  RemoveStaleFiles(dir_, out->snapshot_index);
+  term_ = out->term;
+  voted_ = out->voted_for;
   return true;
 }
 
@@ -221,23 +358,15 @@ bool FileRaftStorage::SaveHardState(Term term, NodeId voted_for) {
   PutU64(&payload, term);
   PutU32(&payload, voted_for);
   AppendFrame(&frame, payload);
-  return WriteRecords(frame);
+  if (!WriteRecords(frame)) return false;
+  term_ = term;
+  voted_ = voted_for;
+  return true;
 }
 
 bool FileRaftStorage::AppendEntries(const std::vector<LogEntry>& entries) {
   std::string frames;  // all entries go out in one write + one fsync
-  for (const LogEntry& e : entries) {
-    std::string payload;
-    PutU8(&payload, kRecEntryV2);
-    PutU64(&payload, e.index);
-    PutU64(&payload, e.term);
-    PutU8(&payload, static_cast<uint8_t>(e.command.type));
-    PutStr(&payload, e.command.key);
-    PutStr(&payload, e.command.value);
-    PutU64(&payload, e.command.client_id);
-    PutU64(&payload, e.command.seq);
-    AppendFrame(&frames, payload);
-  }
+  for (const LogEntry& e : entries) EncodeEntryFrame(&frames, e);
   return WriteRecords(frames);
 }
 
@@ -247,6 +376,36 @@ bool FileRaftStorage::TruncateSuffix(LogIndex from_index) {
   PutU64(&payload, from_index);
   AppendFrame(&frame, payload);
   return WriteRecords(frame);
+}
+
+bool FileRaftStorage::SaveSnapshot(LogIndex index, Term term, const std::string& data,
+                                   const std::vector<LogEntry>& entries_after) {
+  if (fd_ < 0 || index == 0) return false;
+  // Step 1: the snapshot file. The current log does not mention it yet, so a crash here is
+  // harmless: Load() ignores and deletes it.
+  if (!WriteFileAtomic(dir_, dir_ + "/" + SnapshotFileName(index),
+                       EncodeSnapshotFile(index, term, data), sync_)) {
+    return false;
+  }
+  // Step 2: the new log, [hard state][base][kept entries]. Renaming it over raft.log is the
+  // commit point.
+  std::string log, payload;
+  PutU8(&payload, kRecHardState);
+  PutU64(&payload, term_);
+  PutU32(&payload, voted_);
+  AppendFrame(&log, payload);
+  payload.clear();
+  PutU8(&payload, kRecBase);
+  PutU64(&payload, index);
+  PutU64(&payload, term);
+  AppendFrame(&log, payload);
+  for (const LogEntry& e : entries_after) EncodeEntryFrame(&log, e);
+  if (!WriteFileAtomic(dir_, path_, log, sync_)) return false;
+  ::close(fd_);
+  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_APPEND, 0644);
+  if (fd_ < 0) return false;
+  RemoveStaleFiles(dir_, index);  // the previous snapshot is no longer needed
+  return true;
 }
 
 }  // namespace raftkv

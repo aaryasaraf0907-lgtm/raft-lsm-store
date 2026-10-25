@@ -18,6 +18,11 @@ void FakeTransport::SendAppendEntries(NodeId to, const AppendEntriesRequest& req
   net_->SendAppendEntries(id_, to, req, std::move(on_reply));
 }
 
+void FakeTransport::SendInstallSnapshot(NodeId to, const InstallSnapshotRequest& req,
+                                        std::function<void(const InstallSnapshotReply&)> on_reply) {
+  net_->SendInstallSnapshot(id_, to, req, std::move(on_reply));
+}
+
 void FakeTransport::SetHandler(RpcHandler* handler) { net_->Register(id_, handler); }
 
 void FakeTransport::Stop() { net_->Register(id_, nullptr); }
@@ -110,18 +115,41 @@ void FakeNetwork::SendAppendEntries(NodeId from, NodeId to, const AppendEntriesR
                                     std::function<void(const AppendEntriesReply&)> on_reply) {
   uint64_t gen = GenerationOf(from);
   size_t bytes = ApproxAppendBytes(req);
-  size_t seen = max_observed_bytes_.load();
-  while (bytes > seen && !max_observed_bytes_.compare_exchange_weak(seen, bytes)) {
-  }
-  size_t limit = max_message_bytes_.load();
-  if (limit != 0 && bytes > limit) {  // too big for the "wire": never delivered, no reply
-    ++oversized_dropped_;
-    return;
-  }
+  NoteSize(bytes);
+  if (TooBig(bytes)) return;  // too big for the "wire": never delivered, no reply
   Post([this, from, to, gen, req, on_reply = std::move(on_reply)]() {
     RpcHandler* handler = Lookup(from, to);
     if (handler == nullptr) return;
     AppendEntriesReply reply = handler->HandleAppendEntries(req);
+    if (Reachable(to, from) && SenderStillCurrent(from, gen)) on_reply(reply);
+  });
+}
+
+void FakeNetwork::NoteSize(size_t bytes) {
+  size_t seen = max_observed_bytes_.load();
+  while (bytes > seen && !max_observed_bytes_.compare_exchange_weak(seen, bytes)) {
+  }
+}
+
+bool FakeNetwork::TooBig(size_t bytes) {
+  size_t limit = max_message_bytes_.load();
+  if (limit != 0 && bytes > limit) {
+    ++oversized_dropped_;
+    return true;
+  }
+  return false;
+}
+
+void FakeNetwork::SendInstallSnapshot(NodeId from, NodeId to, const InstallSnapshotRequest& req,
+                                      std::function<void(const InstallSnapshotReply&)> on_reply) {
+  uint64_t gen = GenerationOf(from);
+  size_t bytes = ApproxInstallBytes(req);
+  NoteSize(bytes);
+  if (TooBig(bytes)) return;
+  Post([this, from, to, gen, req, on_reply = std::move(on_reply)]() {
+    RpcHandler* handler = Lookup(from, to);
+    if (handler == nullptr) return;
+    InstallSnapshotReply reply = handler->HandleInstallSnapshot(req);
     if (Reachable(to, from) && SenderStillCurrent(from, gen)) on_reply(reply);
   });
 }

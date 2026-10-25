@@ -22,4 +22,8 @@ inline size_t ApproxAppendBytes(const AppendEntriesRequest& req) {
   return total;
 }
 
+inline size_t ApproxInstallBytes(const InstallSnapshotRequest& req) {
+  return kMessageOverheadBytes + req.data.size();
+}
+
 }  // namespace raftkv
