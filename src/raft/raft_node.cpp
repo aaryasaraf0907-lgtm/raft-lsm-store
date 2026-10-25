@@ -139,6 +139,57 @@ void RaftNodeImpl::SetApplyCallback(ApplyCallback cb) {
   apply_cv_.notify_all();
 }
 
+void RaftNodeImpl::RecordAckLocked(NodeId peer, uint64_t seq) {
+  uint64_t& acked = acked_seq_[peer];
+  if (seq > acked) {
+    acked = seq;
+    wait_cv_.notify_all();  // a ReadIndex waiter may now have its majority
+  }
+}
+
+CommitResponse RaftNodeImpl::ReadIndex(std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lk(mu_);
+  if (!running_) return {CommitResult::kStopped, 0, leader_hint_};
+  if (role_ != Role::kLeader) return {CommitResult::kNotLeader, 0, leader_hint_};
+
+  const Term term = current_term_;
+  const size_t cluster_size = peers_.size() + 1;
+  bool have_index = false;
+  LogIndex read_index = 0;
+  uint64_t seq_mark = 0;
+  CommitResult outcome = CommitResult::kTimeout;
+  auto resolved = [&] {
+    if (!running_) {
+      outcome = CommitResult::kStopped;
+      return true;
+    }
+    if (role_ != Role::kLeader || current_term_ != term) {
+      outcome = CommitResult::kNotLeader;
+      return true;
+    }
+    if (!have_index) {
+      // Until an entry of OUR term has committed, commit_index_ may lag behind entries that an
+      // earlier leader already committed, so a read at it could be stale.
+      if (commit_index_ < term_start_index_) return false;
+      read_index = commit_index_;
+      seq_mark = send_seq_;
+      have_index = true;
+      BroadcastAppendEntriesLocked();  // a heartbeat round that starts after the index was fixed
+    }
+    size_t acks = 1;  // ourselves
+    for (NodeId peer : peers_) {
+      auto it = acked_seq_.find(peer);
+      if (it != acked_seq_.end() && it->second > seq_mark) ++acks;
+    }
+    if (acks <= cluster_size / 2) return false;  // not yet known to still be the leader
+    if (last_applied_ < read_index) return false;  // state machine has not caught up
+    outcome = CommitResult::kApplied;
+    return true;
+  };
+  wait_cv_.wait_for(lk, timeout, resolved);  // on timeout `outcome` stays kTimeout
+  return {outcome, read_index, leader_hint_};
+}
+
 void RaftNodeImpl::SetSnapshotCallbacks(SnapshotTaker take, SnapshotRestorer restore) {
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -269,6 +320,7 @@ void RaftNodeImpl::BecomeFollowerLocked(Term term, bool persist) {
   role_ = Role::kFollower;
   ResetElectionDeadlineLocked();
   if (term_changed && persist) PersistHardStateLocked();
+  wait_cv_.notify_all();  // a ReadIndex waiter must notice it is no longer leader
 }
 
 void RaftNodeImpl::StartElectionLocked() {
@@ -323,6 +375,8 @@ void RaftNodeImpl::BecomeLeaderLocked() {
   log_.push_back(LogEntry{current_term_, LastLogIndexLocked() + 1,
                           Command{CommandType::kNoop, "", ""}});
   PersistAppendLocked({log_.back()});
+  acked_seq_.clear();
+  term_start_index_ = log_.back().index;  // reads must wait until this entry is committed
   AdvanceCommitIndexLocked();  // a single-node cluster commits the no-op immediately
   BroadcastAppendEntriesLocked();
 }
@@ -353,10 +407,11 @@ void RaftNodeImpl::SendAppendEntriesToLocked(NodeId peer) {
   }
   Term sent_term = current_term_;
   size_t n_entries = req.entries.size();
+  const uint64_t seq = ++send_seq_;
   transport_->SendAppendEntries(
       peer, req,
-      [this, peer, sent_term, prev, n_entries](const AppendEntriesReply& reply) {
-        OnAppendEntriesReply(peer, sent_term, prev, n_entries, reply);
+      [this, peer, sent_term, seq, prev, n_entries](const AppendEntriesReply& reply) {
+        OnAppendEntriesReply(peer, sent_term, seq, prev, n_entries, reply);
       });
 }
 
@@ -377,13 +432,15 @@ void RaftNodeImpl::SendSnapshotChunkLocked(NodeId peer) {
                              offset + n == snapshot_data_.size()};
   const Term sent_term = current_term_;
   const LogIndex snapshot_index = base_index_;
+  const uint64_t seq = ++send_seq_;
   transport_->SendInstallSnapshot(
-      peer, req, [this, peer, sent_term, snapshot_index](const InstallSnapshotReply& reply) {
-        OnInstallSnapshotReply(peer, sent_term, snapshot_index, reply);
+      peer, req, [this, peer, sent_term, seq, snapshot_index](const InstallSnapshotReply& reply) {
+        OnInstallSnapshotReply(peer, sent_term, seq, snapshot_index, reply);
       });
 }
 
-void RaftNodeImpl::OnInstallSnapshotReply(NodeId peer, Term sent_term, LogIndex snapshot_index,
+void RaftNodeImpl::OnInstallSnapshotReply(NodeId peer, Term sent_term, uint64_t seq,
+                                          LogIndex snapshot_index,
                                           const InstallSnapshotReply& reply) {
   std::lock_guard<std::mutex> lk(mu_);
   if (!running_) return;
@@ -392,6 +449,7 @@ void RaftNodeImpl::OnInstallSnapshotReply(NodeId peer, Term sent_term, LogIndex 
     return;
   }
   if (role_ != Role::kLeader || current_term_ != sent_term) return;
+  RecordAckLocked(peer, seq);
   if (snapshot_index != base_index_) return;  // we have a newer snapshot now; heartbeat restarts
   if (reply.installed) {
     snap_offset_[peer] = 0;
@@ -407,8 +465,9 @@ void RaftNodeImpl::OnInstallSnapshotReply(NodeId peer, Term sent_term, LogIndex 
   if (reply.next_offset < snapshot_data_.size()) SendSnapshotChunkLocked(peer);
 }
 
-void RaftNodeImpl::OnAppendEntriesReply(NodeId peer, Term sent_term, LogIndex prev_index,
-                                        size_t n_entries, const AppendEntriesReply& reply) {
+void RaftNodeImpl::OnAppendEntriesReply(NodeId peer, Term sent_term, uint64_t seq,
+                                        LogIndex prev_index, size_t n_entries,
+                                        const AppendEntriesReply& reply) {
   std::lock_guard<std::mutex> lk(mu_);
   if (!running_) return;
   if (reply.term > current_term_) {  // we are a stale leader
@@ -417,6 +476,7 @@ void RaftNodeImpl::OnAppendEntriesReply(NodeId peer, Term sent_term, LogIndex pr
   }
   // Ignore replies to requests sent in an older term, or if we are no longer the leader.
   if (role_ != Role::kLeader || current_term_ != sent_term) return;
+  RecordAckLocked(peer, seq);  // even a rejection means the follower accepted us as leader
 
   if (reply.success) {
     LogIndex matched = prev_index + n_entries;
