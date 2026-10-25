@@ -68,6 +68,11 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   // the leader's log, NOT when it is committed; commit shows up as the apply callback.
   ProposeResponse Propose(const Command& cmd) override;
   CommitResponse ProposeAndWait(const Command& cmd, std::chrono::milliseconds timeout) override;
+  // Linearizable read barrier without a log write (see RaftNode::ReadIndex). Leader only: fixes
+  // the read index at its commit index (once an entry of its own term has committed), confirms it
+  // is still leader by a heartbeat round that started AFTER that point acknowledged by a
+  // majority, then waits until the state machine has applied up to the read index.
+  CommitResponse ReadIndex(std::chrono::milliseconds timeout) override;
   // Called once per committed entry, in log order, from a dedicated thread (never with the
   // node lock held, so it may call back into the node). kNoop entries are not delivered.
   // Set it before Start(); committed entries wait until a callback is set.
@@ -105,7 +110,7 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   void BroadcastAppendEntriesLocked();
   void SendAppendEntriesToLocked(NodeId peer);
   void SendSnapshotChunkLocked(NodeId peer);
-  void OnInstallSnapshotReply(NodeId peer, Term sent_term, LogIndex snapshot_index,
+  void OnInstallSnapshotReply(NodeId peer, Term sent_term, uint64_t seq, LogIndex snapshot_index,
                               const InstallSnapshotReply& reply);
   void InstallSnapshotLocked(LogIndex index, Term term, std::string data);
   void CompactLocked(LogIndex index, std::string data);
@@ -115,8 +120,9 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   LogIndex AppendAsLeaderLocked(const Command& cmd);
   void ResetElectionDeadlineLocked();
   void OnRequestVoteReply(Term election_term, const RequestVoteReply& reply);
-  void OnAppendEntriesReply(NodeId peer, Term sent_term, LogIndex prev_index, size_t n_entries,
-                            const AppendEntriesReply& reply);
+  void OnAppendEntriesReply(NodeId peer, Term sent_term, uint64_t seq, LogIndex prev_index,
+                            size_t n_entries, const AppendEntriesReply& reply);
+  void RecordAckLocked(NodeId peer, uint64_t seq);
   LogIndex LastLogIndexLocked() const;
   Term LastLogTermLocked() const;
 
@@ -170,6 +176,13 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   std::map<NodeId, LogIndex> next_index_;   // next entry to send to each follower
   std::map<NodeId, LogIndex> match_index_;  // highest entry known replicated on each follower
   std::map<NodeId, uint64_t> snap_offset_;  // next snapshot byte to send to each follower
+  // ReadIndex bookkeeping. Every message sent to a follower gets a number from send_seq_; when a
+  // reply in our term comes back, the follower has accepted us as leader at that moment, and
+  // acked_seq_[peer] records the highest such number. A read confirms leadership once a majority
+  // acked a number above the send_seq_ value taken when its read index was fixed.
+  uint64_t send_seq_ = 0;
+  std::map<NodeId, uint64_t> acked_seq_;
+  LogIndex term_start_index_ = 0;  // index of the no-op this leader appended when elected
 
   Clock::time_point election_deadline_;
   Clock::time_point next_heartbeat_;

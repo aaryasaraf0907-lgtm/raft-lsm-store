@@ -79,6 +79,21 @@ class RaftNode {
   virtual CommitResponse ProposeAndWait(const Command& cmd,
                                         std::chrono::milliseconds timeout) = 0;
 
+  // Linearizable read barrier. Blocks until it is safe to read this node's state machine and
+  // see every write that was acknowledged before this call, then returns kApplied with `index`
+  // = the log index the state machine has caught up to. Unlike a no-op through ProposeAndWait it
+  // writes NOTHING to the log: the leader only confirms with a majority that it is still the
+  // leader and waits for the state machine to reach its commit index.
+  //   kApplied   : read the store now.
+  //   kNotLeader : this node is not (or is no longer) the leader; try leader_hint.
+  //   kTimeout   : leadership could not be confirmed in time (e.g. the leader is cut off).
+  //   kStopped   : the node shut down.
+  // The default is a no-op through the log, the same barrier as before, so an implementation
+  // that does not override it keeps working. RaftNodeImpl overrides it with the real thing.
+  virtual CommitResponse ReadIndex(std::chrono::milliseconds timeout) {
+    return ProposeAndWait(Command{CommandType::kNoop, "", ""}, timeout);
+  }
+
   virtual void SetApplyCallback(ApplyCallback cb) = 0;
   virtual bool IsLeader() const = 0;
   virtual Term CurrentTerm() const = 0;
