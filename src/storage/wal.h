@@ -14,6 +14,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "storage/iterator.h"
 #include "storage/kv_store.h"
@@ -30,10 +31,14 @@ struct ReplayStats {
 
 class WAL {
  public:
+  using WriteFunction = std::function<std::ptrdiff_t(int, const char*, size_t)>;
   static constexpr uint32_t kMaxPayloadBytes = 64u << 20;  // sanity cap
 
   // Opens (creating if needed) the log for appending.
   static Status Open(const std::string& path, std::unique_ptr<WAL>* out);
+  // Opens with an injected writer for tests that need to simulate a partial write failure.
+  static Status OpenForTesting(const std::string& path, std::unique_ptr<WAL>* out,
+                               WriteFunction write_function);
   ~WAL();
   WAL(const WAL&) = delete;
   WAL& operator=(const WAL&) = delete;
@@ -49,9 +54,11 @@ class WAL {
                        ReplayStats* stats = nullptr);
 
  private:
-  explicit WAL(int fd) : fd_(fd) {}
+  explicit WAL(int fd, WriteFunction write_function = {})
+      : fd_(fd), write_function_(std::move(write_function)) {}
   Status Append(uint8_t type, const std::string& key, const std::string& value, bool sync);
   int fd_;
+  WriteFunction write_function_;
   bool failed_ = false;  // set after any failed write/fsync; the log may end in a partial record
 };
 

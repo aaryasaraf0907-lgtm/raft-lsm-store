@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(raft_lsm_store CXX)
 
+if(WIN32)
+  message(FATAL_ERROR "RaftKV supports Linux and macOS only. On Windows, build inside WSL2 Ubuntu.")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 

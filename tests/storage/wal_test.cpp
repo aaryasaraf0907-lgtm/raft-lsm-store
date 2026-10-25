@@ -5,6 +5,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
@@ -206,6 +208,32 @@ TEST_F(WalTest, FailedWriteStopsTheLogInsteadOfHidingLaterRecords) {
   auto r = Replay();
   ASSERT_EQ(r.size(), 1u);
   EXPECT_EQ(r[0].key, "a");
+}
+
+TEST_F(WalTest, InjectedPartialWriteFailurePoisonsWal) {
+  int calls = 0;
+  auto writer = [&calls](int fd, const char* data, size_t size) -> std::ptrdiff_t {
+    ++calls;
+    if (calls == 3) {  // the third write fails outright
+      errno = EIO;
+      return -1;
+    }
+    return static_cast<std::ptrdiff_t>(::write(fd, data, calls == 2 ? std::min<size_t>(10, size) : size));
+  };
+  std::unique_ptr<WAL> wal;
+  ASSERT_EQ(WAL::OpenForTesting(path_, &wal, writer), Status::kOk);
+
+  ASSERT_EQ(wal->AppendPut("first", "record"), Status::kOk);
+  // The second write is short: the log now ends in a partial record, so the WAL must refuse
+  // this record AND every later one instead of burying them behind the torn bytes.
+  EXPECT_EQ(wal->AppendPut("partial", "record"), Status::kIOError);
+  EXPECT_EQ(wal->AppendPut("later", "record"), Status::kIOError);
+  EXPECT_EQ(wal->Sync(), Status::kIOError);
+  wal.reset();
+
+  const auto recovered = Replay();
+  ASSERT_EQ(recovered.size(), 1u);
+  EXPECT_EQ(recovered[0].key, "first");
 }
 
 TEST_F(WalTest, AbsurdLengthFieldIsTreatedAsCorrupt) {
