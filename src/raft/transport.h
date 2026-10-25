@@ -12,7 +12,11 @@ class RpcHandler {
   virtual ~RpcHandler() = default;
   virtual RequestVoteReply HandleRequestVote(const RequestVoteRequest& req) = 0;
   virtual AppendEntriesReply HandleAppendEntries(const AppendEntriesRequest& req) = 0;
-  virtual InstallSnapshotReply HandleInstallSnapshot(const InstallSnapshotRequest& req) = 0;
+  // Not pure on purpose: existing handlers (test doubles, other code) keep compiling. The default
+  // refuses every snapshot; the Raft node overrides it.
+  virtual InstallSnapshotReply HandleInstallSnapshot(const InstallSnapshotRequest&) {
+    return InstallSnapshotReply{0, 0, false};
+  }
 };
 
 // Contract for node-to-node messaging.
