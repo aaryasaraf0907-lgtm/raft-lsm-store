@@ -76,12 +76,12 @@ TEST(SkipListTest, SeekFindsFirstKeyAtOrAfterTarget) {
   EXPECT_FALSE(it.Valid());
 }
 
-TEST(SkipListTest, SizeTracksOverwriteDelta) {
+TEST(SkipListTest, OverwriteAddsOneVersionToSize) {
   SkipList l;
   l.Upsert("k", std::string(100, 'x'), false);
-  size_t big = l.ApproximateBytes();
-  l.Upsert("k", std::string(10, 'x'), false);
-  EXPECT_EQ(l.ApproximateBytes(), big - 90);
+  size_t before = l.ApproximateBytes();
+  l.Upsert("k", std::string(10, 'x'), false);  // old version is kept, so size only grows
+  EXPECT_EQ(l.ApproximateBytes(), before + 1 + 10 + SkipList::kVersionOverhead);
 }
 
 TEST(SkipListTest, MatchesStdMapOnRandomWorkload) {
