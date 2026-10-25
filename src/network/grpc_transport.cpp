@@ -8,6 +8,7 @@
 #include <exception>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -22,6 +23,20 @@ namespace raftkv {
 namespace {
 
 constexpr auto kRpcDeadline = std::chrono::milliseconds(150);
+// A snapshot chunk is up to ~1 MiB and the receiver may fsync a whole snapshot when the last one
+// arrives, so it needs far longer than a heartbeat.
+constexpr auto kSnapshotRpcDeadline = std::chrono::milliseconds(3000);
+// Raft messages are bounded (an AppendEntries is about 1 MiB, a snapshot chunk is about 1 MiB),
+// but gRPC's 4 MiB default would silently turn a larger message into a failed RPC; the limit is
+// set explicitly so it is a decision, not an accident.
+constexpr int kMaxMessageBytes = 8 * 1024 * 1024;
+
+std::shared_ptr<grpc::Channel> MakeChannel(const std::string& address) {
+  grpc::ChannelArguments args;
+  args.SetMaxReceiveMessageSize(kMaxMessageBytes);
+  args.SetMaxSendMessageSize(kMaxMessageBytes);
+  return grpc::CreateCustomChannel(address, grpc::InsecureChannelCredentials(), args);
+}
 constexpr auto kServerShutdownDeadline = std::chrono::milliseconds(500);
 constexpr std::size_t kWorkerCount = 4;
 constexpr std::size_t kMaxQueuedTasks = 256;
@@ -35,8 +50,7 @@ class GrpcTransport::Impl
        std::map<NodeId, std::string> peer_addresses)
       : listen_address_(std::move(listen_address)) {
     for (const auto& peer : peer_addresses) {
-      auto channel = grpc::CreateChannel(
-          peer.second, grpc::InsecureChannelCredentials());
+      auto channel = MakeChannel(peer.second);
       peer_stubs_.emplace(
           peer.first,
           std::shared_ptr<network::proto::RaftRpc::Stub>(
@@ -52,8 +66,7 @@ class GrpcTransport::Impl
     if (address.empty()) {
       throw std::invalid_argument("peer address cannot be empty");
     }
-    auto channel =
-        grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+    auto channel = MakeChannel(address);
     auto stub = std::shared_ptr<network::proto::RaftRpc::Stub>(
         network::proto::RaftRpc::NewStub(std::move(channel)));
     std::lock_guard<std::mutex> lock(mutex_);
@@ -84,6 +97,8 @@ class GrpcTransport::Impl
     builder.AddListeningPort(listen_address_,
                              grpc::InsecureServerCredentials(),
                              &listening_port_);
+    builder.SetMaxReceiveMessageSize(kMaxMessageBytes);
+    builder.SetMaxSendMessageSize(kMaxMessageBytes);
     builder.RegisterService(&service_);
     server_ = builder.BuildAndStart();
     if (!server_) {
@@ -238,6 +253,73 @@ class GrpcTransport::Impl
     });
   }
 
+  void SendPreVote(
+      NodeId to, const PreVoteRequest& request,
+      std::function<void(const PreVoteReply&)> on_reply) {
+    const auto deadline = std::chrono::system_clock::now() + kRpcDeadline;
+    const auto stub = FindStub(to);
+    if (!stub) {
+      return;
+    }
+    auto wire_request = network::ToProto(request);
+    Submit([this, stub, deadline, request = std::move(wire_request),
+                on_reply = std::move(on_reply)]() mutable {
+      network::proto::PreVoteReply wire_reply;
+      grpc::ClientContext context;
+      context.set_deadline(deadline);
+      const auto status = stub->PreVote(&context, request, &wire_reply);
+      if (!status.ok() || !IsRunning() || !on_reply) {
+        return;
+      }
+      const auto reply = network::FromProto(wire_reply);
+      on_reply(reply);
+    });
+  }
+
+  void SendInstallSnapshot(
+      NodeId to, const InstallSnapshotRequest& request,
+      std::function<void(const InstallSnapshotReply&)> on_reply) {
+    const auto stub = FindStub(to);
+    if (!stub) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!started_ || stopping_) {
+        return;
+      }
+      // One snapshot RPC per peer at a time: a repeat while one is outstanding is dropped.
+      if (!snapshot_in_flight_.insert(to).second) {
+        return;
+      }
+    }
+    auto wire_request = network::ToProto(request);
+    const bool queued = Submit([this, to, stub, request = std::move(wire_request),
+                                    on_reply = std::move(on_reply)]() mutable {
+      struct Release {  // frees the per-peer slot however the task ends
+        Impl* self;
+        NodeId peer;
+        ~Release() {
+          std::lock_guard<std::mutex> lock(self->mutex_);
+          self->snapshot_in_flight_.erase(peer);
+        }
+      } release{this, to};
+      network::proto::InstallSnapshotReply wire_reply;
+      grpc::ClientContext context;
+      context.set_deadline(std::chrono::system_clock::now() + kSnapshotRpcDeadline);
+      const auto status = stub->InstallSnapshot(&context, request, &wire_reply);
+      if (!status.ok() || !IsRunning() || !on_reply) {
+        return;
+      }
+      const auto reply = network::FromProto(wire_reply);
+      on_reply(reply);
+    });
+    if (!queued) {  // the task never ran, so nothing will release the slot
+      std::lock_guard<std::mutex> lock(mutex_);
+      snapshot_in_flight_.erase(to);
+    }
+  }
+
  private:
   class Service final : public network::proto::RaftRpc::Service {
    public:
@@ -285,6 +367,47 @@ class GrpcTransport::Impl
       }
     }
 
+    grpc::Status PreVote(
+        grpc::ServerContext*, const network::proto::PreVoteRequest* request,
+        network::proto::PreVoteReply* response) override {
+      auto* handler = owner_->handler_.load(std::memory_order_acquire);
+      if (!handler) {
+        return {grpc::StatusCode::UNAVAILABLE, "RPC handler is not set"};
+      }
+      try {
+        const auto converted = network::FromProto(*request);
+        *response = network::ToProto(handler->HandlePreVote(converted));
+        return grpc::Status::OK;
+      } catch (const std::invalid_argument& error) {
+        return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
+      } catch (const std::exception& error) {
+        return {grpc::StatusCode::INTERNAL, error.what()};
+      } catch (...) {
+        return {grpc::StatusCode::INTERNAL, "RPC handler threw an unknown exception"};
+      }
+    }
+
+    grpc::Status InstallSnapshot(
+        grpc::ServerContext*,
+        const network::proto::InstallSnapshotRequest* request,
+        network::proto::InstallSnapshotReply* response) override {
+      auto* handler = owner_->handler_.load(std::memory_order_acquire);
+      if (!handler) {
+        return {grpc::StatusCode::UNAVAILABLE, "RPC handler is not set"};
+      }
+      try {
+        const auto converted = network::FromProto(*request);
+        *response = network::ToProto(handler->HandleInstallSnapshot(converted));
+        return grpc::Status::OK;
+      } catch (const std::invalid_argument& error) {
+        return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
+      } catch (const std::exception& error) {
+        return {grpc::StatusCode::INTERNAL, error.what()};
+      } catch (...) {
+        return {grpc::StatusCode::INTERNAL, "RPC handler threw an unknown exception"};
+      }
+    }
+
    private:
     Impl* owner_;
   };
@@ -310,15 +433,17 @@ class GrpcTransport::Impl
     return false;
   }
 
-  void Submit(std::function<void()> task) {
+  // False if the task was not queued (not running, or the queue is full).
+  bool Submit(std::function<void()> task) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!started_ || stopping_ || tasks_.size() >= kMaxQueuedTasks) {
-        return;
+        return false;
       }
       tasks_.push_back(std::move(task));
     }
     cv_.notify_one();
+    return true;
   }
 
   void WorkerLoop() {
@@ -362,6 +487,7 @@ class GrpcTransport::Impl
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<std::function<void()>> tasks_;
+  std::set<NodeId> snapshot_in_flight_;  // peers with a snapshot RPC outstanding (guarded by mutex_)
   std::vector<std::thread> workers_;
   std::vector<std::thread::id> worker_ids_;
   std::unique_ptr<grpc::Server> server_;
@@ -392,6 +518,18 @@ void GrpcTransport::SendAppendEntries(
     NodeId to, const AppendEntriesRequest& req,
     std::function<void(const AppendEntriesReply&)> on_reply) {
   impl_->SendAppendEntries(to, req, std::move(on_reply));
+}
+
+void GrpcTransport::SendPreVote(
+    NodeId to, const PreVoteRequest& req,
+    std::function<void(const PreVoteReply&)> on_reply) {
+  impl_->SendPreVote(to, req, std::move(on_reply));
+}
+
+void GrpcTransport::SendInstallSnapshot(
+    NodeId to, const InstallSnapshotRequest& req,
+    std::function<void(const InstallSnapshotReply&)> on_reply) {
+  impl_->SendInstallSnapshot(to, req, std::move(on_reply));
 }
 
 void GrpcTransport::SetHandler(RpcHandler* handler) {

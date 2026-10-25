@@ -348,5 +348,201 @@ TEST(GrpcTransportTest, CallbackStopReturnsWhenExternalStopIsInProgress) {
   transport.Stop();
 }
 
+class SnapshotHandler final : public RpcHandler {
+ public:
+  RequestVoteReply HandleRequestVote(const RequestVoteRequest&) override { return {}; }
+  AppendEntriesReply HandleAppendEntries(const AppendEntriesRequest& request) override {
+    return {request.term, true, request.prev_log_index};
+  }
+  PreVoteReply HandlePreVote(const PreVoteRequest& request) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    prevote_ = request;
+    return {request.term - 1, true};
+  }
+  InstallSnapshotReply HandleInstallSnapshot(const InstallSnapshotRequest& request) override {
+    ++snapshot_calls_;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      snapshot_ = request;
+    }
+    if (snapshot_delay_ms_ > 0) std::this_thread::sleep_for(std::chrono::milliseconds(snapshot_delay_ms_));
+    if (block_first_ && snapshot_calls_.load() == 1) {
+      std::unique_lock<std::mutex> lock(gate_mutex_);
+      gate_cv_.wait_for(lock, std::chrono::seconds(5), [this] { return released_; });
+    }
+    return {request.term, request.offset + request.data.size(), request.done};
+  }
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(gate_mutex_);
+      released_ = true;
+    }
+    gate_cv_.notify_all();
+  }
+  PreVoteRequest PreVote() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return prevote_;
+  }
+  InstallSnapshotRequest Snapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return snapshot_;
+  }
+  int SnapshotCalls() const { return snapshot_calls_.load(); }
+  bool block_first_ = false;
+  int snapshot_delay_ms_ = 0;  // every snapshot chunk takes this long to handle
+
+ private:
+  mutable std::mutex mutex_;
+  PreVoteRequest prevote_{};
+  InstallSnapshotRequest snapshot_{};
+  std::atomic<int> snapshot_calls_{0};
+  std::mutex gate_mutex_;
+  std::condition_variable gate_cv_;
+  bool released_ = false;
+};
+
+template <typename Pred>
+bool WaitUntil(Pred pred, std::chrono::milliseconds timeout) {
+  const auto end = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < end) {
+    if (pred()) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return pred();
+}
+
+TEST(GrpcTransportTest, CarriesPreVoteAndBinarySnapshotChunksAndReportsPreVoteSupport) {
+  SnapshotHandler handler;
+  GrpcTransport server("127.0.0.1:0", {});
+  server.SetHandler(&handler);
+  server.Start();
+  GrpcTransport client("127.0.0.1:0", {{2, Address(server.ListeningPort())}});
+  RecordingHandler unused;
+  client.SetHandler(&unused);
+  client.Start();
+  EXPECT_TRUE(client.SupportsPreVote());
+
+  std::atomic<bool> got_prevote{false};
+  PreVoteReply prevote_reply{};
+  client.SendPreVote(2, PreVoteRequest{6, 1, 50, 5}, [&](const PreVoteReply& r) {
+    prevote_reply = r;
+    got_prevote = true;
+  });
+  ASSERT_TRUE(WaitUntil([&] { return got_prevote.load(); }, std::chrono::seconds(3)));
+  EXPECT_EQ(prevote_reply.term, 5u);
+  EXPECT_TRUE(prevote_reply.granted);
+  EXPECT_EQ(handler.PreVote().term, 6u);
+  EXPECT_EQ(handler.PreVote().last_log_index, 50u);
+
+  std::string data(1024 * 1024, '\0');  // a full-size chunk with NULs and non-UTF-8 bytes
+  for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<char>(i * 37 + 1);
+  data[10] = '\0';
+  data[11] = '\xff';
+  std::atomic<bool> got_snapshot{false};
+  InstallSnapshotReply snapshot_reply{};
+  client.SendInstallSnapshot(2, InstallSnapshotRequest{3, 1, 777, 2, 4096, data, true},
+                             [&](const InstallSnapshotReply& r) {
+                               snapshot_reply = r;
+                               got_snapshot = true;
+                             });
+  ASSERT_TRUE(WaitUntil([&] { return got_snapshot.load(); }, std::chrono::seconds(5)));
+  EXPECT_EQ(snapshot_reply.next_offset, 4096u + data.size());
+  EXPECT_TRUE(snapshot_reply.installed);
+  EXPECT_EQ(handler.Snapshot().data, data);
+  EXPECT_EQ(handler.Snapshot().last_included_index, 777u);
+  client.Stop();
+  server.Stop();
+}
+
+// Raft resends the current snapshot chunk on every heartbeat. Only one snapshot RPC per peer may
+// be outstanding, or a peer that never answers would flood the worker pool.
+TEST(GrpcTransportTest, AtMostOneSnapshotRpcPerPeerIsInFlight) {
+  SnapshotHandler handler;
+  handler.block_first_ = true;
+  GrpcTransport server("127.0.0.1:0", {});
+  server.SetHandler(&handler);
+  server.Start();
+  GrpcTransport client("127.0.0.1:0", {{2, Address(server.ListeningPort())}});
+  RecordingHandler unused;
+  client.SetHandler(&unused);
+  client.Start();
+
+  std::atomic<int> replies{0};
+  auto send = [&] {
+    client.SendInstallSnapshot(2, InstallSnapshotRequest{3, 1, 10, 2, 0, "chunk", false},
+                               [&](const InstallSnapshotReply&) { ++replies; });
+  };
+  send();
+  ASSERT_TRUE(WaitUntil([&] { return handler.SnapshotCalls() == 1; }, std::chrono::seconds(3)));
+  for (int i = 0; i < 20; ++i) send();  // heartbeat resends while the first is still outstanding
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  EXPECT_EQ(handler.SnapshotCalls(), 1) << "duplicates were sent while one was in flight";
+
+  handler.Release();  // the first RPC completes ...
+  ASSERT_TRUE(WaitUntil([&] { return replies.load() == 1; }, std::chrono::seconds(3)));
+  send();             // ... and the slot is free again
+  ASSERT_TRUE(WaitUntil([&] { return handler.SnapshotCalls() == 2; }, std::chrono::seconds(3)));
+  client.Stop();
+  server.Stop();
+}
+
+// A peer that accepts the connection but never answers must not keep heartbeats from reaching a
+// healthy peer: snapshot sends to it may occupy at most one worker.
+TEST(GrpcTransportTest, ASnapshotToAnUnresponsivePeerDoesNotBlockOtherPeers) {
+  SnapshotHandler stuck;
+  stuck.block_first_ = true;  // never released: stays stuck until the deadline
+  GrpcTransport stuck_server("127.0.0.1:0", {});
+  stuck_server.SetHandler(&stuck);
+  stuck_server.Start();
+  RecordingHandler healthy;
+  GrpcTransport healthy_server("127.0.0.1:0", {});
+  healthy_server.SetHandler(&healthy);
+  healthy_server.Start();
+
+  GrpcTransport client("127.0.0.1:0", {{2, Address(stuck_server.ListeningPort())},
+                                      {3, Address(healthy_server.ListeningPort())}});
+  RecordingHandler unused;
+  client.SetHandler(&unused);
+  client.Start();
+  for (int i = 0; i < 50; ++i) {
+    client.SendInstallSnapshot(2, InstallSnapshotRequest{3, 1, 10, 2, 0, "chunk", false},
+                               [](const InstallSnapshotReply&) {});
+  }
+  std::atomic<int> acked{0};
+  const auto start = std::chrono::steady_clock::now();
+  for (int i = 0; i < 20; ++i) {
+    client.SendAppendEntries(3, AppendEntriesRequest{3, 1, 0, 0, {}, 0},
+                             [&](const AppendEntriesReply&) { ++acked; });
+  }
+  ASSERT_TRUE(WaitUntil([&] { return acked.load() == 20; }, std::chrono::seconds(2)))
+      << "heartbeats to a healthy peer were starved";
+  EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
+  stuck.Release();
+  client.Stop();
+  stuck_server.Stop();
+  healthy_server.Stop();
+}
+
+// A snapshot chunk can take much longer than a heartbeat (the receiver may fsync a whole snapshot),
+// so it gets a longer deadline than the 150 ms used for votes and AppendEntries.
+TEST(GrpcTransportTest, ASlowSnapshotChunkStillGetsItsReply) {
+  SnapshotHandler handler;
+  handler.snapshot_delay_ms_ = 700;
+  GrpcTransport server("127.0.0.1:0", {});
+  server.SetHandler(&handler);
+  server.Start();
+  GrpcTransport client("127.0.0.1:0", {{2, Address(server.ListeningPort())}});
+  RecordingHandler unused;
+  client.SetHandler(&unused);
+  client.Start();
+  std::atomic<bool> got{false};
+  client.SendInstallSnapshot(2, InstallSnapshotRequest{3, 1, 10, 2, 0, "chunk", true},
+                             [&](const InstallSnapshotReply&) { got = true; });
+  EXPECT_TRUE(WaitUntil([&] { return got.load(); }, std::chrono::seconds(5)))
+      << "the snapshot RPC hit the short heartbeat deadline";
+  client.Stop();
+  server.Stop();
+}
+
 }  // namespace
 }  // namespace raftkv
