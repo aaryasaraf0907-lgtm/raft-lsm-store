@@ -13,11 +13,17 @@ namespace raftkv {
 //                  (older layout, still readable: loads with client_id = seq = 0)
 //   4 = log entry  {... same as 2 ..., u64 client_id, u64 seq}       what is written now
 //   3 = truncate   {u64 from_index}              drops that entry and all after it
+//   5 = log base   {u64 snapshot_index, u64 snapshot_term}   the entries that follow start at
+//                  snapshot_index + 1; the snapshot itself is in <dir>/snapshot-<index>.bin
 // Load() replays the records. A torn or corrupt record at the end (a crash in the middle of a
 // write) is detected by its length/checksum and cut off, so the node restarts from the last
 // complete record.
 //
-// The file only grows for now; snapshots/compaction will bound it later.
+// SaveSnapshot first writes snapshot-<index>.bin (atomically: temp file, fsync, rename), then
+// atomically replaces raft.log with [hard state][log base][kept entries]. The rename of raft.log
+// is the commit point: a crash before it leaves the old log, which still points at the old
+// snapshot file (kept until the new log is in place); a crash after it leaves the new pair.
+// Leftover files from a crashed attempt are deleted by Load().
 class FileRaftStorage : public RaftStorage {
  public:
   // `sync` = fsync after every write. Keep it true in real use; tests turn it off for speed.
@@ -32,6 +38,8 @@ class FileRaftStorage : public RaftStorage {
   bool SaveHardState(Term term, NodeId voted_for) override;
   bool AppendEntries(const std::vector<LogEntry>& entries) override;
   bool TruncateSuffix(LogIndex from_index) override;
+  bool SaveSnapshot(LogIndex index, Term term, const std::string& data,
+                    const std::vector<LogEntry>& entries_after) override;
 
  private:
   bool WriteRecords(const std::string& bytes);
@@ -40,6 +48,8 @@ class FileRaftStorage : public RaftStorage {
   std::string path_;
   bool sync_;
   int fd_ = -1;
+  Term term_ = 0;      // last saved hard state, rewritten at the top of a compacted log
+  NodeId voted_ = 0;
 };
 
 }  // namespace raftkv

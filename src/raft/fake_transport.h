@@ -23,6 +23,8 @@ class FakeTransport : public Transport {
                        std::function<void(const RequestVoteReply&)> on_reply) override;
   void SendAppendEntries(NodeId to, const AppendEntriesRequest& req,
                          std::function<void(const AppendEntriesReply&)> on_reply) override;
+  void SendInstallSnapshot(NodeId to, const InstallSnapshotRequest& req,
+                           std::function<void(const InstallSnapshotReply&)> on_reply) override;
   void SetHandler(RpcHandler* handler) override;
   void Start() override {}
   void Stop() override;
@@ -47,7 +49,7 @@ class FakeNetwork {
   std::unique_ptr<FakeTransport> MakeTransport(NodeId id);
   void Disconnect(NodeId id);
   void Reconnect(NodeId id);
-  // Drop any AppendEntries whose approximate size (message_size.h) exceeds `bytes`, like a real
+  // Drop any AppendEntries or InstallSnapshot whose approximate size (message_size.h) exceeds `bytes`, like a real
   // transport with a message size limit (gRPC's default is 4 MB). 0 = no limit.
   void SetMaxMessageBytes(size_t bytes) { max_message_bytes_ = bytes; }
   // Size of the largest AppendEntries sent so far, and how many were dropped for being too big.
@@ -63,6 +65,12 @@ class FakeNetwork {
                        std::function<void(const RequestVoteReply&)> on_reply);
   void SendAppendEntries(NodeId from, NodeId to, const AppendEntriesRequest& req,
                          std::function<void(const AppendEntriesReply&)> on_reply);
+
+  void SendInstallSnapshot(NodeId from, NodeId to, const InstallSnapshotRequest& req,
+                           std::function<void(const InstallSnapshotReply&)> on_reply);
+
+  void NoteSize(size_t bytes);
+  bool TooBig(size_t bytes);
 
   bool Reachable(NodeId a, NodeId b);
   RpcHandler* Lookup(NodeId from, NodeId to);

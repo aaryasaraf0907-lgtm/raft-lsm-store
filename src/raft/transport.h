@@ -12,6 +12,7 @@ class RpcHandler {
   virtual ~RpcHandler() = default;
   virtual RequestVoteReply HandleRequestVote(const RequestVoteRequest& req) = 0;
   virtual AppendEntriesReply HandleAppendEntries(const AppendEntriesRequest& req) = 0;
+  virtual InstallSnapshotReply HandleInstallSnapshot(const InstallSnapshotRequest& req) = 0;
 };
 
 // Contract for node-to-node messaging.
@@ -31,6 +32,11 @@ class Transport {
   virtual void SendAppendEntries(
       NodeId to, const AppendEntriesRequest& req,
       std::function<void(const AppendEntriesReply&)> on_reply) = 0;
+
+  // Sends one chunk of a snapshot. The default drops it (no reply), which Raft treats as a
+  // failed send; a transport that supports snapshots overrides it.
+  virtual void SendInstallSnapshot(NodeId, const InstallSnapshotRequest&,
+                                   std::function<void(const InstallSnapshotReply&)>) {}
 
   // Register the node that handles incoming requests. Call before Start().
   virtual void SetHandler(RpcHandler* handler) = 0;
