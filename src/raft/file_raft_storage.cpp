@@ -21,6 +21,7 @@ constexpr uint8_t kRecEntry = 2;
 constexpr uint8_t kRecTruncate = 3;
 constexpr uint8_t kRecEntryV2 = 4;  // entry + client_id + seq (kRecEntry is the older layout)
 constexpr uint8_t kRecBase = 5;     // snapshot index + term: the log starts right after it
+constexpr uint8_t kRecBaseV2 = 6;   // log base and snapshot separately (log may start earlier)
 constexpr uint32_t kSnapshotMagic = 0x504E5352u;  // "RSNP"
 constexpr uint32_t kMaxRecordBytes = 64u * 1024u * 1024u;  // sanity limit when reading
 
@@ -133,24 +134,32 @@ bool ApplyRecord(const char* payload, size_t len, PersistentState* st) {
       }
       if (!r.ok || cmd > static_cast<uint8_t>(CommandType::kNoop)) return false;
       e.command.type = static_cast<CommandType>(cmd);
-      if (e.index != st->snapshot_index + st->log.size() + 1) return false;  // contiguous
+      if (e.index != st->log_base_index + st->log.size() + 1) return false;  // contiguous
       st->log.push_back(std::move(e));
       return true;
     }
     case kRecTruncate: {
       uint64_t from = r.U64();
-      if (!r.ok || from <= st->snapshot_index || from > st->snapshot_index + st->log.size() + 1) {
+      if (!r.ok || from <= st->log_base_index || from > st->log_base_index + st->log.size() + 1) {
         return false;
       }
-      st->log.erase(st->log.begin() + static_cast<std::ptrdiff_t>(from - st->snapshot_index - 1),
+      st->log.erase(st->log.begin() + static_cast<std::ptrdiff_t>(from - st->log_base_index - 1),
                     st->log.end());
       return true;
     }
     case kRecBase: {
+      st->snapshot_index = st->log_base_index = r.U64();
+      st->snapshot_term = st->log_base_term = r.U64();
+      st->log.clear();
+      return r.ok && st->snapshot_index > 0;
+    }
+    case kRecBaseV2: {
+      st->log_base_index = r.U64();
+      st->log_base_term = r.U64();
       st->snapshot_index = r.U64();
       st->snapshot_term = r.U64();
       st->log.clear();
-      return r.ok && st->snapshot_index > 0;
+      return r.ok && st->snapshot_index > 0 && st->log_base_index <= st->snapshot_index;
     }
     default:
       return false;
@@ -378,13 +387,15 @@ bool FileRaftStorage::TruncateSuffix(LogIndex from_index) {
   return WriteRecords(frame);
 }
 
-bool FileRaftStorage::SaveSnapshot(LogIndex index, Term term, const std::string& data,
-                                   const std::vector<LogEntry>& entries_after) {
-  if (fd_ < 0 || index == 0) return false;
+bool FileRaftStorage::SaveSnapshot(LogIndex snapshot_index, Term snapshot_term,
+                                   const std::string& data, LogIndex log_base_index,
+                                   Term log_base_term,
+                                   const std::vector<LogEntry>& entries_after_base) {
+  if (fd_ < 0 || snapshot_index == 0 || log_base_index > snapshot_index) return false;
   // Step 1: the snapshot file. The current log does not mention it yet, so a crash here is
   // harmless: Load() ignores and deletes it.
-  if (!WriteFileAtomic(dir_, dir_ + "/" + SnapshotFileName(index),
-                       EncodeSnapshotFile(index, term, data), sync_)) {
+  if (!WriteFileAtomic(dir_, dir_ + "/" + SnapshotFileName(snapshot_index),
+                       EncodeSnapshotFile(snapshot_index, snapshot_term, data), sync_)) {
     return false;
   }
   // Step 2: the new log, [hard state][base][kept entries]. Renaming it over raft.log is the
@@ -395,16 +406,18 @@ bool FileRaftStorage::SaveSnapshot(LogIndex index, Term term, const std::string&
   PutU32(&payload, voted_);
   AppendFrame(&log, payload);
   payload.clear();
-  PutU8(&payload, kRecBase);
-  PutU64(&payload, index);
-  PutU64(&payload, term);
+  PutU8(&payload, kRecBaseV2);
+  PutU64(&payload, log_base_index);
+  PutU64(&payload, log_base_term);
+  PutU64(&payload, snapshot_index);
+  PutU64(&payload, snapshot_term);
   AppendFrame(&log, payload);
-  for (const LogEntry& e : entries_after) EncodeEntryFrame(&log, e);
+  for (const LogEntry& e : entries_after_base) EncodeEntryFrame(&log, e);
   if (!WriteFileAtomic(dir_, path_, log, sync_)) return false;
   ::close(fd_);
   fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_APPEND, 0644);
   if (fd_ < 0) return false;
-  RemoveStaleFiles(dir_, index);  // the previous snapshot is no longer needed
+  RemoveStaleFiles(dir_, snapshot_index);  // the previous snapshot is no longer needed
   return true;
 }
 

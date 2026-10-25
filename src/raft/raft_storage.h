@@ -12,11 +12,15 @@ struct PersistentState {
   Term term = 0;
   NodeId voted_for = 0;       // 0 = nobody
   // The latest snapshot, if any (snapshot_index == 0 means none). It stands for every log entry
-  // up to and including snapshot_index, which are no longer stored.
+  // up to and including snapshot_index.
   LogIndex snapshot_index = 0;
   Term snapshot_term = 0;
   std::string snapshot_data;
-  std::vector<LogEntry> log;  // entries snapshot_index+1 .. N in order; the dummy entry is not stored
+  // The stored log may start BEFORE the snapshot: a few entries are kept below it so a slightly
+  // slow follower can still be sent log entries. Invariant: log_base_index <= snapshot_index.
+  LogIndex log_base_index = 0;
+  Term log_base_term = 0;
+  std::vector<LogEntry> log;  // entries log_base_index+1 .. N in order; the dummy entry is not stored
 };
 
 // Durable storage for a Raft node. Every mutating call must be durable (on disk, fsynced)
@@ -32,11 +36,18 @@ class RaftStorage {
   virtual bool AppendEntries(const std::vector<LogEntry>& entries) = 0;
   // Removes entry `from_index` and everything after it.
   virtual bool TruncateSuffix(LogIndex from_index) = 0;
-  // Durably stores a snapshot and drops every log entry up to snapshot `index`. `entries_after`
-  // are the log entries after `index` to keep (possibly none). Crash safe: after a crash Load()
-  // returns either the state from before this call or the state after it, never a mix.
-  virtual bool SaveSnapshot(LogIndex index, Term term, const std::string& data,
-                            const std::vector<LogEntry>& entries_after) = 0;
+  // Durably stores a snapshot (the state machine as of `snapshot_index`) and drops every log entry
+  // up to `log_base_index` (<= snapshot_index). `entries_after_base` are the log entries after
+  // log_base_index to keep, including those up to the snapshot (possibly none). Crash safe: after
+  // a crash Load() returns either the state from before this call or the state after it.
+  virtual bool SaveSnapshot(LogIndex snapshot_index, Term snapshot_term, const std::string& data,
+                            LogIndex log_base_index, Term log_base_term,
+                            const std::vector<LogEntry>& entries_after_base) = 0;
+  // Common case: the log starts exactly at the snapshot (nothing is kept below it).
+  bool SaveSnapshot(LogIndex index, Term term, const std::string& data,
+                    const std::vector<LogEntry>& entries_after) {
+    return SaveSnapshot(index, term, data, index, term, entries_after);
+  }
 };
 
 }  // namespace raftkv
