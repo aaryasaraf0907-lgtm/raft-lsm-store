@@ -24,13 +24,15 @@ uint32_t GetU32(const char* p) {
   return v;
 }
 
-bool WriteAll(int fd, const char* p, size_t n) {
+bool WriteAll(int fd, const char* p, size_t n, const WAL::WriteFunction& write_function) {
   while (n > 0) {
-    ssize_t w = ::write(fd, p, n);
+    // `write_function` is a test-only seam (WAL::OpenForTesting) for injecting short or failing writes.
+    ssize_t w = write_function ? static_cast<ssize_t>(write_function(fd, p, n)) : ::write(fd, p, n);
     if (w < 0) {
       if (errno == EINTR) continue;
       return false;
     }
+    if (w == 0 || static_cast<size_t>(w) > n) return false;  // no progress, or a lying writer
     p += w;
     n -= static_cast<size_t>(w);
   }
@@ -67,6 +69,15 @@ Status WAL::Open(const std::string& path, std::unique_ptr<WAL>* out) {
   int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
   if (fd < 0) return Status::kIOError;
   out->reset(new WAL(fd));
+  return Status::kOk;
+}
+
+Status WAL::OpenForTesting(const std::string& path, std::unique_ptr<WAL>* out,
+                           WriteFunction write_function) {
+  if (!write_function) return Status::kIOError;
+  int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+  if (fd < 0) return Status::kIOError;
+  out->reset(new WAL(fd, std::move(write_function)));
   return Status::kOk;
 }
 
@@ -112,7 +123,7 @@ Status WAL::Append(uint8_t type, const std::string& key, const std::string& valu
   // One write() per record keeps a torn write confined to the tail.
   // If this fails midway the file ends in a partial record. Later appends would sit behind it
   // and be thrown away by Replay even though they were reported as durable, so stop here.
-  if (!WriteAll(fd_, record.data(), record.size()) || (sync && !FullSync(fd_))) {
+  if (!WriteAll(fd_, record.data(), record.size(), write_function_) || (sync && !FullSync(fd_))) {
     failed_ = true;
     return Status::kIOError;
   }

@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 
 #include "raft/client_sessions.h"
 #include "raft/raft_interface.h"
@@ -25,23 +27,28 @@ namespace raftkv {
 // so a storage failure is fatal.
 class KVStateMachine {
  public:
+  enum class RequestOutcome { kApplied, kDuplicate, kUnknown };
+
   explicit KVStateMachine(KVStore* store) : store_(store) {}
 
   void Apply(const LogEntry& entry) {
     const Command& cmd = entry.command;
     if (!sessions_.ShouldApply(cmd)) {
       ++duplicates_skipped_;
+      RecordRequestOutcome(entry.index, RequestOutcome::kDuplicate);
       return;
     }
     switch (cmd.type) {
       case CommandType::kPut:
         MustSucceed(store_->Put(cmd.key, cmd.value) == Status::kOk, "put");
         ++applied_;
+        RecordRequestOutcome(entry.index, RequestOutcome::kApplied);
         break;
       case CommandType::kDelete: {
         Status s = store_->Delete(cmd.key);  // deleting a missing key is not an error
         MustSucceed(s == Status::kOk || s == Status::kNotFound, "delete");
         ++applied_;
+        RecordRequestOutcome(entry.index, RequestOutcome::kApplied);
         break;
       }
       case CommandType::kNoop:
@@ -57,7 +64,26 @@ class KVStateMachine {
   uint64_t DuplicatesSkipped() const { return duplicates_skipped_.load(); }
   const ClientSessionTable& Sessions() const { return sessions_; }
 
+  // Returns the result for an applied log index, if it is still in the bounded history.
+  // A missing result must be treated as ambiguous, never as proof of a successful write.
+  RequestOutcome LookupRequestOutcome(LogIndex index) const {
+    std::lock_guard<std::mutex> lock(outcomes_mutex_);
+    const auto found = request_outcomes_.find(index);
+    return found == request_outcomes_.end() ? RequestOutcome::kUnknown
+                                            : found->second;
+  }
+
  private:
+  static constexpr std::size_t kRequestOutcomeHistoryLimit = 4096;
+
+  void RecordRequestOutcome(LogIndex index, RequestOutcome outcome) {
+    std::lock_guard<std::mutex> lock(outcomes_mutex_);
+    request_outcomes_[index] = outcome;
+    while (request_outcomes_.size() > kRequestOutcomeHistoryLimit) {
+      request_outcomes_.erase(request_outcomes_.begin());
+    }
+  }
+
   static void MustSucceed(bool ok, const char* what) {
     if (ok) return;
     std::fprintf(stderr, "kv state machine: fatal: could not apply a committed %s\n", what);
@@ -66,6 +92,8 @@ class KVStateMachine {
 
   KVStore* store_;
   ClientSessionTable sessions_;
+  mutable std::mutex outcomes_mutex_;
+  std::map<LogIndex, RequestOutcome> request_outcomes_;
   std::atomic<uint64_t> applied_{0};
   std::atomic<uint64_t> duplicates_skipped_{0};
 };

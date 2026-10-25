@@ -34,7 +34,8 @@ TEST(ProtoConversionsTest, RoundTripsAppendEntriesWithNestedEntries) {
       7,
       10,
       9,
-      {{9, 10, {CommandType::kPut, "key", "value"}},
+      {{9, 10,
+        {CommandType::kPut, "key", "value", 0xABCDEF0123456789ull, 17}},
        {11, 11, {CommandType::kDelete, "old", ""}},
        {12, 12, {CommandType::kNoop, "", ""}}},
       10};
@@ -54,6 +55,10 @@ TEST(ProtoConversionsTest, RoundTripsAppendEntriesWithNestedEntries) {
               request.entries[i].command.key);
     EXPECT_EQ(decoded_request.entries[i].command.value,
               request.entries[i].command.value);
+    EXPECT_EQ(decoded_request.entries[i].command.client_id,
+              request.entries[i].command.client_id);
+    EXPECT_EQ(decoded_request.entries[i].command.seq,
+              request.entries[i].command.seq);
   }
 
   EXPECT_EQ(decoded_reply.term, reply.term);
@@ -76,7 +81,9 @@ TEST(ProtoConversionsTest, PreservesBinaryCommandDataOnWireRoundTrip) {
   const std::string key{"k\xff\xfe", 3};
   const std::string value{"v\0x\0", 4};
   const AppendEntriesRequest request{
-      1, 1, 0, 0, {{1, 1, {CommandType::kPut, key, value}}}, 1};
+      1, 1, 0, 0,
+      {{1, 1, {CommandType::kPut, key, value, 0xFEDCBA9876543210ull, 29}}},
+      1};
 
   std::string serialized;
   ASSERT_TRUE(ToProto(request).SerializeToString(&serialized));
@@ -88,6 +95,19 @@ TEST(ProtoConversionsTest, PreservesBinaryCommandDataOnWireRoundTrip) {
   ASSERT_EQ(decoded.entries.size(), 1);
   EXPECT_EQ(decoded.entries[0].command.key, key);
   EXPECT_EQ(decoded.entries[0].command.value, value);
+  EXPECT_EQ(decoded.entries[0].command.client_id, 0xFEDCBA9876543210ull);
+  EXPECT_EQ(decoded.entries[0].command.seq, 29u);
+}
+
+TEST(ProtoConversionsTest, PreservesZeroRequestIds) {
+  const AppendEntriesRequest request{
+      1, 1, 0, 0, {{1, 1, {CommandType::kPut, "key", "value"}}}, 1};
+
+  const auto decoded = FromProto(ToProto(request));
+
+  ASSERT_EQ(decoded.entries.size(), 1);
+  EXPECT_EQ(decoded.entries[0].command.client_id, 0u);
+  EXPECT_EQ(decoded.entries[0].command.seq, 0u);
 }
 
 TEST(ProtoConversionsTest, RejectsInvalidOrMissingCommand) {
