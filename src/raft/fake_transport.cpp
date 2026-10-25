@@ -23,6 +23,11 @@ void FakeTransport::SendInstallSnapshot(NodeId to, const InstallSnapshotRequest&
   net_->SendInstallSnapshot(id_, to, req, std::move(on_reply));
 }
 
+void FakeTransport::SendPreVote(NodeId to, const PreVoteRequest& req,
+                                std::function<void(const PreVoteReply&)> on_reply) {
+  net_->SendPreVote(id_, to, req, std::move(on_reply));
+}
+
 void FakeTransport::SetHandler(RpcHandler* handler) { net_->Register(id_, handler); }
 
 void FakeTransport::Stop() { net_->Register(id_, nullptr); }
@@ -150,6 +155,17 @@ void FakeNetwork::SendInstallSnapshot(NodeId from, NodeId to, const InstallSnaps
     RpcHandler* handler = Lookup(from, to);
     if (handler == nullptr) return;
     InstallSnapshotReply reply = handler->HandleInstallSnapshot(req);
+    if (Reachable(to, from) && SenderStillCurrent(from, gen)) on_reply(reply);
+  });
+}
+
+void FakeNetwork::SendPreVote(NodeId from, NodeId to, const PreVoteRequest& req,
+                              std::function<void(const PreVoteReply&)> on_reply) {
+  uint64_t gen = GenerationOf(from);
+  Post([this, from, to, gen, req, on_reply = std::move(on_reply)]() {
+    RpcHandler* handler = Lookup(from, to);
+    if (handler == nullptr) return;  // dropped: silence, like a real timeout
+    PreVoteReply reply = handler->HandlePreVote(req);
     if (Reachable(to, from) && SenderStillCurrent(from, gen)) on_reply(reply);
   });
 }

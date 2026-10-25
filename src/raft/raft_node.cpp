@@ -247,7 +247,7 @@ void RaftNodeImpl::TickerLoop() {
     if (role_ == Role::kLeader) {
       if (now >= next_heartbeat_) BroadcastAppendEntriesLocked();
     } else if (now >= election_deadline_) {
-      StartElectionLocked();
+      StartElectionOrPreVoteLocked();
     }
   }
 }
@@ -320,9 +320,59 @@ void RaftNodeImpl::BecomeFollowerLocked(Term term, bool persist) {
     voted_for_ = 0;  // a new term means we have not voted yet
   }
   role_ = Role::kFollower;
+  prevote_active_ = false;  // whatever we were asking about is moot now
   ResetElectionDeadlineLocked();
   if (term_changed && persist) PersistHardStateLocked();
   wait_cv_.notify_all();  // a ReadIndex waiter must notice it is no longer leader
+}
+
+void RaftNodeImpl::NoteLeaderContactLocked() {
+  have_leader_contact_ = true;
+  last_leader_contact_ = Clock::now();
+  prevote_active_ = false;  // a leader exists: abandon any pre-vote round in progress
+}
+
+// An election timer fired. With PreVote we first ask, without touching any state, whether a real
+// election could be won; only a majority of "yes" turns into one.
+void RaftNodeImpl::StartElectionOrPreVoteLocked() {
+  if (cfg_.enable_pre_vote && !peers_.empty() && transport_->SupportsPreVote()) {
+    StartPreVoteLocked();
+  } else {
+    StartElectionLocked();
+  }
+}
+
+void RaftNodeImpl::StartPreVoteLocked() {
+  role_ = Role::kFollower;  // a candidate whose election timed out starts over as a follower
+  prevote_active_ = true;
+  ++prevote_round_;
+  prevotes_ = 1;  // ourselves
+  leader_hint_ = 0;
+  ResetElectionDeadlineLocked();  // if this round gets no majority, the next timeout retries
+  // Nothing is persisted and our term is unchanged: only the PROPOSED term goes on the wire.
+  PreVoteRequest req{current_term_ + 1, id_, LastLogIndexLocked(), LastLogTermLocked()};
+  const uint64_t round = prevote_round_;
+  for (NodeId peer : peers_) {
+    transport_->SendPreVote(peer, req, [this, round](const PreVoteReply& reply) {
+      OnPreVoteReply(round, reply);
+    });
+  }
+}
+
+void RaftNodeImpl::OnPreVoteReply(uint64_t round, const PreVoteReply& reply) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!running_) return;
+  if (reply.term > current_term_) {  // we are behind: adopt the newer term, no election for us
+    BecomeFollowerLocked(reply.term);
+    return;
+  }
+  if (!prevote_active_ || round != prevote_round_ || !reply.granted) return;
+  ++prevotes_;
+  const size_t cluster_size = peers_.size() + 1;
+  if (static_cast<size_t>(prevotes_) > cluster_size / 2) {
+    prevote_active_ = false;
+    StartElectionLocked();  // the real thing: new term, persisted, RequestVote
+  }
 }
 
 void RaftNodeImpl::StartElectionLocked() {
@@ -546,6 +596,23 @@ RequestVoteReply RaftNodeImpl::HandleRequestVote(const RequestVoteRequest& req) 
   return reply;
 }
 
+PreVoteReply RaftNodeImpl::HandlePreVote(const PreVoteRequest& req) {
+  std::lock_guard<std::mutex> lk(mu_);
+  PreVoteReply reply{current_term_, false};
+  if (req.term <= current_term_) return reply;  // a real election at that term could not succeed
+  if (role_ == Role::kLeader) return reply;     // there is a leader, and it is us
+  // A leader we heard from recently is alive, so this node is probably just cut off (or slow);
+  // letting it start an election would only disrupt the cluster.
+  if (have_leader_contact_ &&
+      Clock::now() - last_leader_contact_ < std::chrono::milliseconds(cfg_.election_timeout_min_ms)) {
+    return reply;
+  }
+  // The same log test as for a real vote: only a candidate that is at least as up to date.
+  reply.granted = req.last_log_term > LastLogTermLocked() ||
+                  (req.last_log_term == LastLogTermLocked() && req.last_log_index >= LastLogIndexLocked());
+  return reply;  // deliberately NO state change: no term, no vote, no timer, no storage write
+}
+
 AppendEntriesReply RaftNodeImpl::HandleAppendEntries(const AppendEntriesRequest& req) {
   std::lock_guard<std::mutex> lk(mu_);
   if (req.term < current_term_) return AppendEntriesReply{current_term_, false, 0};  // stale leader
@@ -557,6 +624,7 @@ AppendEntriesReply RaftNodeImpl::HandleAppendEntries(const AppendEntriesRequest&
     ResetElectionDeadlineLocked();
   }
   leader_hint_ = req.leader_id;
+  NoteLeaderContactLocked();
 
   // Consistency check: our log must contain the entry just before the new ones.
   // On failure we report our last index so the leader can skip back quickly.
@@ -608,6 +676,7 @@ InstallSnapshotReply RaftNodeImpl::HandleInstallSnapshot(const InstallSnapshotRe
     ResetElectionDeadlineLocked();
   }
   leader_hint_ = req.leader_id;
+  NoteLeaderContactLocked();
 
   // We already hold everything this snapshot covers (committed entries match the leader's).
   if (req.last_included_index <= commit_index_) return InstallSnapshotReply{current_term_, 0, true};

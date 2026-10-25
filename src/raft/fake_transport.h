@@ -25,6 +25,9 @@ class FakeTransport : public Transport {
                          std::function<void(const AppendEntriesReply&)> on_reply) override;
   void SendInstallSnapshot(NodeId to, const InstallSnapshotRequest& req,
                            std::function<void(const InstallSnapshotReply&)> on_reply) override;
+  bool SupportsPreVote() const override { return true; }
+  void SendPreVote(NodeId to, const PreVoteRequest& req,
+                   std::function<void(const PreVoteReply&)> on_reply) override;
   void SetHandler(RpcHandler* handler) override;
   void Start() override {}
   void Stop() override;
@@ -68,6 +71,8 @@ class FakeNetwork {
 
   void SendInstallSnapshot(NodeId from, NodeId to, const InstallSnapshotRequest& req,
                            std::function<void(const InstallSnapshotReply&)> on_reply);
+  void SendPreVote(NodeId from, NodeId to, const PreVoteRequest& req,
+                   std::function<void(const PreVoteReply&)> on_reply);
 
   void NoteSize(size_t bytes);
   bool TooBig(size_t bytes);
