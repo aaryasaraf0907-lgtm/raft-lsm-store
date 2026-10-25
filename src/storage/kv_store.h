@@ -3,7 +3,10 @@
 
 namespace raftkv {
 
-enum class Status { kOk, kNotFound, kIOError, kCorruption };
+// kInvalidArgument: the request itself is unacceptable (for example a key or value over the
+// size limit). It is never retryable and must be rejected BEFORE anything is replicated or
+// logged. Always add new values at the end: the numeric values must not change.
+enum class Status { kOk, kNotFound, kIOError, kCorruption, kInvalidArgument };
 
 // Contract for the local LSM storage engine.
 // Raft's apply callback calls Put/Delete only AFTER an entry is committed.
