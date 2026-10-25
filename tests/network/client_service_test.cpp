@@ -427,5 +427,30 @@ TEST(ClientServiceTest, GetRejectsOversizeKeysAndMapsInvalidArgumentFromTheStore
   EXPECT_EQ(response.status(), network::proto::CLIENT_STATUS_INTERNAL_ERROR);
 }
 
+TEST(ClientServiceTest, NodeStatusReportsWhatTheProviderFillsIn) {
+  TestStore store;
+  KVStateMachine machine(&store);
+  TestRaftNode node;
+  ClientService service(&node, &store, &machine);
+  network::proto::StatusRequest request;
+  network::proto::StatusResponse response;
+
+  EXPECT_EQ(service.NodeStatus(nullptr, &request, &response).error_code(), grpc::StatusCode::UNIMPLEMENTED);
+
+  service.SetStatusProvider([](network::proto::StatusResponse* out) {
+    out->set_node_id(3);
+    out->set_role("follower");
+    out->set_term(9);
+    out->set_leader_id_hint(2);
+    out->set_commit_index(40);
+  });
+  ASSERT_TRUE(service.NodeStatus(nullptr, &request, &response).ok());
+  EXPECT_EQ(response.node_id(), 3u);
+  EXPECT_EQ(response.role(), "follower");
+  EXPECT_EQ(response.term(), 9u);
+  EXPECT_EQ(response.leader_id_hint(), 2u);
+  EXPECT_EQ(response.commit_index(), 40u);
+}
+
 }  // namespace
 }  // namespace raftkv

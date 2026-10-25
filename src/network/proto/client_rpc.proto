@@ -48,7 +48,22 @@ message GetResponse {
   bytes value = 4;
 }
 
+// What a node knows about itself: for operators, the CLI and tests.
+message StatusRequest {}
+
+message StatusResponse {
+  uint32 node_id = 1;
+  string role = 2;  // "leader", "follower" or "candidate"
+  uint64 term = 3;
+  uint32 leader_id_hint = 4;  // 0 if unknown
+  uint64 commit_index = 5;
+  uint64 last_applied = 6;
+  uint64 log_length = 7;      // log entries still stored
+  uint64 snapshot_index = 8;  // 0 = no snapshot
+}
+
 service ClientRpc {
+  rpc NodeStatus(StatusRequest) returns (StatusResponse);
   rpc Put(PutRequest) returns (WriteResponse);
   rpc Get(GetRequest) returns (GetResponse);
   rpc Delete(DeleteRequest) returns (WriteResponse);

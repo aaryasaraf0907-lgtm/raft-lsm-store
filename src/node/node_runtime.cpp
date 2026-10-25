@@ -1,0 +1,115 @@
+#include "node/node_runtime.h"
+
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <stdexcept>
+#include <utility>
+
+namespace raftkv {
+namespace {
+
+constexpr int kMaxMessageBytes = 8 * 1024 * 1024;
+
+const char* RoleName(Role role) {
+  switch (role) {
+    case Role::kLeader:
+      return "leader";
+    case Role::kCandidate:
+      return "candidate";
+    case Role::kFollower:
+      return "follower";
+  }
+  return "unknown";
+}
+
+}  // namespace
+
+NodeRuntime::NodeRuntime(NodeOptions options) : options_(std::move(options)) {}
+
+NodeRuntime::~NodeRuntime() { Stop(); }
+
+void NodeRuntime::Start() {
+  if (started_) throw std::logic_error("node already started");
+  if (options_.id == 0) throw std::invalid_argument("node id must be >= 1");
+  if (std::find(options_.cluster.begin(), options_.cluster.end(), options_.id) ==
+      options_.cluster.end()) {
+    throw std::invalid_argument("the cluster list must contain this node's id");
+  }
+  if (options_.data_dir.empty()) throw std::invalid_argument("data_dir is required");
+
+  std::vector<NodeId> peer_ids;
+  for (NodeId id : options_.cluster) {
+    if (id != options_.id) peer_ids.push_back(id);
+  }
+
+  const std::filesystem::path root(options_.data_dir);
+  std::error_code ec;
+  std::filesystem::create_directories(root / "raft", ec);
+  if (ec) throw std::runtime_error("cannot create " + (root / "raft").string() + ": " + ec.message());
+
+  storage_ = std::make_unique<FileRaftStorage>((root / "raft").string(), options_.sync);
+  KVEngine::Options engine_options;
+  engine_options.dir = (root / "kv").string();
+  engine_options.sync_wal = options_.sync;
+  const Status opened = KVEngine::Open(engine_options, &engine_);
+  if (opened != Status::kOk) {
+    throw std::runtime_error("cannot open the storage engine in " + engine_options.dir +
+                             " (status " + std::to_string(static_cast<int>(opened)) + ")");
+  }
+  machine_ = std::make_unique<KVStateMachine>(engine_.get());
+
+  std::map<NodeId, std::string> peer_addresses;
+  for (const auto& p : options_.peers) {
+    if (p.first != options_.id && !p.second.empty()) peer_addresses.insert(p);
+  }
+  transport_ = std::make_unique<GrpcTransport>(options_.raft_listen, std::move(peer_addresses));
+  node_ = std::make_unique<RaftNodeImpl>(options_.id, peer_ids, transport_.get(), options_.raft,
+                                         storage_.get());
+  node_->SetApplyCallback(machine_->AsCallback());
+
+  service_ = std::make_unique<ClientService>(node_.get(), engine_.get(), machine_.get());
+  RaftNodeImpl* node = node_.get();
+  service_->SetStatusProvider([node](network::proto::StatusResponse* out) {
+    out->set_node_id(node->Id());
+    out->set_role(RoleName(node->GetRole()));
+    out->set_term(node->CurrentTerm());
+    out->set_leader_id_hint(node->LeaderHint());
+    out->set_commit_index(node->CommitIndex());
+    out->set_last_applied(node->LastApplied());
+    out->set_log_length(node->LogLength());
+    out->set_snapshot_index(node->SnapshotIndex());
+  });
+
+  node_->Start();  // starts the node-to-node gRPC server
+  raft_port_ = transport_->ListeningPort();
+
+  grpc::ServerBuilder builder;
+  builder.AddListeningPort(options_.client_listen, grpc::InsecureServerCredentials(), &client_port_);
+  builder.SetMaxReceiveMessageSize(kMaxMessageBytes);
+  builder.SetMaxSendMessageSize(kMaxMessageBytes);
+  builder.RegisterService(service_.get());
+  client_server_ = builder.BuildAndStart();
+  if (!client_server_ || client_port_ == 0) {
+    node_->Stop();
+    throw std::runtime_error("cannot listen for clients on " + options_.client_listen);
+  }
+  started_ = true;
+}
+
+void NodeRuntime::Stop() {
+  if (client_server_) {
+    client_server_->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(1));
+    client_server_->Wait();
+    client_server_.reset();
+  }
+  if (node_) node_->Stop();
+  started_ = false;
+}
+
+void NodeRuntime::SetPeerAddress(NodeId peer, const std::string& address) {
+  if (!transport_) throw std::logic_error("node not started");
+  transport_->SetPeerAddress(peer, address);
+}
+
+}  // namespace raftkv
