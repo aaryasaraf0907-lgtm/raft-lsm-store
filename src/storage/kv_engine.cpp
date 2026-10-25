@@ -1,10 +1,58 @@
 #include "storage/kv_engine.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <filesystem>
-#include <mutex>
 #include <system_error>
 
 namespace raftkv {
+namespace {
+
+// Parses "<prefix><digits><suffix>"; false for anything else (temp files, etc).
+bool ParseName(const std::string& name, const std::string& prefix, const std::string& suffix, uint64_t* out) {
+  if (name.size() <= prefix.size() + suffix.size()) return false;
+  if (name.compare(0, prefix.size(), prefix) != 0) return false;
+  if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) return false;
+  const std::string digits = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+  if (digits.size() > 18) return false;
+  uint64_t v = 0;
+  for (char c : digits) {
+    if (c < '0' || c > '9') return false;
+    v = v * 10 + static_cast<uint64_t>(c - '0');
+  }
+  *out = v;
+  return true;
+}
+
+}  // namespace
+
+std::string KVEngine::WalFileName(uint64_t seq) {
+  char buf[40];
+  std::snprintf(buf, sizeof(buf), "wal-%06llu.log", static_cast<unsigned long long>(seq));
+  return buf;
+}
+
+std::string KVEngine::SstFileName(uint64_t seq) {
+  char buf[40];
+  std::snprintf(buf, sizeof(buf), "%06llu.sst", static_cast<unsigned long long>(seq));
+  return buf;
+}
+
+std::string KVEngine::Path(const std::string& name) const {
+  return (std::filesystem::path(options_.dir) / name).string();
+}
+
+bool KVEngine::SyncDir() const {  // make file creations/removals in the directory durable
+  int fd = ::open(options_.dir.c_str(), O_RDONLY);
+  if (fd < 0) return false;
+  const bool ok = ::fsync(fd) == 0;
+  ::close(fd);
+  return ok;
+}
 
 Status KVEngine::Open(const Options& options, std::unique_ptr<KVEngine>* out) {
   std::error_code ec;
@@ -12,50 +60,216 @@ Status KVEngine::Open(const Options& options, std::unique_ptr<KVEngine>* out) {
   if (ec || !std::filesystem::is_directory(options.dir, ec)) return Status::kIOError;
 
   std::unique_ptr<KVEngine> engine(new KVEngine(options));
-  const std::string wal_path = (std::filesystem::path(options.dir) / "wal.log").string();
-
-  // Rebuild the memtable from the log BEFORE accepting any new writes.
-  ReplayStats stats;
-  Status s = WAL::Replay(
-      wal_path,
-      [&](const Entry& e) {
-        if (e.tombstone) {
-          engine->mem_.Delete(e.key);
-        } else {
-          engine->mem_.Put(e.key, e.value);
-        }
-      },
-      &stats);
+  Status s = engine->Recover();
   if (s != Status::kOk) return s;
-  engine->recovered_records_ = stats.records;
-
-  s = WAL::Open(wal_path, &engine->wal_);
-  if (s != Status::kOk) return s;
-
+  engine->PublishView();
+  if (options.flush_writer) engine->flusher_ = std::thread([e = engine.get()] { e->FlushLoop(); });
   *out = std::move(engine);
   return Status::kOk;
 }
 
-Status KVEngine::Put(const std::string& key, const std::string& value) {
-  std::unique_lock<std::shared_mutex> lock(mu_);
-  // Durable first, visible second: never expose a write that could be lost.
-  if (wal_->AppendPut(key, value, options_.sync_wal) != Status::kOk) return Status::kIOError;
-  mem_.Put(key, value);
+Status KVEngine::Recover() {
+  std::error_code ec;
+  std::vector<uint64_t> wal_seqs;
+  uint64_t max_seq = 0;
+  for (const auto& de : std::filesystem::directory_iterator(options_.dir, ec)) {
+    const std::string name = de.path().filename().string();
+    uint64_t n = 0;
+    if (ParseName(name, "wal-", ".log", &n)) {
+      wal_seqs.push_back(n);
+      max_seq = std::max(max_seq, n);
+    } else if (ParseName(name, "", ".sst", &n)) {
+      max_seq = std::max(max_seq, n);  // sequence numbers are never reused
+    }
+  }
+  if (ec) return Status::kIOError;
+  std::sort(wal_seqs.begin(), wal_seqs.end());
+  next_seq_ = max_seq + 1;
+
+  struct Pending {
+    uint64_t seq;
+    std::shared_ptr<MemTable> mem;
+  };
+  std::vector<Pending> pending;  // unflushed WALs, oldest first
+  for (uint64_t seq : wal_seqs) {
+    const std::string wal_path = Path(WalFileName(seq));
+    if (std::filesystem::exists(Path(SstFileName(seq)), ec)) {
+      std::filesystem::remove(wal_path, ec);  // already flushed: retire, do not replay
+      continue;
+    }
+    auto mem = std::make_shared<MemTable>(options_.memtable_bytes);
+    ReplayStats stats;
+    Status s = WAL::Replay(
+        wal_path,
+        [&](const Entry& e) {
+          if (e.tombstone) {
+            mem->Delete(e.key);
+          } else {
+            mem->Put(e.key, e.value);
+          }
+        },
+        &stats);
+    if (s != Status::kOk) return s;
+    recovered_records_ += stats.records;
+    pending.push_back({seq, std::move(mem)});
+  }
+
+  if (pending.empty()) {
+    active_seq_ = next_seq_++;
+    active_ = std::make_shared<MemTable>(options_.memtable_bytes);
+  } else {  // the newest unflushed WAL keeps receiving writes
+    active_seq_ = pending.back().seq;
+    active_ = pending.back().mem;
+    pending.pop_back();
+    for (auto& p : pending) {  // older ones wait for their flush
+      if (p.mem->Empty()) {
+        std::filesystem::remove(Path(WalFileName(p.seq)), ec);
+        continue;
+      }
+      frozen_.push_front({p.seq, p.mem});  // oldest pushed first => newest ends up in front
+    }
+  }
+  Status s = WAL::Open(Path(WalFileName(active_seq_)), &wal_);
+  if (s != Status::kOk) return s;
+  if (!SyncDir()) return Status::kIOError;
   return Status::kOk;
 }
 
-Status KVEngine::Delete(const std::string& key) {
-  std::unique_lock<std::shared_mutex> lock(mu_);
-  if (wal_->AppendDelete(key, options_.sync_wal) != Status::kOk) return Status::kIOError;
-  mem_.Delete(key);
+KVEngine::~KVEngine() {
+  {
+    std::lock_guard<std::mutex> lock(write_mu_);
+    stop_ = true;
+  }
+  cv_.notify_all();
+  if (flusher_.joinable()) flusher_.join();
+}
+
+void KVEngine::PublishView() {
+  auto v = std::make_shared<View>();
+  v->active = active_;
+  for (const Frozen& f : frozen_) v->frozen.push_back(f.mem);
+  std::lock_guard<std::mutex> guard(view_mu_);
+  view_ = std::move(v);
+}
+
+KVEngine::Stats KVEngine::GetStats() const {
+  std::lock_guard<std::mutex> lock(write_mu_);
+  Stats s;
+  s.active_seq = active_seq_;
+  s.frozen_memtables = frozen_.size();
+  s.flushes_done = flushes_done_;
+  s.flush_failures = flush_failures_;
+  s.flush_failing = flush_failing_;
+  return s;
+}
+
+Status KVEngine::Put(const std::string& key, const std::string& value) { return Write(false, key, value); }
+
+Status KVEngine::Delete(const std::string& key) { return Write(true, key, std::string()); }
+
+Status KVEngine::Write(bool tombstone, const std::string& key, const std::string& value) {
+  std::unique_lock<std::mutex> lock(write_mu_);
+  Status s = EnsureRoom(lock);
+  if (s != Status::kOk) return s;
+  // Durable first, visible second: never expose a write that could be lost.
+  s = tombstone ? wal_->AppendDelete(key, options_.sync_wal) : wal_->AppendPut(key, value, options_.sync_wal);
+  if (s != Status::kOk) return Status::kIOError;
+  if (tombstone) {
+    active_->Delete(key);
+  } else {
+    active_->Put(key, value);
+  }
+  return Status::kOk;
+}
+
+// Called before every write. Freezes a full memtable; if too many frozen ones are
+// already waiting, blocks until one is flushed, or fails fast if flushing is broken.
+Status KVEngine::EnsureRoom(std::unique_lock<std::mutex>& lock) {
+  for (;;) {
+    if (!options_.flush_writer || !active_->ShouldFlush()) return Status::kOk;
+    if (frozen_.size() < options_.max_frozen) return Freeze();
+    if (flush_failing_ || stop_) return Status::kIOError;
+    cv_.wait(lock);
+  }
+}
+
+Status KVEngine::Freeze() {
+  if (wal_->Sync() != Status::kOk) return Status::kIOError;  // old WAL fully durable first
+  const uint64_t new_seq = next_seq_;
+  std::unique_ptr<WAL> new_wal;
+  if (WAL::Open(Path(WalFileName(new_seq)), &new_wal) != Status::kOk) return Status::kIOError;
+  if (!SyncDir()) {
+    new_wal.reset();
+    std::error_code ec;
+    std::filesystem::remove(Path(WalFileName(new_seq)), ec);
+    return Status::kIOError;
+  }
+  frozen_.push_front({active_seq_, active_});
+  active_ = std::make_shared<MemTable>(options_.memtable_bytes);
+  active_seq_ = new_seq;
+  ++next_seq_;
+  wal_ = std::move(new_wal);
+  PublishView();
+  cv_.notify_all();
   return Status::kOk;
 }
 
 Status KVEngine::Get(const std::string& key, std::string* value) {
-  std::shared_lock<std::shared_mutex> lock(mu_);
-  // A tombstone and "not here" both mean not-found today. Once SSTables exist,
-  // only kNotFound may fall through to them; kDeleted must stop the search.
-  return mem_.Get(key, value) == MemTable::GetResult::kFound ? Status::kOk : Status::kNotFound;
+  std::shared_ptr<const View> view;
+  {
+    std::lock_guard<std::mutex> guard(view_mu_);
+    view = view_;
+  }
+  auto probe = [&](const MemTable& m, Status* result) {
+    switch (m.Get(key, value)) {
+      case MemTable::GetResult::kFound:
+        *result = Status::kOk;
+        return true;
+      case MemTable::GetResult::kDeleted:  // a tombstone hides every older version
+        *result = Status::kNotFound;
+        return true;
+      case MemTable::GetResult::kNotFound:
+        break;
+    }
+    return false;
+  };
+  Status result = Status::kNotFound;
+  if (probe(*view->active, &result)) return result;
+  for (const auto& f : view->frozen) {
+    if (probe(*f, &result)) return result;
+  }
+  return Status::kNotFound;  // the SSTable lookup goes here (next PR)
+}
+
+void KVEngine::FlushLoop() {
+  std::unique_lock<std::mutex> lock(write_mu_);
+  for (;;) {
+    cv_.wait(lock, [&] { return stop_ || !frozen_.empty(); });
+    if (stop_) return;
+    const Frozen f = frozen_.back();  // oldest first, so SSTables appear in sequence order
+    lock.unlock();
+
+    auto it = f.mem->NewIterator();
+    Status s = options_.flush_writer(it, Path(SstFileName(f.seq)), f.seq);
+    if (s == Status::kOk) {  // published and durable: the WAL is no longer needed
+      std::error_code ec;
+      std::filesystem::remove(Path(WalFileName(f.seq)), ec);  // if this fails, startup retires it
+    }
+
+    lock.lock();
+    if (s == Status::kOk) {
+      frozen_.pop_back();
+      ++flushes_done_;
+      flush_failing_ = false;
+      PublishView();
+      cv_.notify_all();
+    } else {  // keep the memtable and its WAL; try again shortly
+      ++flush_failures_;
+      flush_failing_ = true;
+      cv_.notify_all();  // wake writers waiting for room so they can fail fast
+      cv_.wait_for(lock, std::chrono::milliseconds(options_.flush_retry_ms), [&] { return stop_; });
+    }
+  }
 }
 
 }  // namespace raftkv
