@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <utility>
 
+#include "raft/message_size.h"
+
 namespace raftkv {
 
 namespace {
@@ -270,7 +272,11 @@ void RaftNodeImpl::SendAppendEntriesToLocked(NodeId peer) {
   LogIndex prev = next - 1;  // next_index_ is never below 1
   AppendEntriesRequest req{current_term_, id_, prev, log_[prev].term, {}, commit_index_};
   LogIndex last = LastLogIndexLocked();
+  size_t bytes = 0;
   for (LogIndex i = next; i <= last && req.entries.size() < cfg_.max_entries_per_append; ++i) {
+    size_t entry_bytes = ApproxEntryBytes(log_[i]);
+    if (!req.entries.empty() && bytes + entry_bytes > cfg_.max_bytes_per_append) break;
+    bytes += entry_bytes;
     req.entries.push_back(log_[i]);
   }
   Term sent_term = current_term_;

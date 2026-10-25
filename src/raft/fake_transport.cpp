@@ -2,6 +2,8 @@
 
 #include <utility>
 
+#include "raft/message_size.h"
+
 namespace raftkv {
 
 // ---- FakeTransport: thin wrappers that forward to the network ----
@@ -107,6 +109,15 @@ void FakeNetwork::SendRequestVote(NodeId from, NodeId to, const RequestVoteReque
 void FakeNetwork::SendAppendEntries(NodeId from, NodeId to, const AppendEntriesRequest& req,
                                     std::function<void(const AppendEntriesReply&)> on_reply) {
   uint64_t gen = GenerationOf(from);
+  size_t bytes = ApproxAppendBytes(req);
+  size_t seen = max_observed_bytes_.load();
+  while (bytes > seen && !max_observed_bytes_.compare_exchange_weak(seen, bytes)) {
+  }
+  size_t limit = max_message_bytes_.load();
+  if (limit != 0 && bytes > limit) {  // too big for the "wire": never delivered, no reply
+    ++oversized_dropped_;
+    return;
+  }
   Post([this, from, to, gen, req, on_reply = std::move(on_reply)]() {
     RpcHandler* handler = Lookup(from, to);
     if (handler == nullptr) return;

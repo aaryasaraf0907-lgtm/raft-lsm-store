@@ -18,6 +18,10 @@ struct RaftConfig {
   int election_timeout_max_ms = 300;
   int heartbeat_interval_ms = 50;
   size_t max_entries_per_append = 64;  // cap on entries per AppendEntries message
+  // Soft cap on the size of one AppendEntries message (see message_size.h). A message always
+  // carries at least one entry, so a single entry larger than this is still sent alone. Keep it
+  // well below the transport's message limit (gRPC's default is 4 MB).
+  size_t max_bytes_per_append = 1 << 20;
   uint32_t random_seed = 1;            // seed is combined with the node id
 };
 
