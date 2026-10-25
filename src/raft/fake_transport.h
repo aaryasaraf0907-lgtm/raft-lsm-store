@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -46,6 +47,12 @@ class FakeNetwork {
   std::unique_ptr<FakeTransport> MakeTransport(NodeId id);
   void Disconnect(NodeId id);
   void Reconnect(NodeId id);
+  // Drop any AppendEntries whose approximate size (message_size.h) exceeds `bytes`, like a real
+  // transport with a message size limit (gRPC's default is 4 MB). 0 = no limit.
+  void SetMaxMessageBytes(size_t bytes) { max_message_bytes_ = bytes; }
+  // Size of the largest AppendEntries sent so far, and how many were dropped for being too big.
+  size_t MaxObservedMessageBytes() const { return max_observed_bytes_; }
+  size_t OversizedDropped() const { return oversized_dropped_; }
   void Shutdown();
 
  private:
@@ -73,6 +80,9 @@ class FakeNetwork {
   std::map<NodeId, RpcHandler*> handlers_;
   std::set<NodeId> disconnected_;
   bool stop_ = false;
+  std::atomic<size_t> max_message_bytes_{0};
+  std::atomic<size_t> max_observed_bytes_{0};
+  std::atomic<size_t> oversized_dropped_{0};
   std::thread worker_;
 };
 
