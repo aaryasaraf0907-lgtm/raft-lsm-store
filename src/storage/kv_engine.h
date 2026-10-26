@@ -22,6 +22,7 @@
 // under a tiny mutex, then read lock-free from the concurrent memtables.
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -40,7 +41,7 @@
 
 namespace raftkv {
 
-class KVEngine : public KVStore {
+class KVEngine : public IndexedKVStore {
  public:
   // Writes `entries` (sorted by key, tombstones included) as the SSTable for flush
   // sequence `seq` at `path`. Must return kOk only once the complete file is durable
@@ -74,6 +75,14 @@ class KVEngine : public KVStore {
   Status Get(const std::string& key, std::string* value) override;
   Status Delete(const std::string& key) override;  // writes a tombstone, even if key is absent
 
+  // Like Put/Delete, but also record `raft_index` as the applied index (see IndexedKVStore). The data
+  // record and the index record are appended in that order and made durable by ONE sync, and
+  // neither becomes visible to readers until both are in the WAL. raft_index must be greater than
+  // AppliedIndex() (else kInvalidArgument, and nothing is written).
+  Status PutAt(const std::string& key, const std::string& value, uint64_t raft_index) override;
+  Status DeleteAt(const std::string& key, uint64_t raft_index) override;
+  uint64_t AppliedIndex() override { return applied_index_.load(); }
+
   uint64_t recovered_records() const { return recovered_records_; }
   Stats GetStats() const;
 
@@ -93,7 +102,7 @@ class KVEngine : public KVStore {
   explicit KVEngine(const Options& options) : options_(options) {}
 
   Status Recover();
-  Status Write(bool tombstone, const std::string& key, const std::string& value);
+  Status Write(bool tombstone, const std::string& key, const std::string& value, uint64_t raft_index);
   Status EnsureRoom(std::unique_lock<std::mutex>& lock);  // write_mu_ held
   Status Freeze();                                        // write_mu_ held
   void PublishView();                                     // write_mu_ held
@@ -103,6 +112,7 @@ class KVEngine : public KVStore {
 
   const Options options_;
   uint64_t recovered_records_ = 0;  // set before any thread starts
+  std::atomic<uint64_t> applied_index_{0};  // written under write_mu_, read anywhere
 
   mutable std::mutex write_mu_;  // guards everything below until view_mu_
   std::condition_variable cv_;

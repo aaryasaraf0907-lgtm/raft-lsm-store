@@ -60,7 +60,7 @@ ClientService::ClientService(RaftNode* node, KVStore* store,
 }
 
 bool ClientService::IsValidKey(const std::string& key) {
-  return !key.empty() && key.size() <= kMaxKeyBytes;
+  return !key.empty() && key.size() <= kMaxKeyBytes && !HasReservedKeyPrefix(key);
 }
 
 bool ClientService::IsValidValue(const std::string& value) {
@@ -116,7 +116,7 @@ grpc::Status ClientService::Put(grpc::ServerContext*,
   }
   if (!IsValidKey(request->key())) {
     response->set_status(network::proto::CLIENT_STATUS_INVALID_ARGUMENT);
-    response->set_error_message("key must be 1 to 4096 bytes");
+    response->set_error_message("key must be 1 to 4096 bytes and must not start with the engine's reserved prefix");
     return grpc::Status::OK;
   }
   if (!IsValidValue(request->value())) {
@@ -149,7 +149,7 @@ grpc::Status ClientService::Delete(
   }
   if (!IsValidKey(request->key())) {
     response->set_status(network::proto::CLIENT_STATUS_INVALID_ARGUMENT);
-    response->set_error_message("key must be 1 to 4096 bytes");
+    response->set_error_message("key must be 1 to 4096 bytes and must not start with the engine's reserved prefix");
     return grpc::Status::OK;
   }
   if (!IsValidTimeout(request->timeout_ms())) {
@@ -172,7 +172,7 @@ grpc::Status ClientService::Get(grpc::ServerContext*,
                                 network::proto::GetResponse* response) {
   if (!IsValidKey(request->key())) {
     response->set_status(network::proto::CLIENT_STATUS_INVALID_ARGUMENT);
-    response->set_error_message("key must be 1 to 4096 bytes");
+    response->set_error_message("key must be 1 to 4096 bytes and must not start with the engine's reserved prefix");
     return grpc::Status::OK;
   }
   if (!IsValidTimeout(request->timeout_ms())) {

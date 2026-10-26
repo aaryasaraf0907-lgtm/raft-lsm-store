@@ -28,6 +28,26 @@ bool ParseName(const std::string& name, const std::string& prefix, const std::st
   return true;
 }
 
+// The engine keeps the applied Raft index as an ordinary key under the reserved prefix, so flush,
+// compaction and recovery need no special cases for it.
+std::string AppliedIndexKey() {
+  return std::string(kReservedKeyPrefix, sizeof(kReservedKeyPrefix) - 1) + "applied_index";
+}
+
+std::string EncodeIndex(uint64_t index) {
+  std::string out(8, '\0');
+  for (int i = 0; i < 8; ++i) out[static_cast<size_t>(i)] = static_cast<char>((index >> (8 * i)) & 0xFF);
+  return out;
+}
+
+bool DecodeIndex(const std::string& bytes, uint64_t* index) {
+  if (bytes.size() != 8) return false;
+  uint64_t v = 0;
+  for (int i = 0; i < 8; ++i) v |= static_cast<uint64_t>(static_cast<uint8_t>(bytes[static_cast<size_t>(i)])) << (8 * i);
+  *index = v;
+  return true;
+}
+
 }  // namespace
 
 std::string KVEngine::WalFileName(uint64_t seq) {
@@ -63,6 +83,13 @@ Status KVEngine::Open(const Options& options, std::unique_ptr<KVEngine>* out) {
   Status s = engine->Recover();
   if (s != Status::kOk) return s;
   engine->PublishView();
+  {
+    std::string stored;  // the applied index that survived in the WAL (0 if there is none)
+    uint64_t index = 0;
+    if (engine->Get(AppliedIndexKey(), &stored) == Status::kOk && DecodeIndex(stored, &index)) {
+      engine->applied_index_.store(index);
+    }
+  }
   if (options.flush_writer) engine->flusher_ = std::thread([e = engine.get()] { e->FlushLoop(); });
   *out = std::move(engine);
   return Status::kOk;
@@ -163,21 +190,54 @@ KVEngine::Stats KVEngine::GetStats() const {
   return s;
 }
 
-Status KVEngine::Put(const std::string& key, const std::string& value) { return Write(false, key, value); }
+Status KVEngine::Put(const std::string& key, const std::string& value) {
+  if (HasReservedKeyPrefix(key)) return Status::kInvalidArgument;
+  return Write(false, key, value, 0);
+}
 
-Status KVEngine::Delete(const std::string& key) { return Write(true, key, std::string()); }
+Status KVEngine::Delete(const std::string& key) {
+  if (HasReservedKeyPrefix(key)) return Status::kInvalidArgument;
+  return Write(true, key, std::string(), 0);
+}
 
-Status KVEngine::Write(bool tombstone, const std::string& key, const std::string& value) {
+Status KVEngine::PutAt(const std::string& key, const std::string& value, uint64_t raft_index) {
+  if (HasReservedKeyPrefix(key) || raft_index == 0) return Status::kInvalidArgument;
+  return Write(false, key, value, raft_index);
+}
+
+Status KVEngine::DeleteAt(const std::string& key, uint64_t raft_index) {
+  if (HasReservedKeyPrefix(key) || raft_index == 0) return Status::kInvalidArgument;
+  return Write(true, key, std::string(), raft_index);
+}
+
+Status KVEngine::Write(bool tombstone, const std::string& key, const std::string& value,
+                       uint64_t raft_index) {
   std::unique_lock<std::mutex> lock(write_mu_);
-  Status s = EnsureRoom(lock);
+  const bool with_index = raft_index != 0;
+  // The Raft state machine applies in increasing index order; anything else is a caller bug.
+  if (with_index && raft_index <= applied_index_.load()) return Status::kInvalidArgument;
+  Status s = EnsureRoom(lock);  // data and index record must land in the same WAL and memtable
   if (s != Status::kOk) return s;
-  // Durable first, visible second: never expose a write that could be lost.
-  s = tombstone ? wal_->AppendDelete(key, options_.sync_wal) : wal_->AppendPut(key, value, options_.sync_wal);
+  // Durable first, visible second: never expose a write that could be lost. With an index, the
+  // data record is appended first, then the index record, and ONE sync makes both durable, so after
+  // a crash the index can only be missing (lagging by this operation), never ahead of the data.
+  const bool sync_data = options_.sync_wal && !with_index;
+  s = tombstone ? wal_->AppendDelete(key, sync_data) : wal_->AppendPut(key, value, sync_data);
   if (s != Status::kOk) return Status::kIOError;
+  std::string index_bytes;
+  if (with_index) {
+    index_bytes = EncodeIndex(raft_index);
+    s = wal_->AppendPut(AppliedIndexKey(), index_bytes, options_.sync_wal);
+    if (s != Status::kOk) return Status::kIOError;
+  }
   if (tombstone) {
     active_->Delete(key);
   } else {
     active_->Put(key, value);
+  }
+  if (with_index) {
+    active_->Put(AppliedIndexKey(), index_bytes);
+    applied_index_.store(raft_index);
   }
   return Status::kOk;
 }
