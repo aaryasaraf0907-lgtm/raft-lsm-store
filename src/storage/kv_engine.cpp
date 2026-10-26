@@ -220,8 +220,7 @@ Status KVEngine::Recover() {
     std::shared_ptr<MemTable> mem;
   };
   std::vector<Pending> pending;  // unflushed WALs, oldest first
-  for (size_t wi = 0; wi < wal_seqs.size(); ++wi) {
-    const uint64_t seq = wal_seqs[wi];
+  for (uint64_t seq : wal_seqs) {
     const std::string wal_path = Path(WalFileName(seq));
     // Already flushed: retire the WAL, do not replay it. SSTable mode asks the manifest; the
     // original mode asks whether <seq>.sst exists.
@@ -242,17 +241,10 @@ Status KVEngine::Recover() {
             mem->Put(e.key, e.value);
           }
         },
-        &stats, options_.wal_truncate_on_corruption);
+        &stats);
     if (s != Status::kOk) return s;
     recovered_records_ += stats.records;
     pending.push_back({seq, std::move(mem)});
-    if (options_.wal_truncate_on_corruption && stats.discarded_bytes > 0 && wi + 1 < wal_seqs.size()) {
-      // This WAL lost data and it is not the newest one: every newer WAL now sits behind a hole.
-      for (size_t later = wi + 1; later < wal_seqs.size(); ++later) {
-        std::filesystem::remove(Path(WalFileName(wal_seqs[later])), ec);
-      }
-      break;
-    }
   }
 
   if (pending.empty()) {
@@ -752,7 +744,11 @@ void KVEngine::CompactLoop() {
       next.files.erase(next.files.begin() + at, next.files.begin() + end);  // the run, replaced in place
       next.files.insert(next.files.begin() + at, result.output);
       next.next_file_number = std::max(next.next_file_number, next_seq_);
-      s = StoreManifest(options_.dir, next);
+      // Tests only: test_crash_hook point "compact:fail_after_manifest_rename" makes this store fail
+      // inside StoreManifest after its rename, as if the directory fsync had failed (see above).
+      s = StoreManifest(options_.dir, next, [this] {
+        return options_.test_crash_hook && options_.test_crash_hook("compact:fail_after_manifest_rename");
+      });
       if (s == Status::kOk) {
         manifest_ = std::move(next);
         sstables_.erase(sstables_.begin() + at, sstables_.begin() + end);
