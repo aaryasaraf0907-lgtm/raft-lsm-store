@@ -62,7 +62,8 @@ class KVEngine : public IndexedKVStore {
     // SSTable mode: the real LSM tree. A manifest (docs/sstable-format.md A.4) records which
     // SSTables are live and how far flushing has got; the engine flushes a full memtable into an
     // SSTable by itself (flush_writer must be unset); Get searches the SSTables newest first; and a
-    // background thread merges the live SSTables when there are too many. Off by default, which
+    // background thread merges a run of the newest live SSTables when there are too many (which
+    // run: see CompactLoop). Off by default, which
     // keeps the original WAL + memtable behaviour (and the flush_writer test seam) unchanged.
     bool use_sstables = false;
     size_t compaction_trigger = 4;  // merge when this many SSTables are live (min 2; 0 = never)
