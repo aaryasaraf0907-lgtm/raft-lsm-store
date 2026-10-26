@@ -66,6 +66,13 @@ class KVEngine : public CheckpointableStore {
     // background thread merges the live SSTables when there are too many. Off by default, which
     // keeps the original WAL + memtable behaviour (and the flush_writer test seam) unchanged.
     bool use_sstables = false;
+    // For an engine whose WAL is not fsynced on every write (sync_wal = false) and whose contents
+    // can be rebuilt from the Raft log or a Raft snapshot: if a WAL is damaged in the middle (a power
+    // loss can leave a hole), keep the records before the damage, drop the rest, and ALSO drop every
+    // newer WAL (data after a hole must not survive, or the applied index could claim entries whose
+    // data was lost). The applied index then lags, and replay refills the gap. Off by default: the
+    // strict behaviour reports kCorruption.
+    bool wal_truncate_on_corruption = false;
     size_t compaction_trigger = 4;  // merge when this many SSTables are live (min 2; 0 = never)
     uint32_t bloom_bits_per_key = BloomFilter::kDefaultBitsPerKey;
     // Tests only: called at named steps of flush and compaction ("flush:after_sst",

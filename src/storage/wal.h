@@ -50,8 +50,15 @@ class WAL {
 
   // Calls `apply` for each valid record in order (a delete arrives as an Entry
   // with tombstone=true). A missing file is an empty log. Repairs a torn tail.
+  //
+  // A complete record whose checksum fails, with more data after it, means the MIDDLE of the log is
+  // damaged. By default that is reported as kCorruption (the records after it may be intact, and
+  // silently dropping them would hide a real problem). With `truncate_mid_log_corruption` the log is
+  // instead cut at the first bad record, like a torn tail: the right choice for a log that is not
+  // fsynced on every write (a power loss can leave a hole in it) and whose contents can be rebuilt
+  // from elsewhere (the Raft log).
   static Status Replay(const std::string& path, const std::function<void(const Entry&)>& apply,
-                       ReplayStats* stats = nullptr);
+                       ReplayStats* stats = nullptr, bool truncate_mid_log_corruption = false);
 
  private:
   explicit WAL(int fd, WriteFunction write_function = {})

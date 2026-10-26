@@ -27,6 +27,8 @@ void Usage(FILE* out) {
       "  --client-addr ADDR   listen address for clients (required)\n"
       "  --data-dir DIR       where the Raft log and the storage engine live (required)\n"
       "  --no-sync            do not fsync (fast, NOT crash safe: testing and benchmarks only)\n"
+      "  --sync-engine-wal    also fsync the engine's own WAL on every write (slower; the Raft log\n"
+      "                       is already durable, so the engine can be rebuilt from it)\n"
       "  --no-sstables        use the old WAL + memtable engine instead of the LSM engine\n"
       "  --memtable-bytes N   flush a memtable to an SSTable at this size (default 4194304)\n"
       "  --compaction-trigger N  merge SSTables when N are live; 0 = never (default 4)\n"
@@ -95,6 +97,8 @@ int main(int argc, char** argv) {
       options.snapshot_threshold_entries = static_cast<size_t>(std::strtoull(value("--snapshot-threshold"), nullptr, 10));
     } else if (arg == "--snapshot-trailing") {
       options.snapshot_trailing_entries = static_cast<size_t>(std::strtoull(value("--snapshot-trailing"), nullptr, 10));
+    } else if (arg == "--sync-engine-wal") {
+      options.sync_engine_wal = true;
     } else if (arg == "--no-sstables") {
       options.use_sstables = false;
     } else if (arg == "--no-prevote") {

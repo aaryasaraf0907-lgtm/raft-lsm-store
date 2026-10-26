@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <string>
@@ -73,6 +74,8 @@ class NodeCluster {
     }
     return 0;
   }
+
+  std::string DataDir() const { return dir_.path; }
 
   void Crash(int id) { nodes_[id - 1].reset(); }  // stops it; its data directory stays
 
@@ -383,6 +386,85 @@ TEST(NodeClusterTest, AnEmptyReplacementThatNeverCaughtUpIsBroughtUpBySnapshot) 
       },
       30000ms)) << "the replacement node never caught up";
   EXPECT_GT(c.Node(victim)->node()->SnapshotIndex(), 0u);
+}
+
+// The engine's own WAL is not fsynced by default: the Raft log is the durable copy. So a node whose
+// engine lost anything (its WAL, its whole directory, a damaged middle) must come back by itself.
+namespace {
+std::string EngineDir(NodeCluster& c, int id) { return c.DataDir() + "/node" + std::to_string(id) + "/kv"; }
+}  // namespace
+
+TEST(NodeClusterTest, ANodeWhoseEngineLostItsWalRebuildsFromTheRaftLog) {
+  NodeCluster c(3);
+  for (int i = 0; i < 60; ++i) ASSERT_EQ(c.client().Put(KeyOf(i), ValueOf(i)).status, KvStatus::kOk) << i;
+  const int victim = c.Leader() % 3 + 1;
+  ASSERT_TRUE(WaitFor([&] { return EngineHas(c.Node(victim), KeyOf(59), ValueOf(59)); }, 10000ms));
+  c.Crash(victim);
+  for (const auto& de : std::filesystem::directory_iterator(EngineDir(c, victim))) {
+    if (de.path().filename().string().rfind("wal-", 0) == 0) std::filesystem::remove(de.path());
+  }
+  c.Restart(victim);
+  ASSERT_TRUE(WaitFor(
+      [&] {
+        for (int i = 0; i < 60; ++i) {
+          if (!EngineHas(c.Node(victim), KeyOf(i), ValueOf(i))) return false;
+        }
+        return true;
+      },
+      20000ms)) << "the node did not rebuild its engine from the Raft log";
+}
+
+TEST(NodeClusterTest, ANodeWhoseEngineDirectoryIsGoneRebuildsFromItsSnapshotAndLog) {
+  NodeCluster c(3, /*memtable_bytes=*/16384, /*snapshot_threshold=*/25);
+  const std::string pad(150, 'p');
+  for (int i = 0; i < 150; ++i) ASSERT_EQ(c.client().Put(KeyOf(i), ValueOf(i) + pad).status, KvStatus::kOk) << i;
+  const int victim = c.Leader() % 3 + 1;
+  ASSERT_TRUE(WaitFor([&] { return c.Node(victim)->node()->SnapshotIndex() > 50; }, 15000ms));
+  ASSERT_TRUE(WaitFor([&] { return EngineHas(c.Node(victim), KeyOf(149), ValueOf(149) + pad); }, 10000ms));
+  c.Crash(victim);
+  std::filesystem::remove_all(EngineDir(c, victim));  // the engine is gone; the Raft log and snapshot remain
+  c.Restart(victim);
+  ASSERT_TRUE(WaitFor(
+      [&] {
+        for (int i = 0; i < 150; ++i) {
+          if (!EngineHas(c.Node(victim), KeyOf(i), ValueOf(i) + pad)) return false;
+        }
+        return true;
+      },
+      20000ms)) << "the node did not rebuild its engine from its snapshot and log";
+}
+
+TEST(NodeClusterTest, ADamagedEngineWalDoesNotStopANodeFromStarting) {
+  NodeCluster c(3);
+  for (int i = 0; i < 60; ++i) ASSERT_EQ(c.client().Put(KeyOf(i), ValueOf(i)).status, KvStatus::kOk) << i;
+  const int victim = c.Leader() % 3 + 1;
+  ASSERT_TRUE(WaitFor([&] { return EngineHas(c.Node(victim), KeyOf(59), ValueOf(59)); }, 10000ms));
+  c.Crash(victim);
+  std::string biggest;
+  uintmax_t biggest_size = 0;
+  for (const auto& de : std::filesystem::directory_iterator(EngineDir(c, victim))) {
+    if (de.path().filename().string().rfind("wal-", 0) == 0 && std::filesystem::file_size(de.path()) >= biggest_size) {
+      biggest = de.path().string();
+      biggest_size = std::filesystem::file_size(de.path());
+    }
+  }
+  ASSERT_FALSE(biggest.empty());
+  {
+    std::string bytes;
+    { std::ifstream in(biggest, std::ios::binary); bytes.assign(std::istreambuf_iterator<char>(in), {}); }
+    bytes[bytes.size() / 2] ^= 0x40;  // a hole in the middle, as a power loss can leave
+    std::ofstream out(biggest, std::ios::binary | std::ios::trunc);
+    out << bytes;
+  }
+  c.Restart(victim);
+  ASSERT_TRUE(WaitFor(
+      [&] {
+        for (int i = 0; i < 60; ++i) {
+          if (!EngineHas(c.Node(victim), KeyOf(i), ValueOf(i))) return false;
+        }
+        return true;
+      },
+      20000ms)) << "a damaged engine WAL must be repaired, not fatal";
 }
 
 }  // namespace raftkv
