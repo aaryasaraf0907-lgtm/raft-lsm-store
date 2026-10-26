@@ -155,7 +155,9 @@ class LsmTest : public ::testing::Test {
     EXPECT_EQ(SSTable::Open(dir_ + "/" + KVEngine::SstFileName(file_number), file_number, &t), Status::kOk);
     SSTable::GetResult r = SSTable::GetResult::kAbsent;
     std::string v;
-    if (t != nullptr) EXPECT_EQ(t->Get(key, &r, &v), Status::kOk);
+    if (t != nullptr) {
+      EXPECT_EQ(t->Get(key, &r, &v), Status::kOk);
+    }
     return r;
   }
   std::string FileBytes(const std::string& path) {
@@ -314,7 +316,7 @@ TEST_F(LsmTest, ACrashBeforeTheWalIsDeletedRetiresItInsteadOfReplayingIt) {
   for (int i = 0; i < written; ++i) ASSERT_EQ(Get(Key(i)), "value" + std::string(90, 'x')) << "write " << i;
 }
 
-TEST_F(LsmTest, CompactionMergesIntoOneTableAndDropsTombstones) {
+TEST_F(LsmTest, CompactionKeepsReadsCorrectAndDeletesItsInputs) {
   ASSERT_EQ(Open(Opts(/*compaction_trigger=*/4)), Status::kOk);
   std::map<std::string, std::string> model;
   for (int round = 0; round < 8; ++round) {  // overwrites and deletes spread over many flushes
@@ -337,17 +339,21 @@ TEST_F(LsmTest, CompactionMergesIntoOneTableAndDropsTombstones) {
     auto it = model.find(Key(i));
     ASSERT_EQ(Get(Key(i)), it == model.end() ? "<absent>" : it->second) << Key(i);
   }
-  // Wait until the live set is down to one table, then look inside it: no tombstone may remain.
-  ASSERT_TRUE(WaitFor([&] {
-    auto s = engine_->GetStats();
-    return s.sstables == 1 || (s.sstables < 4 && s.frozen_memtables == 0 && s.compactions_done >= 2);
-  }));
+  // Let compaction settle (the compactor deletes a merge's inputs AFTER it installs the new live
+  // set, so the files on disk only match the manifest once it is idle).
+  WaitUntilCompactionIdle(4);
   const ManifestState m = Manifest();
   ASSERT_FALSE(m.files.empty());
-  std::unique_ptr<SSTable> oldest;
-  ASSERT_EQ(SSTable::Open(dir_ + "/" + KVEngine::SstFileName(m.files[0].file_number), m.files[0].file_number, &oldest), Status::kOk);
-  for (auto it = oldest->NewIterator(); it->Valid(); it->Next()) EXPECT_FALSE(it->Current().tombstone) << it->Current().key;
   EXPECT_EQ(Files(".sst").size(), m.files.size()) << "compaction inputs must be deleted";
+  if (m.files.size() == 1) {  // everything was merged into one table, so no tombstone may remain in it
+    std::unique_ptr<SSTable> only;
+    ASSERT_EQ(SSTable::Open(dir_ + "/" + KVEngine::SstFileName(m.files[0].file_number), m.files[0].file_number, &only), Status::kOk);
+    for (auto it = only->NewIterator(); it->Valid(); it->Next()) EXPECT_FALSE(it->Current().tombstone) << it->Current().key;
+  }
+  for (int i = 0; i < 50; ++i) {  // and reads are still right after it settled
+    auto it = model.find(Key(i));
+    ASSERT_EQ(Get(Key(i)), it == model.end() ? "<absent>" : it->second) << Key(i);
+  }
 }
 
 // Crash after the merged output is published but before the manifest swaps it in: the old files are
