@@ -1,5 +1,7 @@
 #include "storage/kv_engine.h"
 
+#include "storage/compaction.h"
+
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -7,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <set>
 #include <system_error>
 
 namespace raftkv {
@@ -75,6 +78,7 @@ bool KVEngine::SyncDir() const {  // make file creations/removals in the directo
 }
 
 Status KVEngine::Open(const Options& options, std::unique_ptr<KVEngine>* out) {
+  if (options.use_sstables && options.flush_writer) return Status::kInvalidArgument;  // one flush path only
   std::error_code ec;
   std::filesystem::create_directories(options.dir, ec);
   if (ec || !std::filesystem::is_directory(options.dir, ec)) return Status::kIOError;
@@ -90,13 +94,78 @@ Status KVEngine::Open(const Options& options, std::unique_ptr<KVEngine>* out) {
       engine->applied_index_.store(index);
     }
   }
-  if (options.flush_writer) engine->flusher_ = std::thread([e = engine.get()] { e->FlushLoop(); });
+  if (options.flush_writer || options.use_sstables) engine->flusher_ = std::thread([e = engine.get()] { e->FlushLoop(); });
+  if (options.use_sstables && options.compaction_trigger > 0) {
+    engine->compactor_ = std::thread([e = engine.get()] { e->CompactLoop(); });
+  }
   *out = std::move(engine);
+  return Status::kOk;
+}
+
+bool KVEngine::CrashPoint(const char* point) {
+  if (options_.test_crash_hook && options_.test_crash_hook(point)) {
+    dead_ = true;
+    cv_.notify_all();
+    return true;
+  }
+  return false;
+}
+
+// SSTable mode, first step of recovery. The manifest is the truth about which SSTables are live.
+// Anything else in the directory that looks like ours is the leftover of an operation that never
+// committed (a flush or compaction output whose manifest edit did not happen, or an input that a
+// finished compaction had not yet deleted) and is removed. SSTables without any manifest are
+// refused rather than guessed about.
+Status KVEngine::LoadLsmState() {
+  std::error_code ec;
+  bool found = false;
+  Status s = LoadManifest(options_.dir, &manifest_, &found);
+  if (s != Status::kOk) return s;
+  std::set<uint64_t> live;
+  for (const SSTableMeta& f : manifest_.files) live.insert(f.file_number);
+  std::vector<std::filesystem::path> doomed;
+  std::vector<uint64_t> sst_numbers;
+  bool any_sst = false;
+  for (const auto& de : std::filesystem::directory_iterator(options_.dir, ec)) {
+    const std::string name = de.path().filename().string();
+    uint64_t n = 0;
+    if (name.find(".tmp") != std::string::npos) {
+      doomed.push_back(de.path());  // a temp file of a write that never finished
+    } else if (ParseName(name, "", ".sst", &n)) {
+      any_sst = true;
+      sst_numbers.push_back(n);
+      lsm_highest_number_ = std::max(lsm_highest_number_, n);
+      if (live.count(n) == 0) doomed.push_back(de.path());
+    }
+  }
+  if (ec) return Status::kIOError;
+  if (!found && any_sst) {
+    // No manifest means no flush ever committed (the manifest edit comes BEFORE a WAL is retired),
+    // so every SSTable here is an orphan of the very first flush and its WAL must still exist; the
+    // SSTable is redundant. If some SSTable's WAL is gone, the data lives only in that SSTable and
+    // the manifest has been lost: refuse rather than delete or guess.
+    for (uint64_t n : sst_numbers) {
+      if (!std::filesystem::exists(Path(WalFileName(n)), ec)) return Status::kCorruption;
+    }
+  }
+  for (const auto& p : doomed) std::filesystem::remove(p, ec);
+  for (const SSTableMeta& f : manifest_.files) {
+    std::unique_ptr<SSTable> t;
+    s = SSTable::Open(Path(SstFileName(f.file_number)), f.file_number, &t);
+    if (s == Status::kIOError) return Status::kCorruption;  // a live file is missing or unreadable
+    if (s != Status::kOk) return s;
+    if (t->meta().min_seq != f.min_seq || t->meta().max_seq != f.max_seq) return Status::kCorruption;
+    sstables_.push_back(std::shared_ptr<SSTable>(std::move(t)));
+  }
   return Status::kOk;
 }
 
 Status KVEngine::Recover() {
   std::error_code ec;
+  if (options_.use_sstables) {
+    Status s = LoadLsmState();
+    if (s != Status::kOk) return s;
+  }
   std::vector<uint64_t> wal_seqs;
   uint64_t max_seq = 0;
   for (const auto& de : std::filesystem::directory_iterator(options_.dir, ec)) {
@@ -111,7 +180,7 @@ Status KVEngine::Recover() {
   }
   if (ec) return Status::kIOError;
   std::sort(wal_seqs.begin(), wal_seqs.end());
-  next_seq_ = max_seq + 1;
+  next_seq_ = std::max({max_seq, lsm_highest_number_, manifest_.next_file_number - 1}) + 1;  // never reuse a number
 
   struct Pending {
     uint64_t seq;
@@ -120,8 +189,12 @@ Status KVEngine::Recover() {
   std::vector<Pending> pending;  // unflushed WALs, oldest first
   for (uint64_t seq : wal_seqs) {
     const std::string wal_path = Path(WalFileName(seq));
-    if (std::filesystem::exists(Path(SstFileName(seq)), ec)) {
-      std::filesystem::remove(wal_path, ec);  // already flushed: retire, do not replay
+    // Already flushed: retire the WAL, do not replay it. SSTable mode asks the manifest; the
+    // original mode asks whether <seq>.sst exists.
+    const bool flushed = options_.use_sstables ? seq <= manifest_.flushed_through
+                                               : std::filesystem::exists(Path(SstFileName(seq)), ec);
+    if (flushed) {
+      std::filesystem::remove(wal_path, ec);
       continue;
     }
     auto mem = std::make_shared<MemTable>(options_.memtable_bytes);
@@ -169,12 +242,14 @@ KVEngine::~KVEngine() {
   }
   cv_.notify_all();
   if (flusher_.joinable()) flusher_.join();
+  if (compactor_.joinable()) compactor_.join();
 }
 
 void KVEngine::PublishView() {
   auto v = std::make_shared<View>();
   v->active = active_;
   for (const Frozen& f : frozen_) v->frozen.push_back(f.mem);
+  for (auto it = sstables_.rbegin(); it != sstables_.rend(); ++it) v->sstables.push_back(*it);
   std::lock_guard<std::mutex> guard(view_mu_);
   view_ = std::move(v);
 }
@@ -187,6 +262,9 @@ KVEngine::Stats KVEngine::GetStats() const {
   s.flushes_done = flushes_done_;
   s.flush_failures = flush_failures_;
   s.flush_failing = flush_failing_;
+  s.sstables = sstables_.size();
+  s.compactions_done = compactions_done_;
+  s.compaction_failures = compaction_failures_;
   return s;
 }
 
@@ -246,7 +324,8 @@ Status KVEngine::Write(bool tombstone, const std::string& key, const std::string
 // already waiting, blocks until one is flushed, or fails fast if flushing is broken.
 Status KVEngine::EnsureRoom(std::unique_lock<std::mutex>& lock) {
   for (;;) {
-    if (!options_.flush_writer || !active_->ShouldFlush()) return Status::kOk;
+    if (dead_) return Status::kIOError;
+    if (!(options_.flush_writer || options_.use_sstables) || !active_->ShouldFlush()) return Status::kOk;
     if (frozen_.size() < options_.max_frozen) return Freeze();
     if (flush_failing_ || stop_) return Status::kIOError;
     cv_.wait(lock);
@@ -298,36 +377,157 @@ Status KVEngine::Get(const std::string& key, std::string* value) {
   for (const auto& f : view->frozen) {
     if (probe(*f, &result)) return result;
   }
-  return Status::kNotFound;  // the SSTable lookup goes here (next PR)
+  for (const auto& table : view->sstables) {  // newest SSTable first; a tombstone stops the search
+    SSTable::GetResult found = SSTable::GetResult::kAbsent;
+    std::string stored;
+    Status s = table->Get(key, &found, &stored);
+    if (s != Status::kOk) return s;  // a damaged table is an error, never "not found"
+    if (found == SSTable::GetResult::kFound) {
+      *value = std::move(stored);
+      return Status::kOk;
+    }
+    if (found == SSTable::GetResult::kDeleted) return Status::kNotFound;
+  }
+  return Status::kNotFound;
 }
 
+// Flushes frozen memtables, oldest first, so SSTables appear in sequence order.
+//
+// SSTable mode, per memtable (the order is what makes a crash at any point safe):
+//   1. write <seq>.sst  (published atomically by SSTableBuilder)
+//   2. store the manifest with that file added and flushed_through = seq     <- the commit point
+//   3. delete wal-<seq>.log
+// A crash before 2 leaves an SSTable the manifest does not know: startup deletes it and replays the
+// WAL, which still has everything. A crash between 2 and 3 leaves a WAL at or below flushed_through:
+// startup retires it. A memtable and its applied-index record always go into the same SSTable.
 void KVEngine::FlushLoop() {
   std::unique_lock<std::mutex> lock(write_mu_);
   for (;;) {
-    cv_.wait(lock, [&] { return stop_ || !frozen_.empty(); });
-    if (stop_) return;
+    cv_.wait(lock, [&] { return stop_ || dead_ || !frozen_.empty(); });
+    if (stop_ || dead_) return;
     const Frozen f = frozen_.back();  // oldest first, so SSTables appear in sequence order
     lock.unlock();
 
-    auto it = f.mem->NewIterator();
-    Status s = options_.flush_writer(it, Path(SstFileName(f.seq)), f.seq);
-    if (s == Status::kOk) {  // published and durable: the WAL is no longer needed
+    Status s = Status::kOk;
+    std::shared_ptr<SSTable> table;
+    const SSTableMeta meta{f.seq, f.seq, f.seq};
+    if (options_.use_sstables) {
       std::error_code ec;
-      std::filesystem::remove(Path(WalFileName(f.seq)), ec);  // if this fails, startup retires it
+      std::filesystem::remove(Path(SstFileName(f.seq)), ec);  // an orphan of an earlier failed attempt
+      auto it = f.mem->NewIterator();
+      SSTableBuilderOptions bo;
+      bo.bits_per_key = options_.bloom_bits_per_key;
+      s = WriteSSTable(Path(SstFileName(f.seq)), meta, bo, &it);
+      std::unique_ptr<SSTable> opened;
+      if (s == Status::kOk) s = SSTable::Open(Path(SstFileName(f.seq)), f.seq, &opened);
+      if (s == Status::kOk) table = std::shared_ptr<SSTable>(std::move(opened));
+      if (s == Status::kOk && CrashPoint("flush:after_sst")) return;
+    } else {
+      auto it = f.mem->NewIterator();
+      s = options_.flush_writer(it, Path(SstFileName(f.seq)), f.seq);
+      if (s == Status::kOk) {  // published and durable: the WAL is no longer needed
+        std::error_code ec;
+        std::filesystem::remove(Path(WalFileName(f.seq)), ec);  // if this fails, startup retires it
+      }
     }
 
     lock.lock();
+    if (options_.use_sstables && s == Status::kOk) {
+      ManifestState next = manifest_;
+      next.files.push_back(meta);
+      next.flushed_through = f.seq;
+      next.next_file_number = std::max(next.next_file_number, next_seq_);
+      s = StoreManifest(options_.dir, next);
+      if (s == Status::kOk) {
+        manifest_ = std::move(next);
+        sstables_.push_back(table);
+        if (CrashPoint("flush:after_manifest")) return;  // WAL not deleted yet
+        std::error_code ec;
+        std::filesystem::remove(Path(WalFileName(f.seq)), ec);  // if this fails, startup retires it
+      } else {
+        std::error_code ec;
+        std::filesystem::remove(Path(SstFileName(f.seq)), ec);  // never committed
+      }
+    }
     if (s == Status::kOk) {
       frozen_.pop_back();
       ++flushes_done_;
       flush_failing_ = false;
-      PublishView();
+      PublishView();  // the memtable disappears and its SSTable appears in one step
       cv_.notify_all();
     } else {  // keep the memtable and its WAL; try again shortly
       ++flush_failures_;
       flush_failing_ = true;
       cv_.notify_all();  // wake writers waiting for room so they can fail fast
-      cv_.wait_for(lock, std::chrono::milliseconds(options_.flush_retry_ms), [&] { return stop_; });
+      cv_.wait_for(lock, std::chrono::milliseconds(options_.flush_retry_ms), [&] { return stop_ || dead_; });
+    }
+  }
+}
+
+// Merges the live SSTables into one when there are too many (SSTable mode).
+//   1. Compact() writes the merged output (published atomically); inputs are untouched
+//   2. store the manifest with the inputs removed and the output added   <- the commit point
+//   3. delete the input files (readers that already hold them keep reading them)
+// A crash before 2 leaves an output the manifest does not know (startup deletes it); a crash between
+// 2 and 3 leaves input files the manifest no longer lists (startup deletes them). The run always
+// starts at the oldest live file, so dropping tombstones is safe (rule C7): nothing older exists.
+void KVEngine::CompactLoop() {
+  const size_t trigger = std::max<size_t>(2, options_.compaction_trigger);
+  std::unique_lock<std::mutex> lock(write_mu_);
+  for (;;) {
+    cv_.wait(lock, [&] { return stop_ || dead_ || sstables_.size() >= trigger; });
+    if (stop_ || dead_) return;
+    const size_t n = sstables_.size();
+    std::vector<std::shared_ptr<SSTable>> inputs(sstables_.begin(), sstables_.begin() + static_cast<std::ptrdiff_t>(n));
+    const std::vector<SSTableMeta> live = manifest_.files;
+    const uint64_t out_number = next_seq_++;  // same counter as the WAL sequence numbers
+    lock.unlock();
+
+    std::vector<const SSTable*> raw;
+    for (const auto& t : inputs) raw.push_back(t.get());
+    CompactionOptions co;
+    co.drop_tombstones = true;
+    co.builder.bits_per_key = options_.bloom_bits_per_key;
+    CompactionResult result;
+    const std::string out_path = Path(SstFileName(out_number));
+    Status s = Compact(raw, live, out_path, out_number, co, &result);
+    if (s == Status::kOk && CrashPoint("compact:after_output")) return;
+    std::shared_ptr<SSTable> output;
+    if (s == Status::kOk) {
+      std::unique_ptr<SSTable> opened;
+      s = SSTable::Open(out_path, out_number, &opened);
+      if (s == Status::kOk) output = std::shared_ptr<SSTable>(std::move(opened));
+    }
+
+    lock.lock();
+    bool installed = false;
+    if (s == Status::kOk) {
+      ManifestState next = manifest_;
+      next.files.erase(next.files.begin(), next.files.begin() + static_cast<std::ptrdiff_t>(n));  // the oldest n
+      next.files.insert(next.files.begin(), result.output);
+      next.next_file_number = std::max(next.next_file_number, next_seq_);
+      s = StoreManifest(options_.dir, next);
+      if (s == Status::kOk) {
+        manifest_ = std::move(next);
+        sstables_.erase(sstables_.begin(), sstables_.begin() + static_cast<std::ptrdiff_t>(n));
+        sstables_.insert(sstables_.begin(), output);
+        ++compactions_done_;
+        installed = true;
+        PublishView();
+        cv_.notify_all();
+        if (CrashPoint("compact:after_manifest")) return;  // inputs not deleted yet
+      }
+    }
+    if (installed) {
+      lock.unlock();
+      std::error_code ec;
+      for (const auto& t : inputs) std::filesystem::remove(Path(SstFileName(t->meta().file_number)), ec);
+      lock.lock();
+    } else {
+      ++compaction_failures_;
+      std::error_code ec;
+      std::filesystem::remove(out_path, ec);  // an output that never committed
+      cv_.wait_for(lock, std::chrono::milliseconds(options_.flush_retry_ms), [&] { return stop_ || dead_; });
     }
   }
 }

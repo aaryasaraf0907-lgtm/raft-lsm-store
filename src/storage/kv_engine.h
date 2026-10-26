@@ -36,7 +36,9 @@
 
 #include "storage/iterator.h"
 #include "storage/kv_store.h"
+#include "storage/manifest.h"
 #include "storage/memtable.h"
+#include "storage/sstable.h"
 #include "storage/wal.h"
 
 namespace raftkv {
@@ -56,6 +58,19 @@ class KVEngine : public IndexedKVStore {
     FlushWriter flush_writer;                 // unset => never freeze/flush
     size_t max_frozen = 2;                    // writers wait (or fail) beyond this many
     int flush_retry_ms = 200;                 // delay before retrying a failed flush
+
+    // SSTable mode: the real LSM tree. A manifest (docs/sstable-format.md A.4) records which
+    // SSTables are live and how far flushing has got; the engine flushes a full memtable into an
+    // SSTable by itself (flush_writer must be unset); Get searches the SSTables newest first; and a
+    // background thread merges the live SSTables when there are too many. Off by default, which
+    // keeps the original WAL + memtable behaviour (and the flush_writer test seam) unchanged.
+    bool use_sstables = false;
+    size_t compaction_trigger = 4;  // merge when this many SSTables are live (min 2; 0 = never)
+    uint32_t bloom_bits_per_key = BloomFilter::kDefaultBitsPerKey;
+    // Tests only: called at named steps of flush and compaction ("flush:after_sst",
+    // "flush:after_manifest", "compact:after_output", "compact:after_manifest"). Returning true
+    // makes the engine stop right there, as if the process had died, leaving files as they are.
+    std::function<bool(const char* point)> test_crash_hook;
   };
 
   struct Stats {
@@ -64,6 +79,9 @@ class KVEngine : public IndexedKVStore {
     uint64_t flushes_done = 0;
     uint64_t flush_failures = 0;
     bool flush_failing = false;
+    size_t sstables = 0;  // live SSTables (SSTable mode)
+    uint64_t compactions_done = 0;
+    uint64_t compaction_failures = 0;
   };
 
   // kOk; kIOError (cannot create dir / open WAL); kCorruption (a WAL is damaged
@@ -94,19 +112,24 @@ class KVEngine : public IndexedKVStore {
     uint64_t seq;
     std::shared_ptr<MemTable> mem;
   };
-  struct View {  // immutable snapshot of which memtables exist
+  struct View {  // immutable snapshot of what a read must search, newest data first
     std::shared_ptr<MemTable> active;
     std::vector<std::shared_ptr<MemTable>> frozen;  // newest first
+    std::vector<std::shared_ptr<SSTable>> sstables;  // newest first (a reader keeps a file open
+                                                     // even after compaction has deleted it)
   };
 
   explicit KVEngine(const Options& options) : options_(options) {}
 
   Status Recover();
+  Status LoadLsmState();  // SSTable mode: manifest, orphan cleanup, open the live tables
+  bool CrashPoint(const char* point);
   Status Write(bool tombstone, const std::string& key, const std::string& value, uint64_t raft_index);
   Status EnsureRoom(std::unique_lock<std::mutex>& lock);  // write_mu_ held
   Status Freeze();                                        // write_mu_ held
   void PublishView();                                     // write_mu_ held
   void FlushLoop();
+  void CompactLoop();
   bool SyncDir() const;
   std::string Path(const std::string& name) const;
 
@@ -125,11 +148,19 @@ class KVEngine : public IndexedKVStore {
   bool flush_failing_ = false;
   uint64_t flushes_done_ = 0;
   uint64_t flush_failures_ = 0;
+  // SSTable mode (guarded by write_mu_). sstables_ is oldest first and parallel to manifest_.files.
+  ManifestState manifest_;
+  std::vector<std::shared_ptr<SSTable>> sstables_;
+  uint64_t lsm_highest_number_ = 0;  // highest file number seen on disk at startup, orphans included
+  uint64_t compactions_done_ = 0;
+  uint64_t compaction_failures_ = 0;
+  std::atomic<bool> dead_{false};  // a test crash point fired: every background thread stops
 
   mutable std::mutex view_mu_;  // innermost lock; only guards the pointer copy
   std::shared_ptr<const View> view_;
 
   std::thread flusher_;
+  std::thread compactor_;
 };
 
 }  // namespace raftkv
