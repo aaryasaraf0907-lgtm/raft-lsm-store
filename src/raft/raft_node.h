@@ -154,6 +154,15 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   std::condition_variable proposal_cv_;
   std::deque<PendingProposal*> proposals_;
   bool batcher_active_ = false;
+  // Group-commit delay. Proposers that just finished a batch are about to propose again; if the next
+  // batcher wrote immediately it would catch only the stragglers and the group would fall apart into
+  // tiny batches (badly so when threads wake slowly). So a batcher waits up to kBatchWait for as many
+  // proposals to queue as there are proposers currently inside Propose/ProposeAndWait (queued, or
+  // waiting for their commit). Self-correcting: if batches shrink, more proposers pile up inside, so
+  // the wait grows. A lone client has one proposer inside, so it never waits.
+  std::condition_variable batch_cv_;
+  std::atomic<size_t> inflight_proposers_{0};
+  static constexpr std::chrono::microseconds kBatchWait{2000};
   void ResetElectionDeadlineLocked();
   void OnRequestVoteReply(Term election_term, const RequestVoteReply& reply);
   void OnAppendEntriesReply(NodeId peer, Term sent_term, uint64_t seq, LogIndex prev_index,

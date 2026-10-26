@@ -86,12 +86,17 @@ void RaftNodeImpl::Stop() {
 void RaftNodeImpl::SubmitProposal(PendingProposal* p) {
   std::unique_lock<std::mutex> ql(proposal_mu_);
   proposals_.push_back(p);
+  batch_cv_.notify_one();  // a batcher that is waiting for more proposals may now have enough
   while (!p->done) {
     if (batcher_active_) {
       proposal_cv_.wait(ql);
       continue;
     }
     batcher_active_ = true;
+    const size_t want = std::min(inflight_proposers_.load(), kMaxProposalBatch);
+    if (want > 1 && proposals_.size() < want) {
+      batch_cv_.wait_for(ql, kBatchWait, [&] { return proposals_.size() >= want; });
+    }
     std::vector<PendingProposal*> batch;
     while (!proposals_.empty() && batch.size() < kMaxProposalBatch) {
       batch.push_back(proposals_.front());
@@ -132,7 +137,16 @@ void RaftNodeImpl::SubmitProposal(PendingProposal* p) {
   }
 }
 
+namespace {
+struct InflightGuard {  // counts a proposer for as long as it is inside Propose/ProposeAndWait
+  std::atomic<size_t>& n;
+  explicit InflightGuard(std::atomic<size_t>& a) : n(a) { ++n; }
+  ~InflightGuard() { --n; }
+};
+}  // namespace
+
 ProposeResponse RaftNodeImpl::Propose(const Command& cmd) {
+  InflightGuard inflight(inflight_proposers_);
   PendingProposal p;
   p.cmd = cmd;
   SubmitProposal(&p);
@@ -141,6 +155,7 @@ ProposeResponse RaftNodeImpl::Propose(const Command& cmd) {
 }
 
 CommitResponse RaftNodeImpl::ProposeAndWait(const Command& cmd, std::chrono::milliseconds timeout) {
+  InflightGuard inflight(inflight_proposers_);
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   PendingProposal p;
   p.cmd = cmd;

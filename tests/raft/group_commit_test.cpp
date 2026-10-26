@@ -97,6 +97,18 @@ TEST(GroupCommit, ConcurrentProposersShareLogWritesAndEveryEntryIsStoredOnceInOr
   std::atomic<int> bad{0}, not_durable{0};
   std::mutex m;
   std::set<LogIndex> indexes;
+  // Scheduling pressure: two threads that burn CPU. Batching that only works when every thread wakes
+  // promptly falls apart under this (it did on a laptop: 161 writes for 320 proposals).
+  std::atomic<bool> burn{true};
+  std::vector<std::thread> burners;
+  for (int b = 0; b < 2; ++b) {
+    burners.emplace_back([&] {
+      volatile uint64_t sink = 0;
+      while (burn.load()) {
+        for (int i = 0; i < 2000; ++i) sink = sink + static_cast<uint64_t>(i);
+      }
+    });
+  }
   std::vector<std::thread> threads;
   for (int t = 0; t < kThreads; ++t) {
     threads.emplace_back([&, t] {
@@ -110,12 +122,17 @@ TEST(GroupCommit, ConcurrentProposersShareLogWritesAndEveryEntryIsStoredOnceInOr
     });
   }
   for (auto& th : threads) th.join();
+  burn = false;
+  for (auto& th : burners) th.join();
   EXPECT_EQ(bad.load(), 0);
   EXPECT_EQ(not_durable.load(), 0);
   EXPECT_EQ(indexes.size(), static_cast<size_t>(kThreads * kEach));
 
   const size_t writes = n.storage.calls() - calls_before;
-  EXPECT_LT(writes, static_cast<size_t>(kThreads * kEach) / 2) << "proposals were not batched: " << writes << " log writes";
+  std::printf("[ batching ] %zu log writes for %d proposals, largest batch %zu\n", writes, kThreads * kEach, n.storage.max_batch());
+  // With the group-commit delay, 320 proposals take about a dozen writes whatever the scheduler does;
+  // without it they took 40-260 depending on the machine. The bound is generous but meaningful.
+  EXPECT_LT(writes, static_cast<size_t>(kThreads * kEach) / 8) << "proposals were not batched well: " << writes << " log writes";
   EXPECT_GE(n.storage.max_batch(), 8u);
 
   // The log in storage is exactly 1..N, in order, each index once, holding every proposed command once.
