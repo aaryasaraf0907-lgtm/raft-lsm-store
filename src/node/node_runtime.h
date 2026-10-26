@@ -27,6 +27,10 @@ struct NodeOptions {
   std::map<NodeId, std::string> peers;
   std::string data_dir;  // holds "raft/" (log, snapshots) and "kv/" (storage engine)
   bool sync = true;      // fsync every write (turn off only for tests and benchmarks)
+  // Use the real LSM engine (manifest, SSTables, compaction). Off = the old WAL + memtable engine.
+  bool use_sstables = true;
+  size_t memtable_bytes = 4 * 1024 * 1024;  // the engine freezes and flushes a memtable at this size
+  size_t compaction_trigger = 4;            // merge SSTables when this many are live (0 = never)
   RaftConfig raft;
 };
 

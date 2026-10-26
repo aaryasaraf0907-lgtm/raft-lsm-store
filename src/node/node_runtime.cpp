@@ -52,6 +52,9 @@ void NodeRuntime::Start() {
   KVEngine::Options engine_options;
   engine_options.dir = (root / "kv").string();
   engine_options.sync_wal = options_.sync;
+  engine_options.use_sstables = options_.use_sstables;
+  engine_options.memtable_bytes = options_.memtable_bytes;
+  engine_options.compaction_trigger = options_.compaction_trigger;
   const Status opened = KVEngine::Open(engine_options, &engine_);
   if (opened != Status::kOk) {
     throw std::runtime_error("cannot open the storage engine in " + engine_options.dir +

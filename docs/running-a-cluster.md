@@ -90,6 +90,8 @@ throughput and p50/p95/p99 latency. Numbers depend heavily on fsync: compare wit
 | `--client-addr H:P` | where clients connect |
 | `--data-dir DIR` | Raft log and storage engine files |
 | `--no-sync` | no fsync (testing only) |
+| `--memtable-bytes N`, `--compaction-trigger N` | flush size of a memtable (default 4 MiB) and how many SSTables trigger a merge (default 4; 0 = never) |
+| `--no-sstables` | use the old WAL + memtable engine instead of the LSM engine (the default) |
 | `--no-prevote` | turn PreVote off |
 | `--heartbeat-ms N`, `--election-ms MIN,MAX` | timing (defaults 50 and 150,300) |
 
