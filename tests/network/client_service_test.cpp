@@ -427,5 +427,36 @@ TEST(ClientServiceTest, GetRejectsOversizeKeysAndMapsInvalidArgumentFromTheStore
   EXPECT_EQ(response.status(), network::proto::CLIENT_STATUS_INTERNAL_ERROR);
 }
 
+TEST(ClientServiceTest, RejectsKeysUnderTheEnginesReservedPrefix) {
+  TestStore store;
+  KVStateMachine machine(&store);
+  TestRaftNode node;
+  node.SetApplyCallback(machine.AsCallback());
+  ClientService service(&node, &store, &machine);
+  const std::string reserved = std::string(kReservedKeyPrefix, sizeof(kReservedKeyPrefix) - 1) + "applied_index";
+
+  network::proto::WriteResponse write;
+  auto put = PutRequest();
+  put.set_key(reserved);
+  ASSERT_TRUE(service.Put(nullptr, &put, &write).ok());
+  EXPECT_EQ(write.status(), network::proto::CLIENT_STATUS_INVALID_ARGUMENT);
+  auto del = DeleteRequest();
+  del.set_key(reserved);
+  ASSERT_TRUE(service.Delete(nullptr, &del, &write).ok());
+  EXPECT_EQ(write.status(), network::proto::CLIENT_STATUS_INVALID_ARGUMENT);
+  network::proto::GetResponse read;
+  auto get = GetRequest();
+  get.set_key(reserved);
+  ASSERT_TRUE(service.Get(nullptr, &get, &read).ok());
+  EXPECT_EQ(read.status(), network::proto::CLIENT_STATUS_INVALID_ARGUMENT);
+  EXPECT_TRUE(node.proposals.empty()) << "a reserved key must never reach Raft";
+  EXPECT_EQ(node.read_index_calls, 0);
+
+  put = PutRequest();  // a key that merely contains the prefix further in is an ordinary key
+  put.set_key("x" + reserved);
+  ASSERT_TRUE(service.Put(nullptr, &put, &write).ok());
+  EXPECT_EQ(write.status(), network::proto::CLIENT_STATUS_OK);
+}
+
 }  // namespace
 }  // namespace raftkv
