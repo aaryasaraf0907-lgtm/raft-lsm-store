@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -53,7 +54,12 @@ Status DecodeManifest(const std::string& bytes, ManifestState* out);
 
 // kOk with *found = false if there is no manifest (a fresh directory); kCorruption if it is damaged.
 Status LoadManifest(const std::string& dir, ManifestState* out, bool* found);
-// Atomically replaces the manifest. kIOError on failure; the previous manifest is then still valid.
-Status StoreManifest(const std::string& dir, const ManifestState& state);
+// Atomically replaces the manifest. kIOError on failure. A failure before the rename leaves the
+// previous manifest in place; a failure of the directory fsync after it leaves the NEW manifest in
+// the directory, but not known to be durable, so after a crash either one may be found.
+// `fail_after_rename` is for tests only: if set and it returns true once the new manifest has been
+// renamed into place, the directory fsync is treated as failed and kIOError is returned.
+Status StoreManifest(const std::string& dir, const ManifestState& state,
+                     const std::function<bool()>& fail_after_rename = nullptr);
 
 }  // namespace raftkv

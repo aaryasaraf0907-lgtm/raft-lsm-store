@@ -306,6 +306,7 @@ KVEngine::Stats KVEngine::GetStats() const {
   s.sstables = sstables_.size();
   s.compactions_done = compactions_done_;
   s.compaction_failures = compaction_failures_;
+  s.fail_stopped = fail_stopped_;
   return s;
 }
 
@@ -510,10 +511,33 @@ Status KVEngine::InstallCheckpoint(const std::string& data, uint64_t applied_ind
   next.files = {meta};
   next.flushed_through = number;  // every old WAL has a smaller number
   next.next_file_number = next_seq_;
-  s = StoreManifest(options_.dir, next);
+  // Tests only: test_crash_hook point "install:fail_after_manifest_rename" makes a store below fail
+  // inside StoreManifest after its rename, as if the directory fsync had failed.
+  const auto fail_after_rename = [this] {
+    return options_.test_crash_hook && options_.test_crash_hook("install:fail_after_manifest_rename");
+  };
+  s = StoreManifest(options_.dir, next, fail_after_rename);
   if (s != Status::kOk) {
     new_wal.reset();
-    std::filesystem::remove(Path(WalFileName(wal_seq)), ec);
+    std::filesystem::remove(Path(WalFileName(wal_seq)), ec);  // empty, and manifests never list WALs
+    // The store may have failed after its rename: then the manifest in the directory names only the
+    // new table, and a crash could make it the one found. Store the current (old) state again, so
+    // the old dataset is the durable one before this returns; otherwise writes accepted after this
+    // failure would sit in WALs that manifest's flushed_through retires. Delete the new table only
+    // if no manifest that may survive names it. If even the restore fails, keep it: then recovery
+    // finds either the old dataset or the complete checkpoint, never a missing table. And stop the
+    // engine for good: which dataset is durable is now unknown, so it must not accept (or report as
+    // done) any write, nor store any other manifest. Reopening resolves it from what is on disk.
+    if (ManifestMayName(options_.dir, number)) {
+      ManifestState current = manifest_;
+      current.next_file_number = std::max(current.next_file_number, next_seq_);
+      if (StoreManifest(options_.dir, current, fail_after_rename) != Status::kOk) {
+        fail_stopped_ = true;  // reads refuse from now on (Get)
+        dead_ = true;  // fail-stop: writes, flushes, compactions and installs all refuse from now on
+        cv_.notify_all();  // writers waiting for room and the background threads see it at once
+        return s;
+      }
+    }
     std::filesystem::remove(Path(SstFileName(number)), ec);
     return s;
   }
@@ -560,6 +584,9 @@ Status KVEngine::Freeze() {
 }
 
 Status KVEngine::Get(const std::string& key, std::string* value) {
+  // After a fail-stop the in-memory data may not be what a restart recovers: refuse. A Get that
+  // passed this check before the flag was set completes normally (it is ordered before the failure).
+  if (fail_stopped_) return Status::kIOError;
   std::shared_ptr<const View> view;
   {
     std::lock_guard<std::mutex> guard(view_mu_);
@@ -607,6 +634,9 @@ Status KVEngine::Get(const std::string& key, std::string* value) {
 // WAL, which still has everything. A crash between 2 and 3 leaves a WAL at or below flushed_through:
 // startup retires it. A memtable and its applied-index record always go into the same SSTable.
 void KVEngine::FlushLoop() {
+  // The flush whose SSTable was kept after a failed manifest store that may have named it (see the
+  // store below), or 0. Its retry reuses that file instead of deleting and rewriting it.
+  uint64_t kept_seq = 0;
   std::unique_lock<std::mutex> lock(write_mu_);
   for (;;) {
     cv_.wait(lock, [&] { return stop_ || dead_ || !frozen_.empty(); });
@@ -619,14 +649,20 @@ void KVEngine::FlushLoop() {
     std::shared_ptr<SSTable> table;
     const SSTableMeta meta{f.seq, f.seq, f.seq};
     if (options_.use_sstables) {
-      std::error_code ec;
-      std::filesystem::remove(Path(SstFileName(f.seq)), ec);  // an orphan of an earlier failed attempt
-      auto it = f.mem->NewIterator();
-      SSTableBuilderOptions bo;
-      bo.bits_per_key = options_.bloom_bits_per_key;
-      s = WriteSSTable(Path(SstFileName(f.seq)), meta, bo, &it);
       std::unique_ptr<SSTable> opened;
-      if (s == Status::kOk) s = SSTable::Open(Path(SstFileName(f.seq)), f.seq, &opened);
+      if (kept_seq == f.seq) {
+        // A manifest that may survive names this file, so it must not be deleted. It was written
+        // from this same (immutable) memtable: reuse it.
+        s = SSTable::Open(Path(SstFileName(f.seq)), f.seq, &opened);
+      } else {
+        std::error_code ec;
+        std::filesystem::remove(Path(SstFileName(f.seq)), ec);  // an orphan of an earlier failed attempt
+        auto it = f.mem->NewIterator();
+        SSTableBuilderOptions bo;
+        bo.bits_per_key = options_.bloom_bits_per_key;
+        s = WriteSSTable(Path(SstFileName(f.seq)), meta, bo, &it);
+        if (s == Status::kOk) s = SSTable::Open(Path(SstFileName(f.seq)), f.seq, &opened);
+      }
       if (s == Status::kOk) table = std::shared_ptr<SSTable>(std::move(opened));
       if (s == Status::kOk && CrashPoint("flush:after_sst")) return;
     } else {
@@ -639,9 +675,13 @@ void KVEngine::FlushLoop() {
     }
 
     lock.lock();
+    if (dead_) return;  // the engine stopped while we flushed: change nothing (startup cleans up)
     if (options_.use_sstables && epoch_ != epoch) {  // the dataset was replaced while we flushed: ours is stale
+      // InstallCheckpoint made a manifest durable that names only its own table, so even a file
+      // kept after an earlier ambiguous store is unreferenced now.
       std::error_code ec;
       std::filesystem::remove(Path(SstFileName(f.seq)), ec);
+      kept_seq = 0;
       continue;
     }
     if (options_.use_sstables && s == Status::kOk) {
@@ -649,16 +689,29 @@ void KVEngine::FlushLoop() {
       next.files.push_back(meta);
       next.flushed_through = f.seq;
       next.next_file_number = std::max(next.next_file_number, next_seq_);
-      s = StoreManifest(options_.dir, next);
+      // Tests only: test_crash_hook point "flush:fail_after_manifest_rename" makes this store fail
+      // inside StoreManifest after its rename, as if the directory fsync had failed.
+      s = StoreManifest(options_.dir, next, [this] {
+        return options_.test_crash_hook && options_.test_crash_hook("flush:fail_after_manifest_rename");
+      });
       if (s == Status::kOk) {
+        kept_seq = 0;
         manifest_ = std::move(next);
         sstables_.push_back(table);
         if (CrashPoint("flush:after_manifest")) return;  // WAL not deleted yet
         std::error_code ec;
         std::filesystem::remove(Path(WalFileName(f.seq)), ec);  // if this fails, startup retires it
+      } else if (ManifestMayName(options_.dir, f.seq)) {
+        // The store may have failed after its rename (a failed directory fsync): the manifest in the
+        // directory names this table and may be the one found after a crash. Keep the table (and,
+        // as on any failure, the memtable and its WAL), and reuse it on the retry. With the new
+        // manifest, recovery retires the WAL and uses the table; with the old one, the table is an
+        // orphan and the WAL is replayed.
+        kept_seq = f.seq;
       } else {
         std::error_code ec;
-        std::filesystem::remove(Path(SstFileName(f.seq)), ec);  // never committed
+        std::filesystem::remove(Path(SstFileName(f.seq)), ec);  // no manifest names it
+        kept_seq = 0;
       }
     }
     if (s == Status::kOk) {
@@ -731,6 +784,7 @@ void KVEngine::CompactLoop() {
     }
 
     lock.lock();
+    if (dead_) return;  // the engine stopped while we merged: change nothing (startup cleans up)
     if (epoch_ != epoch) {  // the dataset was replaced while we merged: the output is stale
       std::error_code ec;
       std::filesystem::remove(out_path, ec);
@@ -752,7 +806,11 @@ void KVEngine::CompactLoop() {
       next.files.erase(next.files.begin() + at, next.files.begin() + end);  // the run, replaced in place
       next.files.insert(next.files.begin() + at, result.output);
       next.next_file_number = std::max(next.next_file_number, next_seq_);
-      s = StoreManifest(options_.dir, next);
+      // Tests only: test_crash_hook point "compact:fail_after_manifest_rename" makes this store fail
+      // inside StoreManifest after its rename, as if the directory fsync had failed (see above).
+      s = StoreManifest(options_.dir, next, [this] {
+        return options_.test_crash_hook && options_.test_crash_hook("compact:fail_after_manifest_rename");
+      });
       if (s == Status::kOk) {
         manifest_ = std::move(next);
         sstables_.erase(sstables_.begin() + at, sstables_.begin() + end);
