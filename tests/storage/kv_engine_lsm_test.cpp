@@ -4,6 +4,7 @@
 
 #include <stdlib.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 
 #include <atomic>
 #include <csignal>
@@ -19,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include "storage/checkpoint.h"
 #include "storage/kv_engine.h"
 #include "storage/manifest.h"
 #include "storage/sstable.h"
@@ -814,6 +816,508 @@ TEST_F(LsmTest, AManifestStoreThatFailsBeforeItsRenameKeepsEverythingAndLeavesNo
   ASSERT_EQ(Open(Opts(0)), Status::kOk);
   EXPECT_EQ(Get("k"), "<absent>");
   EXPECT_EQ(Get("c0005"), "three");
+}
+
+// The ambiguous case: the commit-point store reports failure AFTER the new manifest is in place
+// (seam "compact:fail_after_manifest_rename", standing for a directory fsync that failed after the
+// rename). The running engine must keep its old live set and view, keep every input, and keep the
+// output, because the manifest in the directory names it. The retry then succeeds, and its durable
+// manifest names neither the inputs nor the kept output, so both are deleted. This fails if the
+// output were deleted after the failed store, or if the kept output were never cleaned up.
+TEST_F(LsmTest, AnAmbiguousManifestStoreKeepsTheOutputItNamesAndCleansItUpAfterTheRetry) {
+  std::vector<Entry> t1 = Rows("a", 200, "old");
+  t1.push_back(Entry{"k", "old", false});
+  std::vector<Entry> t2 = Rows("b", 10, "two");
+  t2.push_back(Entry{"k", "", true});
+  BuildTables({t1, t2, Rows("c", 10, "three"), Rows("d", 10, "four")});  // sizes 201, 11, 10, 10
+
+  std::atomic<int> injected{0};
+  KVEngine::Options o = Opts(4);
+  o.flush_retry_ms = 300;  // a quiet window after the failure in which nothing is in flight
+  o.test_crash_hook = [&](const char* p) {
+    return std::string(p) == "compact:fail_after_manifest_rename" && injected.fetch_add(1) == 0;
+  };
+  ASSERT_EQ(Open(o), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compaction_failures >= 1; }));
+  // A failure is counted and handled under the engine lock, which GetStats takes: it is over here.
+  const auto s = engine_->GetStats();
+  EXPECT_EQ(s.compactions_done, 0u);
+  EXPECT_EQ(s.sstables, 4u) << "the in-memory live set must not take the failed edit";
+  const ManifestState on_disk = Manifest();
+  ASSERT_EQ(on_disk.files.size(), 2u) << "the failed store's manifest is in place: table 1 and the output";
+  const uint64_t kept = on_disk.files[1].file_number;
+  const std::string kept_path = dir_ + "/" + KVEngine::SstFileName(kept);
+  EXPECT_TRUE(fs::exists(kept_path)) << "a manifest that may survive names the output: it must be kept";
+  for (uint64_t n = 1; n <= 4; ++n) {
+    EXPECT_TRUE(fs::exists(dir_ + "/" + KVEngine::SstFileName(n))) << "input " << n << " must be kept";
+  }
+  EXPECT_EQ(Get("k"), "<absent>");
+  EXPECT_EQ(Get("a0100"), "old");
+  EXPECT_EQ(Get("d0009"), "four");
+
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compactions_done >= 1; }));  // the retry
+  ASSERT_TRUE(WaitFor([&] { return Files(".sst").size() == 2; }))
+      << "after the successful retry the inputs and the kept output must all be deleted";
+  EXPECT_FALSE(fs::exists(kept_path));
+  const ManifestState m = Manifest();
+  ASSERT_EQ(m.files.size(), 2u);
+  EXPECT_EQ(m.files[0].file_number, 1u);
+  EXPECT_NE(m.files[1].file_number, kept) << "the retry wrote a new output under a new number";
+  EXPECT_EQ(Get("k"), "<absent>");
+  ASSERT_EQ(Open(Opts(0)), Status::kOk);
+  EXPECT_EQ(Files(".sst").size(), 2u);
+  EXPECT_EQ(Get("k"), "<absent>");
+  EXPECT_EQ(Get("a0100"), "old");
+  EXPECT_EQ(Get("c0005"), "three");
+}
+
+// A crash right after the ambiguous store (here: during the retry, once its new output is written).
+// After a real crash either manifest may be the one found, so both are tried:
+//  - the new one (the rename survived): it is on disk as left;
+//  - the old one (the rename was not yet durable): constructed by putting the old manifest back.
+// Either way startup must open, keep exactly the tables that manifest lists, delete the rest, and
+// return the right data. With the new manifest this needs the kept output: had it been deleted after
+// the failed store, startup would find a listed table missing.
+TEST_F(LsmTest, ACrashAfterAnAmbiguousManifestStoreRecoversWithEitherManifest) {
+  for (const bool new_manifest_survives : {true, false}) {
+    SCOPED_TRACE(new_manifest_survives ? "new manifest survives" : "old manifest survives");
+    ResetDir();
+    std::vector<Entry> t1 = Rows("a", 200, "old");
+    t1.push_back(Entry{"k", "old", false});
+    std::vector<Entry> t2 = Rows("b", 10, "two");
+    t2.push_back(Entry{"k", "", true});
+    BuildTables({t1, t2, Rows("c", 10, "three"), Rows("d", 10, "four")});
+    const std::string old_manifest = FileBytes(dir_ + "/MANIFEST");
+
+    std::atomic<int> stage{0};  // 0: before the store, 1: after the injected failure, 2: crashed
+    KVEngine::Options o = Opts(4);
+    o.test_crash_hook = [&](const char* p) {
+      const std::string point(p);
+      if (point == "compact:fail_after_manifest_rename" && stage == 0) {
+        stage = 1;
+        return true;  // the store "fails" after its rename
+      }
+      if (point == "compact:after_output" && stage == 1) {
+        stage = 2;
+        return true;  // crash during the retry, once its output is written
+      }
+      return false;
+    };
+    ASSERT_EQ(Open(o), Status::kOk);
+    ASSERT_TRUE(WaitFor([&] { return stage.load() == 2; }));
+    engine_.reset();  // the process "died" there
+
+    const ManifestState left = Manifest();
+    ASSERT_EQ(left.files.size(), 2u) << "the failed store's manifest is in the directory";
+    const uint64_t kept = left.files[1].file_number;
+    EXPECT_TRUE(fs::exists(dir_ + "/" + KVEngine::SstFileName(kept)));
+    EXPECT_EQ(Files(".sst").size(), 6u) << "four inputs, the kept output and the retry's output";
+    if (!new_manifest_survives) {
+      std::ofstream out(dir_ + "/MANIFEST", std::ios::binary | std::ios::trunc);
+      out << old_manifest;
+    }
+
+    ASSERT_EQ(Open(Opts(0)), Status::kOk);
+    const ManifestState m = Manifest();
+    if (new_manifest_survives) {
+      ASSERT_EQ(m.files.size(), 2u);
+      EXPECT_EQ(m.files[0].file_number, 1u);
+      EXPECT_EQ(m.files[1].file_number, kept) << "the kept output is live";
+    } else {
+      ASSERT_EQ(m.files.size(), 4u) << "the four inputs are live";
+      EXPECT_FALSE(fs::exists(dir_ + "/" + KVEngine::SstFileName(kept))) << "the output is an orphan";
+    }
+    EXPECT_EQ(Files(".sst").size(), m.files.size()) << "startup deletes every table the manifest does not list";
+    EXPECT_EQ(Get("k"), "<absent>");
+    EXPECT_EQ(Get("a0100"), "old");
+    EXPECT_EQ(Get("b0003"), "two");
+    EXPECT_EQ(Get("c0001"), "three");
+    EXPECT_EQ(Get("d0009"), "four");
+  }
+}
+
+// A compaction still merging when a checkpoint replaces the dataset must not install its output
+// into the new dataset. The compactor is held at "compact:after_output" (the hook runs without the
+// engine lock) while InstallCheckpoint runs, then released; it must see the epoch change, discard
+// its output and leave the checkpoint's single table as the whole live set.
+TEST_F(LsmTest, ACompactionOverlappingACheckpointInstallIsDiscarded) {
+  BuildTables({Rows("a", 10, "1"), Rows("b", 10, "2"), Rows("c", 10, "3"), Rows("d", 10, "4")});
+  std::atomic<bool> reached{false}, release{false};
+  KVEngine::Options o = Opts(4);
+  o.test_crash_hook = [&](const char* p) {
+    if (std::string(p) == "compact:after_output" && !reached.exchange(true)) {
+      while (!release) std::this_thread::sleep_for(1ms);
+    }
+    return false;  // never a crash
+  };
+  ASSERT_EQ(Open(o), Status::kOk);
+  struct Release {  // never leave the compactor blocked, whatever happens below
+    std::atomic<bool>& flag;
+    ~Release() { flag = true; }
+  } release_guard{release};
+  ASSERT_TRUE(WaitFor([&] { return reached.load(); }));
+
+  std::string body;
+  AppendCheckpointEntry(&body, "ck", "cv");
+  ASSERT_EQ(engine_->InstallCheckpoint(CheckpointHeader(1) + body, 77), Status::kOk);
+  release = true;
+
+  // The stale output is deleted once the compactor resumes; the checkpoint's table is all that is left.
+  ASSERT_TRUE(WaitFor([&] { return Files(".sst").size() == 1; }));
+  const ManifestState m = Manifest();
+  ASSERT_EQ(m.files.size(), 1u);
+  EXPECT_EQ(Files(".sst")[0], KVEngine::SstFileName(m.files[0].file_number));
+  EXPECT_EQ(engine_->GetStats().compactions_done, 0u) << "the stale result must not be installed";
+  EXPECT_EQ(engine_->GetStats().compaction_failures, 0u)
+      << "the epoch check discards it as stale; it is not a failed compaction to be retried";
+  EXPECT_EQ(engine_->GetStats().sstables, 1u);
+  EXPECT_EQ(Get("ck"), "cv");
+  EXPECT_EQ(Get("a0000"), "<absent>") << "the old dataset is gone";
+  EXPECT_EQ(engine_->AppliedIndex(), 77u);
+  ASSERT_EQ(Open(Opts(4)), Status::kOk);
+  EXPECT_EQ(Manifest().files.size(), 1u);
+  EXPECT_EQ(Get("ck"), "cv");
+  EXPECT_EQ(Get("d0009"), "<absent>");
+  EXPECT_EQ(engine_->AppliedIndex(), 77u);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Flush and checkpoint install: a manifest store that fails AFTER its rename (seams
+// "flush:fail_after_manifest_rename" and "install:fail_after_manifest_rename", standing for a
+// directory fsync that failed). The manifest then in the directory may be the one found after a
+// crash, so no table it names may be deleted.
+
+namespace {
+// Identifies one particular file: a deleted and rewritten file can get the freed inode number back,
+// but not the same modification time (nanosecond resolution).
+std::string FileIdentity(const std::string& path) {
+  struct stat st;
+  if (::stat(path.c_str(), &st) != 0) return "<missing>";
+  return std::to_string(st.st_ino) + ":" + std::to_string(st.st_mtim.tv_sec) + "." + std::to_string(st.st_mtim.tv_nsec);
+}
+}  // namespace
+
+// The first flush's store fails after its rename. The engine keeps the frozen memtable and its WAL
+// (as on any failed flush) and also keeps 000001.sst, which the manifest in the directory names. The
+// retry reuses that same file (never deleted and rewritten) and completes the flush.
+TEST_F(LsmTest, AnAmbiguousFlushManifestStoreKeepsTheTableAndTheRetryReusesIt) {
+  std::atomic<int> injected{0};
+  KVEngine::Options o = Opts();
+  o.flush_retry_ms = 300;  // a quiet window after the failure
+  o.test_crash_hook = [&](const char* p) {
+    return std::string(p) == "flush:fail_after_manifest_rename" && injected.fetch_add(1) == 0;
+  };
+  ASSERT_EQ(Open(o), Status::kOk);
+  int written = 0;
+  while (engine_->GetStats().active_seq == 1 && written < 400) {  // until memtable 1 is frozen
+    Write(Key(written), "v" + std::to_string(written) + std::string(100, 'f'));
+    ++written;
+  }
+  ASSERT_GT(engine_->GetStats().active_seq, 1u);
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().flush_failures >= 1; }));
+  const auto s = engine_->GetStats();  // the failure is handled under the engine lock: it is over
+  EXPECT_EQ(s.flushes_done, 0u);
+  EXPECT_EQ(s.sstables, 0u) << "the in-memory live set must not take the failed edit";
+  EXPECT_GE(s.frozen_memtables, 1u) << "the memtable stays until its flush is committed";
+  const ManifestState on_disk = Manifest();
+  ASSERT_EQ(on_disk.files.size(), 1u) << "the failed store's manifest is in place";
+  EXPECT_EQ(on_disk.files[0].file_number, 1u);
+  EXPECT_EQ(on_disk.flushed_through, 1u);
+  const std::string table = dir_ + "/" + KVEngine::SstFileName(1);
+  const std::string wal1 = dir_ + "/" + KVEngine::WalFileName(1);
+  ASSERT_TRUE(fs::exists(table)) << "a manifest that may survive names this table: it must be kept";
+  EXPECT_TRUE(fs::exists(wal1)) << "the WAL is kept until the flush is committed";
+  const std::string identity = FileIdentity(table);
+  for (int i = 0; i < written; ++i) ASSERT_EQ(Get(Key(i)), "v" + std::to_string(i) + std::string(100, 'f')) << i;
+
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().flushes_done >= 1; }));  // the retry
+  ASSERT_TRUE(WaitFor([&] { return !fs::exists(wal1); }));
+  EXPECT_EQ(FileIdentity(table), identity) << "the retry must reuse the kept table, not delete and rewrite it";
+  EXPECT_EQ(Manifest().files[0].file_number, 1u);
+  ASSERT_EQ(Open(Opts()), Status::kOk);
+  for (int i = 0; i < written; ++i) ASSERT_EQ(Get(Key(i)), "v" + std::to_string(i) + std::string(100, 'f')) << i;
+}
+
+// A crash right after the ambiguous flush store, before any retry. The crash state is taken as a copy
+// of the directory while the engine waits to retry (a long retry delay keeps it idle), because the
+// retry would rewrite the table and hide a deletion. Either manifest may then be the one found: the
+// new one (as left on disk) or the old one, which for the very first flush means no manifest at all
+// (constructed by removing it). Both must recover every acknowledged write: from the table with the
+// new manifest (the WAL is retired), from the WAL without it (the table is an orphan). Had the table
+// been deleted after the failed store, the new manifest would name a missing table and startup
+// would refuse.
+TEST_F(LsmTest, ACrashAfterAnAmbiguousFlushManifestStoreRecoversWithEitherManifest) {
+  for (const bool new_manifest_survives : {true, false}) {
+    SCOPED_TRACE(new_manifest_survives ? "new manifest survives" : "old (no) manifest survives");
+    ResetDir();
+    std::atomic<int> injected{0};
+    KVEngine::Options o = Opts();
+    o.flush_retry_ms = 5000;  // no retry while the crash state is copied
+    o.test_crash_hook = [&](const char* p) {
+      return std::string(p) == "flush:fail_after_manifest_rename" && injected.fetch_add(1) == 0;
+    };
+    ASSERT_EQ(Open(o), Status::kOk);
+    int written = 0;
+    while (engine_->GetStats().active_seq == 1 && written < 400) {
+      Write(Key(written), "v" + std::to_string(written) + std::string(100, 'f'));
+      ++written;
+    }
+    ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().flush_failures >= 1; }));
+    // The failure is handled under the engine lock, which GetStats takes: the files are settled.
+    const std::string crashed = dir_ + "-crashed";
+    fs::remove_all(crashed);
+    fs::copy(dir_, crashed, fs::copy_options::recursive);
+    engine_.reset();
+    fs::remove_all(dir_);
+    fs::rename(crashed, dir_);  // the process "died" right after the failed store
+
+    const ManifestState left = Manifest();
+    ASSERT_EQ(left.files.size(), 1u);
+    EXPECT_EQ(left.flushed_through, 1u);
+    EXPECT_TRUE(fs::exists(dir_ + "/" + KVEngine::SstFileName(1)));
+    EXPECT_TRUE(fs::exists(dir_ + "/" + KVEngine::WalFileName(1)));
+    if (!new_manifest_survives) fs::remove(dir_ + "/MANIFEST");
+
+    ASSERT_EQ(Open(Opts()), Status::kOk);
+    if (new_manifest_survives) {
+      EXPECT_FALSE(fs::exists(dir_ + "/" + KVEngine::WalFileName(1))) << "the WAL is retired";
+      EXPECT_EQ(Manifest().files.size(), 1u);
+    } else {
+      EXPECT_GT(engine_->recovered_records(), 0u) << "the WAL is replayed";
+    }
+    for (int i = 0; i < written; ++i) {
+      ASSERT_EQ(Get(Key(i)), "v" + std::to_string(i) + std::string(100, 'f')) << "write " << i << " was lost";
+    }
+  }
+}
+
+// InstallCheckpoint's store fails after its rename, then putting the old state back succeeds. The
+// install reports the error, the directory holds the old dataset's manifest again, the checkpoint's
+// table and new WAL are gone, the old dataset is still served, and a later install works.
+TEST_F(LsmTest, AnAmbiguousCheckpointInstallStoreIsUndoneByStoringTheOldStateAgain) {
+  BuildTables({Rows("a", 10, "1"), Rows("b", 10, "2")});
+  std::atomic<int> injected{0};
+  KVEngine::Options o = Opts();
+  o.test_crash_hook = [&](const char* p) {
+    return std::string(p) == "install:fail_after_manifest_rename" && injected.fetch_add(1) == 0;
+  };
+  ASSERT_EQ(Open(o), Status::kOk);
+  std::string body;
+  AppendCheckpointEntry(&body, "ck", "cv");
+  const std::string data = CheckpointHeader(1) + body;
+  EXPECT_EQ(engine_->InstallCheckpoint(data, 77), Status::kIOError);
+  EXPECT_EQ(injected.load(), 2) << "two stores: the install's (made to fail) and the restore (left alone)";
+  const ManifestState m = Manifest();
+  ASSERT_EQ(m.files.size(), 2u) << "the old dataset's manifest is back";
+  EXPECT_EQ(m.files[0].file_number, 1u);
+  EXPECT_EQ(m.files[1].file_number, 2u);
+  EXPECT_EQ(m.flushed_through, 2u);
+  std::set<std::string> ssts;
+  for (const auto& n : Files(".sst")) ssts.insert(n);
+  EXPECT_EQ(ssts, (std::set<std::string>{KVEngine::SstFileName(1), KVEngine::SstFileName(2)}))
+      << "the checkpoint's table is unreferenced once the old state is durable again";
+  EXPECT_EQ(Get("a0003"), "1");
+  EXPECT_EQ(Get("ck"), "<absent>");
+  EXPECT_EQ(engine_->AppliedIndex(), 0u);
+  Write("after", "failed-install");
+  ASSERT_EQ(engine_->InstallCheckpoint(data, 77), Status::kOk) << "a later install works";
+  EXPECT_EQ(Get("ck"), "cv");
+  ASSERT_EQ(Open(Opts()), Status::kOk);
+  EXPECT_EQ(Get("ck"), "cv");
+  EXPECT_EQ(Get("a0003"), "<absent>");
+  EXPECT_EQ(engine_->AppliedIndex(), 77u);
+}
+
+// Both the install's store and the restore of the old state fail after their renames. Nothing that
+// either manifest names may be deleted, so the checkpoint's table is kept, and after a crash either
+// dataset is recovered whole: the old one (the manifest left on disk, which is the restored old
+// state) or the checkpoint (constructed by putting back the install's manifest, captured in the hook).
+TEST_F(LsmTest, ACheckpointInstallWhoseStoreAndRestoreBothFailRecoversEitherDataset) {
+  for (const bool checkpoint_survives : {false, true}) {
+    SCOPED_TRACE(checkpoint_survives ? "the install's manifest survives" : "the old manifest survives");
+    ResetDir();
+    BuildTables({Rows("a", 10, "1"), Rows("b", 10, "2")});
+    std::string install_manifest;  // the install's manifest, as it was in the directory
+    int calls = 0;
+    KVEngine::Options o = Opts();
+    o.test_crash_hook = [&](const char* p) {
+      if (std::string(p) != "install:fail_after_manifest_rename") return false;
+      if (++calls == 1) install_manifest = FileBytes(dir_ + "/MANIFEST");
+      return true;  // the install's store and the restore both "fail" after their renames
+    };
+    ASSERT_EQ(Open(o), Status::kOk);
+    std::string body;
+    AppendCheckpointEntry(&body, "ck", "cv");
+    EXPECT_EQ(engine_->InstallCheckpoint(CheckpointHeader(1) + body, 77), Status::kIOError);
+    EXPECT_EQ(calls, 2) << "the install's store, then the restore";
+    ManifestState installed;
+    ASSERT_EQ(DecodeManifest(install_manifest, &installed), Status::kOk);
+    ASSERT_EQ(installed.files.size(), 1u) << "the install's manifest names only the checkpoint's table";
+    const std::string table = dir_ + "/" + KVEngine::SstFileName(installed.files[0].file_number);
+    EXPECT_TRUE(fs::exists(table)) << "a manifest that may survive names it: it must be kept";
+    EXPECT_EQ(Manifest().files.size(), 2u) << "the restore's rename put the old state back in the directory";
+    std::string v;
+    EXPECT_EQ(engine_->Get("a0003", &v), Status::kIOError) << "a fail-stopped engine refuses reads";
+    engine_.reset();  // crash
+
+    if (checkpoint_survives) {
+      std::ofstream out(dir_ + "/MANIFEST", std::ios::binary | std::ios::trunc);
+      out << install_manifest;
+    }
+    ASSERT_EQ(Open(Opts()), Status::kOk);
+    EXPECT_EQ(Files(".sst").size(), Manifest().files.size()) << "every unlisted table is deleted";
+    if (checkpoint_survives) {
+      EXPECT_EQ(Get("ck"), "cv");
+      EXPECT_EQ(Get("a0003"), "<absent>");
+      EXPECT_EQ(engine_->AppliedIndex(), 77u);
+    } else {
+      EXPECT_EQ(Get("a0003"), "1");
+      EXPECT_EQ(Get("b0009"), "2");
+      EXPECT_EQ(Get("ck"), "<absent>");
+      EXPECT_FALSE(fs::exists(table)) << "the checkpoint's table is an orphan";
+    }
+  }
+}
+
+// After the install's store AND the restore both fail, which dataset is durable is unknown, so the
+// engine must stop for good. Reads work normally before the failure; afterwards every read, every
+// write entry point and both checkpoint calls fail with kIOError (a read STARTED after the failure is
+// never served, checked by a reader thread running across it), nothing is written, GetStats reports
+// the stop, and a flush and a compaction that were already running when it stopped (held
+// here at "flush:after_sst" and "compact:after_output", outside the engine lock) must not store a
+// manifest when they resume. Shutting down must not hang. Reopening then recovers either dataset whole: the old one with every write
+// acknowledged before the install (the manifest left on disk is the restored old state), or the
+// checkpoint (the install's manifest, captured in the hook and put back).
+TEST_F(LsmTest, ACheckpointInstallWhoseStoreAndRestoreBothFailStopsTheEngine) {
+  for (const bool checkpoint_survives : {false, true}) {
+    SCOPED_TRACE(checkpoint_survives ? "the install's manifest survives" : "the old manifest survives");
+    ResetDir();
+    BuildTables({Rows("a", 10, "1"), Rows("b", 10, "2"), Rows("c", 10, "3"), Rows("d", 10, "4")});
+    std::string install_manifest;
+    int install_stores = 0;
+    std::atomic<bool> flush_held{false}, compaction_held{false}, release_workers{false};
+    KVEngine::Options o = Opts(/*compaction_trigger=*/4);  // the four tables start a compaction at once
+    o.test_crash_hook = [&](const char* p) {
+      const std::string point(p);
+      if (point == "install:fail_after_manifest_rename") {
+        if (++install_stores == 1) install_manifest = FileBytes(dir_ + "/MANIFEST");
+        return true;  // the install's store and the restore both "fail" after their renames
+      }
+      if (point == "flush:after_sst" && !flush_held.exchange(true)) {
+        while (!release_workers) std::this_thread::sleep_for(1ms);  // a flush in flight
+      }
+      if (point == "compact:after_output" && !compaction_held.exchange(true)) {
+        while (!release_workers) std::this_thread::sleep_for(1ms);  // a compaction in flight
+      }
+      return false;
+    };
+    ASSERT_EQ(Open(o), Status::kOk);
+    struct Release {  // never leave a worker held, whatever happens below
+      std::atomic<bool>& flag;
+      ~Release() { flag = true; }
+    } release_guard{release_workers};
+    ASSERT_TRUE(WaitFor([&] { return compaction_held.load(); }));
+    const uint64_t first_wal = engine_->GetStats().active_seq;
+    int written = 0;
+    while (engine_->GetStats().active_seq == first_wal && written < 400) {  // until a memtable is frozen
+      Write(Key(written), "v" + std::to_string(written) + std::string(100, 'f'));
+      ++written;
+    }
+    ASSERT_TRUE(WaitFor([&] { return flush_held.load(); }));
+    // Reads work normally before the failure.
+    EXPECT_EQ(Get("a0003"), "1");
+    EXPECT_EQ(Get(Key(0)), "v0" + std::string(100, 'f'));
+    EXPECT_EQ(Get("never-written"), "<absent>");
+    EXPECT_FALSE(engine_->GetStats().fail_stopped);
+    // A reader runs across the failure. Every Get it STARTS after the install has returned must
+    // fail; Gets started earlier may return data (they are ordered before the failure).
+    std::atomic<bool> install_returned{false}, stop_reader{false};
+    std::atomic<int> late_reads{0}, late_reads_not_refused{0};
+    std::thread reader([&] {
+      while (!stop_reader) {
+        const bool after = install_returned.load();
+        std::string v;
+        const Status s = engine_->Get("a0003", &v);
+        if (after) {
+          ++late_reads;
+          if (s != Status::kIOError) ++late_reads_not_refused;
+        } else {
+          EXPECT_TRUE(s == Status::kOk || s == Status::kIOError) << "a read before the failure saw a broken state";
+        }
+      }
+    });
+    struct JoinReader {
+      std::atomic<bool>& stop;
+      std::thread& t;
+      ~JoinReader() {
+        stop = true;
+        if (t.joinable()) t.join();
+      }
+    } join_reader{stop_reader, reader};
+
+    std::string body;
+    AppendCheckpointEntry(&body, "ck", "cv");
+    const std::string data = CheckpointHeader(1) + body;
+    ASSERT_EQ(engine_->InstallCheckpoint(data, 77), Status::kIOError);
+    install_returned = true;
+    ASSERT_EQ(install_stores, 2) << "the install's store, then the restore";
+    ASSERT_TRUE(WaitFor([&] { return late_reads.load() >= 50; })) << "the reader kept running";
+    stop_reader = true;
+    reader.join();
+    EXPECT_EQ(late_reads_not_refused.load(), 0) << "a read started after the fail-stop returned data";
+    const std::string manifest_after = FileBytes(dir_ + "/MANIFEST");
+    const std::string active_wal = dir_ + "/" + KVEngine::WalFileName(engine_->GetStats().active_seq);
+    const uintmax_t wal_size = fs::file_size(active_wal);
+
+    // Fail-stop: nothing is accepted, nothing is reported as done, nothing reaches the WAL.
+    EXPECT_EQ(engine_->Put("late", "x"), Status::kIOError);
+    EXPECT_EQ(engine_->Delete(Key(0)), Status::kIOError);
+    EXPECT_EQ(engine_->PutAt("late", "x", 1000), Status::kIOError);
+    EXPECT_EQ(engine_->DeleteAt(Key(0), 1001), Status::kIOError);
+    std::string snapshot;
+    uint64_t snapshot_index = 0;
+    EXPECT_EQ(engine_->Checkpoint(&snapshot, &snapshot_index), Status::kIOError);
+    EXPECT_EQ(engine_->InstallCheckpoint(data, 78), Status::kIOError);
+    EXPECT_EQ(install_stores, 2) << "a refused install must not even try to store a manifest";
+    EXPECT_EQ(fs::file_size(active_wal), wal_size) << "a refused write must not reach the WAL";
+    EXPECT_EQ(engine_->AppliedIndex(), 0u);
+    // Reads are refused too, for present and absent keys alike, and the stop is reported.
+    std::string v;
+    EXPECT_EQ(engine_->Get("a0003", &v), Status::kIOError);
+    EXPECT_EQ(engine_->Get(Key(0), &v), Status::kIOError);
+    EXPECT_EQ(engine_->Get("late", &v), Status::kIOError);
+    EXPECT_EQ(engine_->Get("never-written", &v), Status::kIOError);
+    EXPECT_TRUE(engine_->GetStats().fail_stopped);
+
+    release_workers = true;
+    engine_.reset();  // joins the flusher and the compactor, which resume now; must not hang
+    EXPECT_EQ(FileBytes(dir_ + "/MANIFEST"), manifest_after)
+        << "the flush and compaction that were running when the engine stopped must not store a manifest";
+
+    if (checkpoint_survives) {
+      std::ofstream out(dir_ + "/MANIFEST", std::ios::binary | std::ios::trunc);
+      out << install_manifest;
+    }
+    ASSERT_EQ(Open(Opts()), Status::kOk);
+    EXPECT_FALSE(engine_->GetStats().fail_stopped) << "reopening ends the fail-stop";
+    EXPECT_EQ(Files(".sst").size(), Manifest().files.size()) << "every unlisted table is deleted";
+    if (checkpoint_survives) {
+      EXPECT_EQ(Get("ck"), "cv");
+      EXPECT_EQ(Get("a0003"), "<absent>");
+      EXPECT_EQ(Get(Key(0)), "<absent>") << "the checkpoint replaces the whole dataset";
+      EXPECT_EQ(engine_->AppliedIndex(), 77u);
+    } else {
+      EXPECT_EQ(Get("a0003"), "1");
+      EXPECT_EQ(Get("d0009"), "4");
+      EXPECT_EQ(Get("ck"), "<absent>");
+      for (int i = 0; i < written; ++i) {
+        ASSERT_EQ(Get(Key(i)), "v" + std::to_string(i) + std::string(100, 'f')) << "acknowledged write " << i << " was lost";
+      }
+    }
+    EXPECT_EQ(Get("late"), "<absent>") << "a refused write must not appear after recovery";
+    Write("after-reopen", "ok");  // the reopened engine works normally
+    EXPECT_EQ(Get("after-reopen"), "ok");
+  }
 }
 
 // Many flush/compaction cycles through the real write path: reads always match a model, the live
