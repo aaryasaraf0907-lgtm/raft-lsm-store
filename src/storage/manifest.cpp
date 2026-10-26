@@ -132,7 +132,8 @@ Status LoadManifest(const std::string& dir, ManifestState* out, bool* found) {
   return Status::kOk;
 }
 
-Status StoreManifest(const std::string& dir, const ManifestState& state) {
+Status StoreManifest(const std::string& dir, const ManifestState& state,
+                     const std::function<bool()>& fail_after_rename) {
   const std::string path = ManifestPath(dir);
   const std::string tmp = path + ".tmp";
   const std::string bytes = EncodeManifest(state);
@@ -152,6 +153,7 @@ Status StoreManifest(const std::string& dir, const ManifestState& state) {
     ::unlink(tmp.c_str());
     return Status::kIOError;
   }
+  if (fail_after_rename && fail_after_rename()) return Status::kIOError;  // tests: the directory fsync "fails"
   if (!SyncPath(dir, O_RDONLY)) return Status::kIOError;  // make the rename itself durable
   return Status::kOk;
 }

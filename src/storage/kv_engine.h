@@ -79,6 +79,10 @@ class KVEngine : public CheckpointableStore {
     // Tests only: called at named steps of flush and compaction ("flush:after_sst",
     // "flush:after_manifest", "compact:after_output", "compact:after_manifest"). Returning true
     // makes the engine stop right there, as if the process had died, leaving files as they are.
+    // Three points are faults, not crashes: returning true at "compact:fail_after_manifest_rename",
+    // "flush:fail_after_manifest_rename" or "install:fail_after_manifest_rename" makes that manifest
+    // store report failure AFTER the new manifest has been renamed into place (as if the directory
+    // fsync after the rename had failed); the engine keeps running.
     std::function<bool(const char* point)> test_crash_hook;
   };
 
@@ -91,6 +95,9 @@ class KVEngine : public CheckpointableStore {
     size_t sstables = 0;  // live SSTables (SSTable mode)
     uint64_t compactions_done = 0;
     uint64_t compaction_failures = 0;
+    // The engine stopped for good because InstallCheckpoint could not tell which dataset is durable
+    // (see InstallCheckpoint): reads, writes and checkpoints all fail; reopen the directory.
+    bool fail_stopped = false;
   };
 
   // kOk; kIOError (cannot create dir / open WAL); kCorruption (a WAL is damaged
@@ -112,7 +119,12 @@ class KVEngine : public CheckpointableStore {
 
   // Raft snapshots of the data (see checkpoint.h). Checkpoint works in both modes; InstallCheckpoint
   // needs SSTable mode (kInvalidArgument otherwise): it replaces everything with ONE new SSTable and
-  // one manifest edit, so a crash leaves the old dataset or the new one, never a mix.
+  // one manifest edit, so a crash leaves the old dataset or the new one, never a mix. If that edit
+  // fails in a way that leaves unknown which of the two is durable (and putting the old state back
+  // fails too), the engine stops for good: every read (Get), write, Checkpoint and InstallCheckpoint
+  // started after that fails with kIOError, GetStats().fail_stopped is true, and reopening the
+  // directory recovers whichever dataset is on disk. A Get already running when the engine stops
+  // may still return what it found (it is ordered before the failure).
   Status Checkpoint(std::string* data, uint64_t* applied_index) override;
   Status InstallCheckpoint(const std::string& data, uint64_t applied_index) override;
 
@@ -170,7 +182,15 @@ class KVEngine : public CheckpointableStore {
   uint64_t compactions_done_ = 0;
   uint64_t compaction_failures_ = 0;
   uint64_t epoch_ = 0;  // bumped when InstallCheckpoint replaces the dataset (guarded by write_mu_)
-  std::atomic<bool> dead_{false};  // a test crash point fired: every background thread stops
+  // The engine has stopped for good: a test crash point fired, or InstallCheckpoint could not tell
+  // which dataset is durable. Writes, Checkpoint and InstallCheckpoint fail with kIOError, and every
+  // background thread exits when it next waits.
+  std::atomic<bool> dead_{false};
+  // Set (together with dead_) only when InstallCheckpoint could not tell which dataset is durable.
+  // Then the in-memory data may not be what a restart recovers, so reads fail with kIOError too, and
+  // a flush or compaction already running stores no manifest when it resumes. (A test crash point
+  // sets only dead_: reads, and a flush or compaction already running, behave as they always have.)
+  std::atomic<bool> fail_stopped_{false};
 
   mutable std::mutex view_mu_;  // innermost lock; only guards the pointer copy
   std::shared_ptr<const View> view_;
