@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "storage/iterator.h"
+#include "storage/checkpoint.h"
 #include "storage/kv_store.h"
 #include "storage/manifest.h"
 #include "storage/memtable.h"
@@ -43,7 +44,7 @@
 
 namespace raftkv {
 
-class KVEngine : public IndexedKVStore {
+class KVEngine : public CheckpointableStore {
  public:
   // Writes `entries` (sorted by key, tombstones included) as the SSTable for flush
   // sequence `seq` at `path`. Must return kOk only once the complete file is durable
@@ -101,6 +102,12 @@ class KVEngine : public IndexedKVStore {
   Status DeleteAt(const std::string& key, uint64_t raft_index) override;
   uint64_t AppliedIndex() override { return applied_index_.load(); }
 
+  // Raft snapshots of the data (see checkpoint.h). Checkpoint works in both modes; InstallCheckpoint
+  // needs SSTable mode (kInvalidArgument otherwise): it replaces everything with ONE new SSTable and
+  // one manifest edit, so a crash leaves the old dataset or the new one, never a mix.
+  Status Checkpoint(std::string* data, uint64_t* applied_index) override;
+  Status InstallCheckpoint(const std::string& data, uint64_t applied_index) override;
+
   uint64_t recovered_records() const { return recovered_records_; }
   Stats GetStats() const;
 
@@ -154,6 +161,7 @@ class KVEngine : public IndexedKVStore {
   uint64_t lsm_highest_number_ = 0;  // highest file number seen on disk at startup, orphans included
   uint64_t compactions_done_ = 0;
   uint64_t compaction_failures_ = 0;
+  uint64_t epoch_ = 0;  // bumped when InstallCheckpoint replaces the dataset (guarded by write_mu_)
   std::atomic<bool> dead_{false};  // a test crash point fired: every background thread stops
 
   mutable std::mutex view_mu_;  // innermost lock; only guards the pointer copy

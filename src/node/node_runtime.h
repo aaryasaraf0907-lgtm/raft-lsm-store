@@ -31,6 +31,11 @@ struct NodeOptions {
   bool use_sstables = true;
   size_t memtable_bytes = 4 * 1024 * 1024;  // the engine freezes and flushes a memtable at this size
   size_t compaction_trigger = 4;            // merge SSTables when this many are live (0 = never)
+  // Raft snapshots (LSM engine only): after this many applied entries the node snapshots its data
+  // and drops the Raft log, keeping `snapshot_trailing_entries` of it for followers that are only
+  // a little behind. 0 = never snapshot. The node can always RECEIVE a snapshot from the leader.
+  size_t snapshot_threshold_entries = 10000;
+  size_t snapshot_trailing_entries = 100;
   RaftConfig raft;
 };
 

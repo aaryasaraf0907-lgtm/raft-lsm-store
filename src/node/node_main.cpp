@@ -30,6 +30,9 @@ void Usage(FILE* out) {
       "  --no-sstables        use the old WAL + memtable engine instead of the LSM engine\n"
       "  --memtable-bytes N   flush a memtable to an SSTable at this size (default 4194304)\n"
       "  --compaction-trigger N  merge SSTables when N are live; 0 = never (default 4)\n"
+      "  --snapshot-threshold N  snapshot the data and drop the Raft log every N applied entries;\n"
+      "                       0 = never (default 10000)\n"
+      "  --snapshot-trailing N  Raft log entries kept below each snapshot (default 100)\n"
       "  --no-prevote         disable PreVote\n"
       "  --heartbeat-ms N     leader heartbeat interval (default 50)\n"
       "  --election-ms MIN,MAX  election timeout range (default 150,300)\n"
@@ -88,6 +91,10 @@ int main(int argc, char** argv) {
       options.memtable_bytes = static_cast<size_t>(std::strtoull(value("--memtable-bytes"), nullptr, 10));
     } else if (arg == "--compaction-trigger") {
       options.compaction_trigger = static_cast<size_t>(std::strtoull(value("--compaction-trigger"), nullptr, 10));
+    } else if (arg == "--snapshot-threshold") {
+      options.snapshot_threshold_entries = static_cast<size_t>(std::strtoull(value("--snapshot-threshold"), nullptr, 10));
+    } else if (arg == "--snapshot-trailing") {
+      options.snapshot_trailing_entries = static_cast<size_t>(std::strtoull(value("--snapshot-trailing"), nullptr, 10));
     } else if (arg == "--no-sstables") {
       options.use_sstables = false;
     } else if (arg == "--no-prevote") {

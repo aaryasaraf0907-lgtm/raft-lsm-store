@@ -44,7 +44,8 @@ struct TempDir {
 
 class NodeCluster {
  public:
-  explicit NodeCluster(int n, size_t memtable_bytes = 0) : n_(n), memtable_bytes_(memtable_bytes), nodes_(n) {
+  explicit NodeCluster(int n, size_t memtable_bytes = 0, size_t snapshot_threshold = 0)
+      : n_(n), memtable_bytes_(memtable_bytes), snapshot_threshold_(snapshot_threshold), nodes_(n) {
     for (int id = 1; id <= n; ++id) Boot(id);
     WireAll();
     KvClientOptions options;
@@ -75,6 +76,14 @@ class NodeCluster {
 
   void Crash(int id) { nodes_[id - 1].reset(); }  // stops it; its data directory stays
 
+  // Crashes the node, DELETES everything it had on disk, and boots it again: a replacement machine.
+  void RestartEmpty(int id) {
+    Crash(id);
+    std::error_code ec;
+    std::filesystem::remove_all(dir_.path + "/node" + std::to_string(id), ec);
+    Restart(id);
+  }
+
   // Boots node `id` again from its data directory (on new ports) and tells everyone.
   void Restart(int id) {
     Boot(id);
@@ -89,6 +98,10 @@ class NodeCluster {
     for (int p = 1; p <= n_; ++p) options.cluster.push_back(p);
     options.data_dir = dir_.path + "/node" + std::to_string(id);
     options.sync = false;  // speed: crash safety is covered by the storage tests
+    if (snapshot_threshold_ != 0) {
+      options.snapshot_threshold_entries = snapshot_threshold_;
+      options.snapshot_trailing_entries = 5;
+    }
     if (memtable_bytes_ != 0) {
       options.memtable_bytes = memtable_bytes_;  // small: the engine flushes and compacts during the test
       options.compaction_trigger = 3;
@@ -109,6 +122,7 @@ class NodeCluster {
 
   int n_;
   size_t memtable_bytes_;
+  size_t snapshot_threshold_;
   TempDir dir_;
   std::vector<std::unique_ptr<NodeRuntime>> nodes_;
   std::unique_ptr<KvClient> client_;
@@ -290,6 +304,85 @@ TEST(NodeClusterTest, LeaderCrashWithFlushesAndCompactionsLosesNothing) {
       20000ms)) << "the restarted node did not recover from its SSTables and WAL";
   EXPECT_GT(c.Node(victim)->state_machine()->ReplaySkipped(), 0u)
       << "replay should have skipped what the engine already held";
+}
+
+// With snapshots on, the Raft log stays bounded however much is written, and the data survives a
+// restart of the whole cluster (which restores from snapshots instead of replaying a huge log).
+TEST(NodeClusterTest, SnapshotsBoundTheRaftLogAndTheDataSurvivesAFullRestart) {
+  NodeCluster c(3, /*memtable_bytes=*/16384, /*snapshot_threshold=*/25);
+  const std::string pad(150, 'p');
+  for (int i = 0; i < 300; ++i) ASSERT_EQ(c.client().Put(KeyOf(i), ValueOf(i) + pad).status, KvStatus::kOk) << i;
+  for (int id = 1; id <= 3; ++id) {
+    ASSERT_TRUE(WaitFor([&] { return c.Node(id)->node()->SnapshotIndex() > 0; }, 15000ms)) << "node " << id << " never snapshotted";
+    EXPECT_LT(c.Node(id)->node()->LogLength(), 70u) << "node " << id << " keeps an unbounded Raft log";
+  }
+  for (int id = 1; id <= 3; ++id) c.Crash(id);
+  for (int id = 1; id <= 3; ++id) c.Restart(id);
+  for (int i = 0; i < 300; ++i) {
+    KvResult got = c.client().Get(KeyOf(i));
+    ASSERT_EQ(got.status, KvStatus::kOk) << i;
+    ASSERT_EQ(got.value, ValueOf(i) + pad) << i;
+  }
+  EXPECT_EQ(c.client().Put("after", "restart").status, KvStatus::kOk);
+}
+
+// The scenario the whole snapshot machinery exists for: a node that was down while the leader
+// compacted its Raft log past that node's position. The log entries it needs no longer exist, so the
+// leader sends its snapshot over gRPC; the node installs it into its engine, REPLACING whatever the
+// engine held, and carries on.
+TEST(NodeClusterTest, ALaggingFollowerCatchesUpFromASnapshotThatReplacesItsOldData) {
+  NodeCluster c(3, /*memtable_bytes=*/16384, /*snapshot_threshold=*/25);
+  const std::string pad(150, 'p');
+  ASSERT_EQ(c.client().Put("gone-later", "x").status, KvStatus::kOk);
+  const int leader = c.Leader();
+  ASSERT_NE(leader, 0);
+  const int victim = leader % 3 + 1;
+  ASSERT_TRUE(WaitFor([&] { return EngineHas(c.Node(victim), "gone-later", "x"); }, 10000ms));
+  c.Crash(victim);  // down while the cluster moves on
+  ASSERT_EQ(c.client().Delete("gone-later").status, KvStatus::kOk);
+  for (int i = 0; i < 200; ++i) ASSERT_EQ(c.client().Put(KeyOf(i), ValueOf(i) + pad).status, KvStatus::kOk) << i;
+  ASSERT_TRUE(WaitFor([&] { return c.Node(leader)->node()->SnapshotIndex() > 50; }, 15000ms))
+      << "the leader should have dropped the part of its log the follower needs";
+  c.Restart(victim);  // from its own, now stale, disk
+  ASSERT_TRUE(WaitFor(
+      [&] {
+        for (int i = 0; i < 200; ++i) {
+          if (!EngineHas(c.Node(victim), KeyOf(i), ValueOf(i) + pad)) return false;
+        }
+        return true;
+      },
+      30000ms)) << "the lagging node never caught up";
+  EXPECT_GT(c.Node(victim)->node()->SnapshotIndex(), 0u) << "it should have been brought up to date by a snapshot";
+  std::string v;
+  EXPECT_EQ(c.Node(victim)->store()->Get("gone-later", &v), Status::kNotFound) << "the old dataset must have been replaced";
+  ASSERT_EQ(c.client().Put("later", "still-works").status, KvStatus::kOk);
+  EXPECT_TRUE(WaitFor([&] { return EngineHas(c.Node(victim), "later", "still-works"); }, 10000ms));
+}
+
+// A replacement machine with an empty disk, brought in while the cluster has only ever heard from
+// it at the very start. (A node that is wiped AFTER it caught up cannot rejoin under the same id:
+// Raft assumes a node keeps its persisted state, and replacing one needs a membership change.)
+TEST(NodeClusterTest, AnEmptyReplacementThatNeverCaughtUpIsBroughtUpBySnapshot) {
+  NodeCluster c(3, /*memtable_bytes=*/16384, /*snapshot_threshold=*/25);
+  const std::string pad(150, 'p');
+  ASSERT_EQ(c.client().Put("warm", "up").status, KvStatus::kOk);
+  const int leader = c.Leader();
+  ASSERT_NE(leader, 0);
+  const int victim = leader % 3 + 1;
+  c.Crash(victim);
+  for (int i = 0; i < 200; ++i) ASSERT_EQ(c.client().Put(KeyOf(i), ValueOf(i) + pad).status, KvStatus::kOk) << i;
+  ASSERT_TRUE(WaitFor([&] { return c.Node(leader)->node()->SnapshotIndex() > 50; }, 15000ms));
+  std::error_code ec;
+  c.RestartEmpty(victim);
+  ASSERT_TRUE(WaitFor(
+      [&] {
+        for (int i = 0; i < 200; ++i) {
+          if (!EngineHas(c.Node(victim), KeyOf(i), ValueOf(i) + pad)) return false;
+        }
+        return true;
+      },
+      30000ms)) << "the replacement node never caught up";
+  EXPECT_GT(c.Node(victim)->node()->SnapshotIndex(), 0u);
 }
 
 }  // namespace raftkv
