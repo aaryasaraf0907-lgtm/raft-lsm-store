@@ -2,6 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -133,7 +134,26 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   LogEntry& EntryLocked(LogIndex index) { return log_[index - base_index_]; }
   const LogEntry& EntryLocked(LogIndex index) const { return log_[index - base_index_]; }
   void AdvanceCommitIndexLocked();
-  LogIndex AppendAsLeaderLocked(const Command& cmd);
+  // ---- group commit for proposals ----
+  // Concurrent proposers queue their commands; one of them (the "batcher") appends everything that
+  // is queued with ONE log write and ONE fsync, then wakes the rest. While one batch is being
+  // fsynced the next one accumulates, so batches grow with the load. Every storage write still
+  // happens under mu_, exactly as before: only the number of fsyncs per entry changes.
+  struct PendingProposal {
+    Command cmd;
+    bool done = false;      // the batcher has handled it (guarded by proposal_mu_)
+    bool accepted = false;  // appended to the log as leader
+    bool stopped = false;   // the node was shut down
+    LogIndex index = 0;     // valid if accepted
+    Term term = 0;          // the term the entry was appended in (valid if accepted)
+    NodeId leader_hint = 0;
+  };
+  void SubmitProposal(PendingProposal* p);
+  static constexpr size_t kMaxProposalBatch = 256;
+  std::mutex proposal_mu_;
+  std::condition_variable proposal_cv_;
+  std::deque<PendingProposal*> proposals_;
+  bool batcher_active_ = false;
   void ResetElectionDeadlineLocked();
   void OnRequestVoteReply(Term election_term, const RequestVoteReply& reply);
   void OnAppendEntriesReply(NodeId peer, Term sent_term, uint64_t seq, LogIndex prev_index,

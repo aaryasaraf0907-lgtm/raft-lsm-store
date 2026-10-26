@@ -79,30 +79,78 @@ void RaftNodeImpl::Stop() {
   transport_->Stop();
 }
 
-LogIndex RaftNodeImpl::AppendAsLeaderLocked(const Command& cmd) {
-  LogIndex index = LastLogIndexLocked() + 1;
-  log_.push_back(LogEntry{current_term_, index, cmd});
-  PersistAppendLocked({log_.back()});  // durable on the leader before we replicate or count it
-  AdvanceCommitIndexLocked();       // a single-node cluster commits immediately
-  BroadcastAppendEntriesLocked();   // replicate now instead of waiting for the next heartbeat
-  return index;
+// Appends every queued proposal with one log write and one fsync (see the note in the header).
+// The thread that finds no batcher running becomes the batcher; the others wait until their
+// proposal has been handled. A proposal is handled exactly once: appended (accepted), refused
+// because this node is not the leader, or refused because the node stopped.
+void RaftNodeImpl::SubmitProposal(PendingProposal* p) {
+  std::unique_lock<std::mutex> ql(proposal_mu_);
+  proposals_.push_back(p);
+  while (!p->done) {
+    if (batcher_active_) {
+      proposal_cv_.wait(ql);
+      continue;
+    }
+    batcher_active_ = true;
+    std::vector<PendingProposal*> batch;
+    while (!proposals_.empty() && batch.size() < kMaxProposalBatch) {
+      batch.push_back(proposals_.front());
+      proposals_.pop_front();
+    }
+    ql.unlock();  // proposers keep queueing while this batch is being written
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (!running_) {
+        for (PendingProposal* x : batch) {
+          x->stopped = true;
+          x->leader_hint = leader_hint_;
+        }
+      } else if (role_ != Role::kLeader) {
+        for (PendingProposal* x : batch) x->leader_hint = leader_hint_;
+      } else {
+        std::vector<LogEntry> entries;
+        entries.reserve(batch.size());
+        LogIndex index = LastLogIndexLocked();
+        for (PendingProposal* x : batch) {
+          ++index;
+          log_.push_back(LogEntry{current_term_, index, x->cmd});
+          entries.push_back(log_.back());
+          x->accepted = true;
+          x->index = index;
+          x->term = current_term_;
+          x->leader_hint = id_;
+        }
+        PersistAppendLocked(entries);  // durable on the leader before we replicate or count it
+        AdvanceCommitIndexLocked();    // a single-node cluster commits immediately
+        BroadcastAppendEntriesLocked();  // replicate now instead of waiting for the next heartbeat
+      }
+    }
+    ql.lock();
+    for (PendingProposal* x : batch) x->done = true;
+    batcher_active_ = false;
+    proposal_cv_.notify_all();
+  }
 }
 
 ProposeResponse RaftNodeImpl::Propose(const Command& cmd) {
-  std::lock_guard<std::mutex> lk(mu_);
-  if (role_ != Role::kLeader) return {ProposeResult::kNotLeader, 0, leader_hint_};
-  LogIndex index = AppendAsLeaderLocked(cmd);
-  return {ProposeResult::kAccepted, index, id_};
+  PendingProposal p;
+  p.cmd = cmd;
+  SubmitProposal(&p);
+  if (!p.accepted) return {ProposeResult::kNotLeader, 0, p.leader_hint};
+  return {ProposeResult::kAccepted, p.index, id_};
 }
 
 CommitResponse RaftNodeImpl::ProposeAndWait(const Command& cmd, std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  PendingProposal p;
+  p.cmd = cmd;
+  SubmitProposal(&p);
+  if (p.stopped) return {CommitResult::kStopped, 0, p.leader_hint};
+  if (!p.accepted) return {CommitResult::kNotLeader, 0, p.leader_hint};
+
+  const Term term = p.term;  // the entry is identified by (index, term)
+  const LogIndex index = p.index;
   std::unique_lock<std::mutex> lk(mu_);
-  if (!running_) return {CommitResult::kStopped, 0, leader_hint_};
-  if (role_ != Role::kLeader) return {CommitResult::kNotLeader, 0, leader_hint_};
-
-  const Term term = current_term_;  // the entry is identified by (index, term)
-  const LogIndex index = AppendAsLeaderLocked(cmd);
-
   CommitResult outcome = CommitResult::kTimeout;
   auto resolved = [&] {
     if (!running_) {
@@ -129,7 +177,7 @@ CommitResponse RaftNodeImpl::ProposeAndWait(const Command& cmd, std::chrono::mil
     }
     return false;
   };
-  wait_cv_.wait_for(lk, timeout, resolved);  // on timeout `outcome` stays kTimeout
+  wait_cv_.wait_until(lk, deadline, resolved);  // on timeout `outcome` stays kTimeout
   return {outcome, index, leader_hint_};
 }
 
