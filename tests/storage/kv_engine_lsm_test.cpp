@@ -3,8 +3,11 @@
 #include <gtest/gtest.h>
 
 #include <stdlib.h>
+#include <sys/resource.h>
 
 #include <atomic>
+#include <csignal>
+#include <cstdio>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -111,6 +114,62 @@ class LsmTest : public ::testing::Test {
     return out;
   }
   static std::string Key(int i) { return "key" + std::to_string(1000 + i); }
+
+  // Lays out an exact live set by hand, as consecutive flushes would leave it: table i (from 1) is
+  // "00000i.sst" with file number and sequence range {i, i, i}, and the manifest lists them all with
+  // flushed_through = the last one. Each table's entries must be sorted by key. No WAL exists, so the
+  // engine opened on this directory holds exactly these tables and an empty memtable.
+  void BuildTables(const std::vector<std::vector<Entry>>& tables) {
+    ManifestState m;
+    for (size_t i = 0; i < tables.size(); ++i) {
+      const uint64_t n = i + 1;
+      const SSTableMeta meta{n, n, n};
+      std::unique_ptr<SSTableBuilder> b;
+      ASSERT_EQ(SSTableBuilder::Create(dir_ + "/" + KVEngine::SstFileName(n), meta, {}, &b), Status::kOk);
+      for (const Entry& e : tables[i]) ASSERT_EQ(b->Add(e), Status::kOk);
+      ASSERT_EQ(b->Finish(), Status::kOk);
+      m.files.push_back(meta);
+    }
+    m.flushed_through = tables.size();
+    m.next_file_number = tables.size() + 1;
+    ASSERT_EQ(StoreManifest(dir_, m), Status::kOk);
+  }
+  void ResetDir() {
+    engine_.reset();
+    fs::remove_all(dir_);
+    fs::create_directories(dir_);
+  }
+  // `count` puts "<prefix>0000", "<prefix>0001", ... (sorted), each with `value`.
+  static std::vector<Entry> Rows(const std::string& prefix, int count, const std::string& value) {
+    std::vector<Entry> out;
+    for (int i = 0; i < count; ++i) {
+      char key[16];
+      std::snprintf(key, sizeof(key), "%04d", i);
+      out.push_back(Entry{prefix + key, value, false});
+    }
+    return out;
+  }
+  // Looks `key` up in one SSTable on disk, bypassing the engine.
+  SSTable::GetResult TableGet(uint64_t file_number, const std::string& key) {
+    std::unique_ptr<SSTable> t;
+    EXPECT_EQ(SSTable::Open(dir_ + "/" + KVEngine::SstFileName(file_number), file_number, &t), Status::kOk);
+    SSTable::GetResult r = SSTable::GetResult::kAbsent;
+    std::string v;
+    if (t != nullptr) EXPECT_EQ(t->Get(key, &r, &v), Status::kOk);
+    return r;
+  }
+  std::string FileBytes(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), {});
+  }
+  // No compaction is running or due: fewer live tables than the trigger, nothing left to flush,
+  // and every replaced input already deleted from disk.
+  void WaitUntilCompactionIdle(size_t trigger) {
+    ASSERT_TRUE(WaitFor([&] {
+      const auto s = engine_->GetStats();
+      return s.sstables < trigger && s.frozen_memtables == 0 && Files(".sst").size() == s.sstables;
+    }));
+  }
 
   std::string dir_;
   std::unique_ptr<KVEngine> engine_;
@@ -506,4 +565,289 @@ TEST_F(LsmTest, ReadersNeverSeeTheStateGoBackwardsWhileFlushingAndCompacting) {
   for (auto& t : readers) t.join();
   EXPECT_EQ(violations.load(), 0);
   EXPECT_EQ(Get("counter"), "1500");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Compaction policy: which run of tables is merged. The live sets below are built by hand
+// (BuildTables) so that every test knows the exact tables, sizes and sequence ranges involved.
+
+// The common case the policy exists for: one large older table and a few small newer ones. Only the
+// newer ones are merged; the large table is neither rewritten nor touched. The run does not start at
+// the oldest table, so a tombstone in it must survive: it still hides the older value in table 1.
+TEST_F(LsmTest, CompactionMergesTheSmallNewerTablesAndLeavesTheLargeOldOneAlone) {
+  std::vector<Entry> t1 = Rows("a", 200, "old");  // 201 entries
+  t1.push_back(Entry{"k", "old", false});
+  std::vector<Entry> t2 = Rows("b", 10, "two");  // 11 entries
+  t2.push_back(Entry{"k", "", true});            // deletes the value in table 1
+  std::vector<Entry> t3 = {Entry{"a0005", "new", false}};  // 11 entries; overwrites table 1
+  for (const Entry& e : Rows("c", 10, "three")) t3.push_back(e);
+  BuildTables({t1, t2, t3, Rows("d", 10, "four")});  // sizes 201, 11, 11, 10
+  const std::string table1 = dir_ + "/" + KVEngine::SstFileName(1);
+  const std::string table1_bytes = FileBytes(table1);
+
+  ASSERT_EQ(Open(Opts(4)), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compactions_done >= 1; }));
+  WaitUntilCompactionIdle(4);
+  std::this_thread::sleep_for(100ms);  // a policy that kept going would show up here
+  EXPECT_EQ(engine_->GetStats().compactions_done, 1u) << "two live tables are below the trigger";
+
+  const ManifestState m = Manifest();
+  ASSERT_EQ(m.files.size(), 2u);
+  EXPECT_EQ(m.files[0].file_number, 1u) << "the large old table is still live";
+  EXPECT_EQ(m.files[0].min_seq, 1u);
+  EXPECT_EQ(m.files[0].max_seq, 1u);
+  EXPECT_EQ(m.files[1].min_seq, 2u) << "the output covers exactly the merged run 2..4";
+  EXPECT_EQ(m.files[1].max_seq, 4u);
+  for (uint64_t n = 1; n <= 4; ++n) EXPECT_NE(m.files[1].file_number, n) << "output numbers come from the shared counter";
+  EXPECT_LT(m.files[1].file_number, m.next_file_number);
+  EXPECT_EQ(FileBytes(table1), table1_bytes) << "the large table must not be rewritten";
+  EXPECT_EQ(Files(".sst").size(), 2u) << "the three merged inputs are deleted";
+  EXPECT_EQ(TableGet(m.files[1].file_number, "k"), SSTable::GetResult::kDeleted)
+      << "the tombstone must be kept: the run does not start at the oldest table";
+
+  auto check = [&](const char* when) {
+    EXPECT_EQ(Get("k"), "<absent>") << when;
+    EXPECT_EQ(Get("a0005"), "new") << when;
+    EXPECT_EQ(Get("a0006"), "old") << when;
+    EXPECT_EQ(Get("b0003"), "two") << when;
+    EXPECT_EQ(Get("c0009"), "three") << when;
+    EXPECT_EQ(Get("d0000"), "four") << when;
+  };
+  check("after compaction");
+  ASSERT_EQ(Open(Opts(4)), Status::kOk);
+  check("after a restart");
+  EXPECT_EQ(Manifest().files.size(), 2u);
+}
+
+// Tables of similar size: no run of newer tables is as small as the table before it, so the policy
+// merges everything. That run starts at the oldest table, so the tombstone and every older version
+// of its key are dropped (C7).
+TEST_F(LsmTest, CompactionOfAllTablesDropsTombstonesAndOlderVersions) {
+  std::vector<Entry> t1 = Rows("a", 10, "one");
+  t1.push_back(Entry{"k", "v1", false});
+  std::vector<Entry> t2 = Rows("b", 10, "two");
+  t2.push_back(Entry{"k", "v2", false});
+  std::vector<Entry> t3 = Rows("c", 10, "three");
+  t3.push_back(Entry{"k", "", true});
+  BuildTables({t1, t2, t3, Rows("d", 10, "four")});
+
+  ASSERT_EQ(Open(Opts(4)), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compactions_done >= 1; }));
+  WaitUntilCompactionIdle(4);
+  const ManifestState m = Manifest();
+  ASSERT_EQ(m.files.size(), 1u);
+  EXPECT_EQ(m.files[0].min_seq, 1u);
+  EXPECT_EQ(m.files[0].max_seq, 4u);
+  EXPECT_EQ(TableGet(m.files[0].file_number, "k"), SSTable::GetResult::kAbsent)
+      << "with nothing older left, the tombstone and the values it hid are dropped";
+  EXPECT_EQ(Get("k"), "<absent>");
+  EXPECT_EQ(Get("a0000"), "one");
+  EXPECT_EQ(Get("d0009"), "four");
+  ASSERT_EQ(Open(Opts(4)), Status::kOk);
+  EXPECT_EQ(Get("k"), "<absent>") << "a delete must stay deleted after compaction and restart";
+  EXPECT_EQ(Get("b0005"), "two");
+}
+
+// The trigger: nothing happens below it, 0 means never, it is a threshold (not an exact count), and
+// a value below 2 behaves as 2.
+TEST_F(LsmTest, CompactionStartsOnlyAtTheTriggerAndZeroMeansNever) {
+  BuildTables({Rows("a", 10, "1"), Rows("b", 10, "2"), Rows("c", 10, "3"), Rows("d", 10, "4"), Rows("e", 10, "5")});
+  for (size_t trigger : {size_t{0}, size_t{6}}) {
+    ASSERT_EQ(Open(Opts(trigger)), Status::kOk);
+    std::this_thread::sleep_for(150ms);
+    EXPECT_EQ(engine_->GetStats().compactions_done, 0u) << "trigger " << trigger;
+    EXPECT_EQ(engine_->GetStats().sstables, 5u) << "trigger " << trigger;
+    EXPECT_EQ(Manifest().files.size(), 5u) << "trigger " << trigger;
+  }
+  ASSERT_EQ(Open(Opts(5)), Status::kOk);  // exactly at the trigger
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compactions_done >= 1; }));
+  WaitUntilCompactionIdle(5);
+  EXPECT_EQ(Get("a0000"), "1");
+  EXPECT_EQ(Get("e0009"), "5");
+
+  ResetDir();
+  BuildTables({Rows("a", 10, "1"), Rows("b", 10, "2")});
+  ASSERT_EQ(Open(Opts(1)), Status::kOk);  // documented minimum is 2: two tables are enough
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compactions_done >= 1; }));
+  WaitUntilCompactionIdle(2);
+  EXPECT_EQ(Manifest().files.size(), 1u);
+  EXPECT_EQ(Get("a0003"), "1");
+  EXPECT_EQ(Get("b0003"), "2");
+}
+
+// The two crash points of compaction, for a run that does NOT include the oldest table. Before the
+// manifest edit the old tables stay live and the output is an orphan; after it the output is live and
+// the replaced inputs are orphans. Either way the large table is untouched and nothing is lost.
+TEST_F(LsmTest, ACrashAtEitherStepOfAPartialCompactionRecoversTheRightTables) {
+  for (const std::string point : {"compact:after_output", "compact:after_manifest"}) {
+    SCOPED_TRACE(point);
+    ResetDir();
+    std::vector<Entry> t1 = Rows("a", 200, "old");
+    t1.push_back(Entry{"k", "old", false});
+    std::vector<Entry> t2 = Rows("b", 10, "two");
+    t2.push_back(Entry{"k", "", true});
+    BuildTables({t1, t2, Rows("c", 10, "three"), Rows("d", 10, "four")});
+    const std::string table1_bytes = FileBytes(dir_ + "/" + KVEngine::SstFileName(1));
+
+    std::atomic<bool> fired{false};
+    KVEngine::Options o = Opts(4);
+    o.test_crash_hook = [&](const char* p) { return std::string(p) == point && !fired.exchange(true); };
+    ASSERT_EQ(Open(o), Status::kOk);
+    ASSERT_TRUE(WaitFor([&] { return fired.load(); }));
+    engine_.reset();  // the process "died" there
+
+    const ManifestState m = Manifest();
+    EXPECT_EQ(Files(".sst").size(), 5u) << "four inputs plus one output are on disk";
+    if (point == "compact:after_output") {
+      ASSERT_EQ(m.files.size(), 4u) << "the edit never happened: the old tables are still the live set";
+    } else {
+      ASSERT_EQ(m.files.size(), 2u) << "the edit happened: table 1 and the output";
+      EXPECT_EQ(m.files[0].file_number, 1u);
+      EXPECT_EQ(m.files[1].min_seq, 2u);
+      EXPECT_EQ(m.files[1].max_seq, 4u);
+    }
+    ASSERT_EQ(Open(Opts(0)), Status::kOk);
+    EXPECT_EQ(Files(".sst").size(), m.files.size()) << "startup deletes whatever the manifest does not list";
+    EXPECT_EQ(FileBytes(dir_ + "/" + KVEngine::SstFileName(1)), table1_bytes);
+    EXPECT_EQ(Get("k"), "<absent>");
+    EXPECT_EQ(Get("a0100"), "old");
+    EXPECT_EQ(Get("c0001"), "three");
+    EXPECT_EQ(Get("d0009"), "four");
+  }
+}
+
+// A compaction that keeps failing (here its output cannot be written: RLIMIT_FSIZE) must leave the
+// live set, the manifest and every input as they were, publish nothing, keep counting failures and
+// retrying, and succeed once writing works again.
+TEST_F(LsmTest, AFailingCompactionKeepsItsInputsLiveAndPublishesNothing) {
+  const std::string big(100, 'x');
+  BuildTables({Rows("a", 400, big), Rows("b", 40, big), Rows("c", 40, big), Rows("d", 40, big)});
+  const ManifestState before = Manifest();
+
+  struct FileSizeLimit {  // restores the limit even if an assertion below fails
+    struct rlimit original;
+    explicit FileSizeLimit(rlim_t bytes) {
+      std::signal(SIGXFSZ, SIG_IGN);  // exceeding the limit then fails write() with EFBIG
+      getrlimit(RLIMIT_FSIZE, &original);
+      struct rlimit tiny = {bytes, original.rlim_max};
+      setrlimit(RLIMIT_FSIZE, &tiny);
+    }
+    void Lift() { setrlimit(RLIMIT_FSIZE, &original); }
+    ~FileSizeLimit() { Lift(); }
+  } limit(4096);  // far smaller than the ~12 KB output of merging tables 2..4
+
+  ASSERT_EQ(Open(Opts(4)), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compaction_failures >= 3; }));
+  const auto s = engine_->GetStats();
+  EXPECT_EQ(s.compactions_done, 0u);
+  EXPECT_EQ(s.sstables, 4u);
+  const ManifestState during = Manifest();
+  ASSERT_EQ(during.files.size(), before.files.size());
+  for (size_t i = 0; i < before.files.size(); ++i) EXPECT_EQ(during.files[i].file_number, before.files[i].file_number);
+  std::set<std::string> on_disk;
+  for (const auto& n : Files(".sst")) on_disk.insert(n);
+  EXPECT_EQ(on_disk, (std::set<std::string>{KVEngine::SstFileName(1), KVEngine::SstFileName(2),
+                                            KVEngine::SstFileName(3), KVEngine::SstFileName(4)}))
+      << "no output may be published, and no input may be deleted";
+  EXPECT_EQ(Get("a0399"), big);
+  EXPECT_EQ(Get("d0039"), big);
+
+  limit.Lift();
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compactions_done >= 1; }));
+  WaitUntilCompactionIdle(4);
+  EXPECT_EQ(Manifest().files.size(), 2u);
+  EXPECT_EQ(Manifest().files[0].file_number, 1u);
+  EXPECT_EQ(Get("a0399"), big);
+  EXPECT_EQ(Get("b0000"), big);
+}
+
+// The manifest store at the commit point fails BEFORE its rename (MANIFEST.tmp cannot be created: a
+// non-empty directory has that name, which startup cleanup cannot remove either). The manifest in the
+// directory is then still the old one and names no output, so the output is deleted rather than left
+// behind by every retry. The live set, the read view, the manifest and the inputs stay as they were,
+// and the compaction completes once storing works again. (A store that fails AFTER its rename cannot
+// be injected here; the two states it can leave are the two crash-point states tested above.)
+TEST_F(LsmTest, AManifestStoreThatFailsBeforeItsRenameKeepsEverythingAndLeavesNoOutput) {
+  std::vector<Entry> t1 = Rows("a", 200, "old");
+  t1.push_back(Entry{"k", "old", false});
+  std::vector<Entry> t2 = Rows("b", 10, "two");
+  t2.push_back(Entry{"k", "", true});
+  BuildTables({t1, t2, Rows("c", 10, "three"), Rows("d", 10, "four")});  // sizes 201, 11, 10, 10
+  const std::string manifest_before = FileBytes(dir_ + "/MANIFEST");
+  const std::string blocker = dir_ + "/MANIFEST.tmp";
+  fs::create_directories(blocker);
+  { std::ofstream(blocker + "/keep") << "x"; }
+
+  KVEngine::Options o = Opts(4);
+  o.flush_retry_ms = 300;  // a quiet window after each failure in which nothing is in flight
+  ASSERT_EQ(Open(o), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compaction_failures >= 2; }));
+  // GetStats takes the engine lock, and a failure is counted and cleaned up under that lock, so the
+  // second attempt is fully over here and the next one is still about 300 ms away.
+  const auto s = engine_->GetStats();
+  EXPECT_EQ(s.compactions_done, 0u);
+  EXPECT_EQ(s.sstables, 4u) << "the live set must not change";
+  EXPECT_EQ(FileBytes(dir_ + "/MANIFEST"), manifest_before) << "the old manifest is untouched";
+  std::set<std::string> on_disk;
+  for (const auto& n : Files(".sst")) on_disk.insert(n);
+  EXPECT_EQ(on_disk, (std::set<std::string>{KVEngine::SstFileName(1), KVEngine::SstFileName(2),
+                                            KVEngine::SstFileName(3), KVEngine::SstFileName(4)}))
+      << "inputs kept; an output no manifest names is deleted, not accumulated by retries";
+  EXPECT_EQ(Get("k"), "<absent>");
+  EXPECT_EQ(Get("a0100"), "old");
+  EXPECT_EQ(Get("d0009"), "four");
+
+  fs::remove_all(blocker);
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compactions_done >= 1; }));
+  WaitUntilCompactionIdle(4);
+  const ManifestState m = Manifest();
+  ASSERT_EQ(m.files.size(), 2u);
+  EXPECT_EQ(m.files[0].file_number, 1u);
+  EXPECT_EQ(Files(".sst").size(), 2u);
+  EXPECT_EQ(Get("k"), "<absent>");
+  ASSERT_EQ(Open(Opts(0)), Status::kOk);
+  EXPECT_EQ(Get("k"), "<absent>");
+  EXPECT_EQ(Get("c0005"), "three");
+}
+
+// Many flush/compaction cycles through the real write path: reads always match a model, the live
+// set on disk always matches the manifest, the engine settles below the trigger each time instead of
+// spinning, and the applied index survives. Each compaction removes at least one table and each flush
+// adds one, so since the last Open (which resets the counters and starts with at most trigger - 1 = 3
+// tables, because the previous engine had settled) compactions can exceed flushes by at most 3.
+TEST_F(LsmTest, RepeatedFlushAndCompactionCyclesStayCorrectAndSettle) {
+  ASSERT_EQ(Open(Opts(4)), Status::kOk);
+  std::map<std::string, std::string> model;
+  uint64_t index = 0;
+  auto check = [&](const std::string& when) {
+    for (int i = 0; i < 80; ++i) {
+      auto it = model.find(Key(i));
+      ASSERT_EQ(Get(Key(i)), it == model.end() ? "<absent>" : it->second) << when << " " << Key(i);
+    }
+    ASSERT_EQ(engine_->AppliedIndex(), index) << when;
+  };
+  for (int round = 0; round < 25; ++round) {
+    for (int i = 0; i < 40; ++i) {
+      const int key = (round * 37 + i * 11) % 80;
+      if ((round + i) % 9 == 0) {
+        Write(Key(key), "", ++index, true);
+        model.erase(Key(key));
+      } else {
+        const std::string v = "r" + std::to_string(round) + "-" + std::to_string(i) + std::string(70, 'v');
+        Write(Key(key), v, ++index);
+        model[Key(key)] = v;
+      }
+    }
+    Settle();
+    WaitUntilCompactionIdle(4);
+    const auto s = engine_->GetStats();
+    ASSERT_LE(s.compactions_done, s.flushes_done + 3) << "round " << round;
+    ASSERT_EQ(Manifest().files.size(), s.sstables) << "round " << round;
+    check("round " + std::to_string(round));
+    if (round % 8 == 7) {
+      ASSERT_EQ(Open(Opts(4)), Status::kOk);
+      check("after a restart in round " + std::to_string(round));
+    }
+  }
+  EXPECT_GE(engine_->GetStats().compactions_done + engine_->GetStats().flushes_done, 1u);
 }

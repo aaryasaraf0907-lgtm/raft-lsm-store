@@ -52,6 +52,38 @@ bool DecodeIndex(const std::string& bytes, uint64_t* index) {
   return true;
 }
 
+// The compaction policy. `sizes` are the live SSTables' sizes, oldest first (at least two). Returns
+// how many of the NEWEST tables to merge: the smallest k >= 2 whose combined size is no larger than
+// the table just older than them, or all of them if there is no such k. So a large old table is not
+// rewritten just to absorb a few small new ones; it is merged once the newer data has grown as large
+// as it. The run is always a contiguous run of the newest tables (rule C5), and it includes the
+// oldest table, which is what allows dropping tombstones (C7), only when k is everything.
+size_t NewestRunToCompact(const std::vector<uint64_t>& sizes) {
+  const size_t n = sizes.size();
+  uint64_t run = sizes[n - 1];
+  for (size_t k = 2; k < n; ++k) {
+    run += sizes[n - k];  // the k newest tables
+    if (run <= sizes[n - k - 1]) return k;
+  }
+  return n;
+}
+
+// After StoreManifest failed: can a manifest that might survive a crash name file `file_number`?
+// StoreManifest's error does not say whether its rename happened (the directory fsync after it can
+// still fail). Every manifest store is made under write_mu_, which the caller holds, so the MANIFEST
+// now in the directory is either the old one or the one that just failed. If it does not name the
+// file, the rename never happened and no manifest, old or new, refers to it. If it names the file, or
+// cannot be read, the answer is "maybe".
+bool ManifestMayName(const std::string& dir, uint64_t file_number) {
+  ManifestState current;
+  bool found = false;
+  if (LoadManifest(dir, &current, &found) != Status::kOk) return true;
+  for (const SSTableMeta& f : current.files) {
+    if (f.file_number == file_number) return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 std::string KVEngine::WalFileName(uint64_t seq) {
@@ -636,21 +668,39 @@ void KVEngine::FlushLoop() {
   }
 }
 
-// Merges the live SSTables into one when there are too many (SSTable mode).
+// Merges a run of the newest live SSTables when there are too many (SSTable mode). Which run is the
+// policy above (NewestRunToCompact), sized by each table's entry count.
 //   1. Compact() writes the merged output (published atomically); inputs are untouched
-//   2. store the manifest with the inputs removed and the output added   <- the commit point
+//   2. store the manifest with the inputs replaced by the output, in their place   <- the commit point
 //   3. delete the input files (readers that already hold them keep reading them)
 // A crash before 2 leaves an output the manifest does not know (startup deletes it); a crash between
-// 2 and 3 leaves input files the manifest no longer lists (startup deletes them). The run always
-// starts at the oldest live file, so dropping tombstones is safe (rule C7): nothing older exists.
+// 2 and 3 leaves input files the manifest no longer lists (startup deletes them). Tombstones are
+// dropped only when the run starts at the oldest live file (rule C7): then nothing older exists that
+// a dropped tombstone could have been hiding. Otherwise they are kept.
+//
+// If step 2 fails, the in-memory live set and the read view stay exactly as they were, and nothing
+// that a surviving manifest could need is deleted. StoreManifest may fail AFTER renaming the new
+// manifest into place (its directory fsync failed), so after a crash either manifest can be the one
+// found. The inputs are never deleted on failure; the output is deleted only if the manifest in the
+// directory does not name it (ManifestMayName). Otherwise it is kept, and recovery works either way:
+// with the new manifest, the output is live and the inputs are orphans (the same state as the crash
+// point "compact:after_manifest"); with the old one, the inputs are live and the output is an orphan
+// (as at "compact:after_output"). Startup deletes the orphans. A kept output becomes safe to delete
+// once a later compaction stores a manifest successfully, which is built from the in-memory state
+// and so does not name it.
 void KVEngine::CompactLoop() {
   const size_t trigger = std::max<size_t>(2, options_.compaction_trigger);
+  std::vector<std::string> unsettled;  // outputs kept after a failed manifest store (see above)
   std::unique_lock<std::mutex> lock(write_mu_);
   for (;;) {
     cv_.wait(lock, [&] { return stop_ || dead_ || sstables_.size() >= trigger; });
     if (stop_ || dead_) return;
     const size_t n = sstables_.size();
-    std::vector<std::shared_ptr<SSTable>> inputs(sstables_.begin(), sstables_.begin() + static_cast<std::ptrdiff_t>(n));
+    std::vector<uint64_t> sizes;
+    for (const auto& t : sstables_) sizes.push_back(std::max<uint64_t>(1, t->entry_count()));
+    const size_t k = NewestRunToCompact(sizes);
+    const size_t first = n - k;  // position of the oldest input in sstables_ / manifest_.files
+    std::vector<std::shared_ptr<SSTable>> inputs(sstables_.begin() + static_cast<std::ptrdiff_t>(first), sstables_.end());
     const std::vector<SSTableMeta> live = manifest_.files;
     const uint64_t out_number = next_seq_++;  // same counter as the WAL sequence numbers
     const uint64_t epoch = epoch_;
@@ -659,7 +709,7 @@ void KVEngine::CompactLoop() {
     std::vector<const SSTable*> raw;
     for (const auto& t : inputs) raw.push_back(t.get());
     CompactionOptions co;
-    co.drop_tombstones = true;
+    co.drop_tombstones = first == 0;  // C7: only a run that starts at the oldest live file
     co.builder.bits_per_key = options_.bloom_bits_per_key;
     CompactionResult result;
     const std::string out_path = Path(SstFileName(out_number));
@@ -679,32 +729,52 @@ void KVEngine::CompactLoop() {
       continue;
     }
     bool installed = false;
-    if (s == Status::kOk) {
+    bool store_failed = false;
+    // Flushes may have appended newer tables in the meantime. They only ever append, so the run is
+    // still at [first, first + k); check that rather than assume it before editing the live set.
+    bool run_in_place = first + k <= sstables_.size() && sstables_.size() == manifest_.files.size();
+    for (size_t i = 0; run_in_place && i < k; ++i) {
+      run_in_place = sstables_[first + i] == inputs[i] &&
+                     manifest_.files[first + i].file_number == inputs[i]->meta().file_number;
+    }
+    if (s == Status::kOk && run_in_place) {
+      const auto at = static_cast<std::ptrdiff_t>(first);
+      const auto end = static_cast<std::ptrdiff_t>(first + k);
       ManifestState next = manifest_;
-      next.files.erase(next.files.begin(), next.files.begin() + static_cast<std::ptrdiff_t>(n));  // the oldest n
-      next.files.insert(next.files.begin(), result.output);
+      next.files.erase(next.files.begin() + at, next.files.begin() + end);  // the run, replaced in place
+      next.files.insert(next.files.begin() + at, result.output);
       next.next_file_number = std::max(next.next_file_number, next_seq_);
       s = StoreManifest(options_.dir, next);
       if (s == Status::kOk) {
         manifest_ = std::move(next);
-        sstables_.erase(sstables_.begin(), sstables_.begin() + static_cast<std::ptrdiff_t>(n));
-        sstables_.insert(sstables_.begin(), output);
+        sstables_.erase(sstables_.begin() + at, sstables_.begin() + end);
+        sstables_.insert(sstables_.begin() + at, output);
         ++compactions_done_;
         installed = true;
         PublishView();
         cv_.notify_all();
         if (CrashPoint("compact:after_manifest")) return;  // inputs not deleted yet
+      } else {
+        store_failed = true;  // manifest_, sstables_ and the view are untouched
       }
     }
     if (installed) {
+      // The manifest just made durable names neither the inputs nor any output kept earlier.
+      std::vector<std::string> doomed;
+      doomed.swap(unsettled);
+      for (const auto& t : inputs) doomed.push_back(Path(SstFileName(t->meta().file_number)));
       lock.unlock();
       std::error_code ec;
-      for (const auto& t : inputs) std::filesystem::remove(Path(SstFileName(t->meta().file_number)), ec);
+      for (const auto& p : doomed) std::filesystem::remove(p, ec);
       lock.lock();
     } else {
       ++compaction_failures_;
-      std::error_code ec;
-      std::filesystem::remove(out_path, ec);  // an output that never committed
+      if (store_failed && ManifestMayName(options_.dir, out_number)) {
+        unsettled.push_back(out_path);  // a surviving manifest may need it: keep it
+      } else {
+        std::error_code ec;
+        std::filesystem::remove(out_path, ec);  // no manifest refers to this output
+      }
       cv_.wait_for(lock, std::chrono::milliseconds(options_.flush_retry_ms), [&] { return stop_ || dead_; });
     }
   }
