@@ -19,6 +19,7 @@
 #include <thread>
 #include <vector>
 
+#include "storage/checkpoint.h"
 #include "storage/kv_engine.h"
 #include "storage/manifest.h"
 #include "storage/sstable.h"
@@ -155,7 +156,9 @@ class LsmTest : public ::testing::Test {
     EXPECT_EQ(SSTable::Open(dir_ + "/" + KVEngine::SstFileName(file_number), file_number, &t), Status::kOk);
     SSTable::GetResult r = SSTable::GetResult::kAbsent;
     std::string v;
-    if (t != nullptr) EXPECT_EQ(t->Get(key, &r, &v), Status::kOk);
+    if (t != nullptr) {
+      EXPECT_EQ(t->Get(key, &r, &v), Status::kOk);
+    }
     return r;
   }
   std::string FileBytes(const std::string& path) {
@@ -314,7 +317,13 @@ TEST_F(LsmTest, ACrashBeforeTheWalIsDeletedRetiresItInsteadOfReplayingIt) {
   for (int i = 0; i < written; ++i) ASSERT_EQ(Get(Key(i)), "value" + std::string(90, 'x')) << "write " << i;
 }
 
-TEST_F(LsmTest, CompactionMergesIntoOneTableAndDropsTombstones) {
+// Overwrites and deletes spread over many flushes, with compaction running underneath. Whatever runs
+// the policy picks, reads must match the model before and after a restart (deleted keys included),
+// and the live set on disk must match the manifest once compaction is idle. The one tombstone rule
+// that can be checked from the outside: a compaction output at the oldest position (its range spans
+// several flushes) was produced by a run starting at the oldest live table, so it holds no tombstone
+// (C7). A single flushed table at that position may hold tombstones, so it is not checked.
+TEST_F(LsmTest, CompactionKeepsReadsCorrectAndDropsTombstonesOnlyFromARunAtTheOldestTable) {
   ASSERT_EQ(Open(Opts(/*compaction_trigger=*/4)), Status::kOk);
   std::map<std::string, std::string> model;
   for (int round = 0; round < 8; ++round) {  // overwrites and deletes spread over many flushes
@@ -332,22 +341,27 @@ TEST_F(LsmTest, CompactionMergesIntoOneTableAndDropsTombstones) {
   }
   Settle();
   ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compactions_done >= 1; }));
-  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().sstables < 4; }));
-  for (int i = 0; i < 50; ++i) {
-    auto it = model.find(Key(i));
-    ASSERT_EQ(Get(Key(i)), it == model.end() ? "<absent>" : it->second) << Key(i);
-  }
-  // Wait until the live set is down to one table, then look inside it: no tombstone may remain.
-  ASSERT_TRUE(WaitFor([&] {
-    auto s = engine_->GetStats();
-    return s.sstables == 1 || (s.sstables < 4 && s.frozen_memtables == 0 && s.compactions_done >= 2);
-  }));
+  WaitUntilCompactionIdle(4);  // below the trigger, nothing to flush, replaced inputs deleted
+  auto check = [&](const char* when) {
+    for (int i = 0; i < 50; ++i) {
+      auto it = model.find(Key(i));
+      ASSERT_EQ(Get(Key(i)), it == model.end() ? "<absent>" : it->second) << Key(i) << " " << when;
+    }
+  };
+  check("after compaction");
   const ManifestState m = Manifest();
   ASSERT_FALSE(m.files.empty());
-  std::unique_ptr<SSTable> oldest;
-  ASSERT_EQ(SSTable::Open(dir_ + "/" + KVEngine::SstFileName(m.files[0].file_number), m.files[0].file_number, &oldest), Status::kOk);
-  for (auto it = oldest->NewIterator(); it->Valid(); it->Next()) EXPECT_FALSE(it->Current().tombstone) << it->Current().key;
-  EXPECT_EQ(Files(".sst").size(), m.files.size()) << "compaction inputs must be deleted";
+  EXPECT_EQ(m.files.size(), engine_->GetStats().sstables) << "the manifest is the live set";
+  EXPECT_EQ(Files(".sst").size(), m.files.size()) << "no replaced input or orphan output is left";
+  if (m.files[0].min_seq < m.files[0].max_seq) {  // a compaction output at the oldest position
+    std::unique_ptr<SSTable> oldest;
+    ASSERT_EQ(SSTable::Open(dir_ + "/" + KVEngine::SstFileName(m.files[0].file_number), m.files[0].file_number, &oldest), Status::kOk);
+    for (auto it = oldest->NewIterator(); it->Valid(); it->Next()) {
+      EXPECT_FALSE(it->Current().tombstone) << it->Current().key;
+    }
+  }
+  ASSERT_EQ(Open(Opts(4)), Status::kOk);
+  check("after a restart");
 }
 
 // Crash after the merged output is published but before the manifest swaps it in: the old files are
@@ -808,6 +822,169 @@ TEST_F(LsmTest, AManifestStoreThatFailsBeforeItsRenameKeepsEverythingAndLeavesNo
   ASSERT_EQ(Open(Opts(0)), Status::kOk);
   EXPECT_EQ(Get("k"), "<absent>");
   EXPECT_EQ(Get("c0005"), "three");
+}
+
+// The ambiguous case: the commit-point store reports failure AFTER the new manifest is in place
+// (seam "compact:fail_after_manifest_rename", standing for a directory fsync that failed after the
+// rename). The running engine must keep its old live set and view, keep every input, and keep the
+// output, because the manifest in the directory names it. The retry then succeeds, and its durable
+// manifest names neither the inputs nor the kept output, so both are deleted. This fails if the
+// output were deleted after the failed store, or if the kept output were never cleaned up.
+TEST_F(LsmTest, AnAmbiguousManifestStoreKeepsTheOutputItNamesAndCleansItUpAfterTheRetry) {
+  std::vector<Entry> t1 = Rows("a", 200, "old");
+  t1.push_back(Entry{"k", "old", false});
+  std::vector<Entry> t2 = Rows("b", 10, "two");
+  t2.push_back(Entry{"k", "", true});
+  BuildTables({t1, t2, Rows("c", 10, "three"), Rows("d", 10, "four")});  // sizes 201, 11, 10, 10
+
+  std::atomic<int> injected{0};
+  KVEngine::Options o = Opts(4);
+  o.flush_retry_ms = 300;  // a quiet window after the failure in which nothing is in flight
+  o.test_crash_hook = [&](const char* p) {
+    return std::string(p) == "compact:fail_after_manifest_rename" && injected.fetch_add(1) == 0;
+  };
+  ASSERT_EQ(Open(o), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compaction_failures >= 1; }));
+  // A failure is counted and handled under the engine lock, which GetStats takes: it is over here.
+  const auto s = engine_->GetStats();
+  EXPECT_EQ(s.compactions_done, 0u);
+  EXPECT_EQ(s.sstables, 4u) << "the in-memory live set must not take the failed edit";
+  const ManifestState on_disk = Manifest();
+  ASSERT_EQ(on_disk.files.size(), 2u) << "the failed store's manifest is in place: table 1 and the output";
+  const uint64_t kept = on_disk.files[1].file_number;
+  const std::string kept_path = dir_ + "/" + KVEngine::SstFileName(kept);
+  EXPECT_TRUE(fs::exists(kept_path)) << "a manifest that may survive names the output: it must be kept";
+  for (uint64_t n = 1; n <= 4; ++n) {
+    EXPECT_TRUE(fs::exists(dir_ + "/" + KVEngine::SstFileName(n))) << "input " << n << " must be kept";
+  }
+  EXPECT_EQ(Get("k"), "<absent>");
+  EXPECT_EQ(Get("a0100"), "old");
+  EXPECT_EQ(Get("d0009"), "four");
+
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compactions_done >= 1; }));  // the retry
+  ASSERT_TRUE(WaitFor([&] { return Files(".sst").size() == 2; }))
+      << "after the successful retry the inputs and the kept output must all be deleted";
+  EXPECT_FALSE(fs::exists(kept_path));
+  const ManifestState m = Manifest();
+  ASSERT_EQ(m.files.size(), 2u);
+  EXPECT_EQ(m.files[0].file_number, 1u);
+  EXPECT_NE(m.files[1].file_number, kept) << "the retry wrote a new output under a new number";
+  EXPECT_EQ(Get("k"), "<absent>");
+  ASSERT_EQ(Open(Opts(0)), Status::kOk);
+  EXPECT_EQ(Files(".sst").size(), 2u);
+  EXPECT_EQ(Get("k"), "<absent>");
+  EXPECT_EQ(Get("a0100"), "old");
+  EXPECT_EQ(Get("c0005"), "three");
+}
+
+// A crash right after the ambiguous store (here: during the retry, once its new output is written).
+// After a real crash either manifest may be the one found, so both are tried:
+//  - the new one (the rename survived): it is on disk as left;
+//  - the old one (the rename was not yet durable): constructed by putting the old manifest back.
+// Either way startup must open, keep exactly the tables that manifest lists, delete the rest, and
+// return the right data. With the new manifest this needs the kept output: had it been deleted after
+// the failed store, startup would find a listed table missing.
+TEST_F(LsmTest, ACrashAfterAnAmbiguousManifestStoreRecoversWithEitherManifest) {
+  for (const bool new_manifest_survives : {true, false}) {
+    SCOPED_TRACE(new_manifest_survives ? "new manifest survives" : "old manifest survives");
+    ResetDir();
+    std::vector<Entry> t1 = Rows("a", 200, "old");
+    t1.push_back(Entry{"k", "old", false});
+    std::vector<Entry> t2 = Rows("b", 10, "two");
+    t2.push_back(Entry{"k", "", true});
+    BuildTables({t1, t2, Rows("c", 10, "three"), Rows("d", 10, "four")});
+    const std::string old_manifest = FileBytes(dir_ + "/MANIFEST");
+
+    std::atomic<int> stage{0};  // 0: before the store, 1: after the injected failure, 2: crashed
+    KVEngine::Options o = Opts(4);
+    o.test_crash_hook = [&](const char* p) {
+      const std::string point(p);
+      if (point == "compact:fail_after_manifest_rename" && stage == 0) {
+        stage = 1;
+        return true;  // the store "fails" after its rename
+      }
+      if (point == "compact:after_output" && stage == 1) {
+        stage = 2;
+        return true;  // crash during the retry, once its output is written
+      }
+      return false;
+    };
+    ASSERT_EQ(Open(o), Status::kOk);
+    ASSERT_TRUE(WaitFor([&] { return stage.load() == 2; }));
+    engine_.reset();  // the process "died" there
+
+    const ManifestState left = Manifest();
+    ASSERT_EQ(left.files.size(), 2u) << "the failed store's manifest is in the directory";
+    const uint64_t kept = left.files[1].file_number;
+    EXPECT_TRUE(fs::exists(dir_ + "/" + KVEngine::SstFileName(kept)));
+    EXPECT_EQ(Files(".sst").size(), 6u) << "four inputs, the kept output and the retry's output";
+    if (!new_manifest_survives) {
+      std::ofstream out(dir_ + "/MANIFEST", std::ios::binary | std::ios::trunc);
+      out << old_manifest;
+    }
+
+    ASSERT_EQ(Open(Opts(0)), Status::kOk);
+    const ManifestState m = Manifest();
+    if (new_manifest_survives) {
+      ASSERT_EQ(m.files.size(), 2u);
+      EXPECT_EQ(m.files[0].file_number, 1u);
+      EXPECT_EQ(m.files[1].file_number, kept) << "the kept output is live";
+    } else {
+      ASSERT_EQ(m.files.size(), 4u) << "the four inputs are live";
+      EXPECT_FALSE(fs::exists(dir_ + "/" + KVEngine::SstFileName(kept))) << "the output is an orphan";
+    }
+    EXPECT_EQ(Files(".sst").size(), m.files.size()) << "startup deletes every table the manifest does not list";
+    EXPECT_EQ(Get("k"), "<absent>");
+    EXPECT_EQ(Get("a0100"), "old");
+    EXPECT_EQ(Get("b0003"), "two");
+    EXPECT_EQ(Get("c0001"), "three");
+    EXPECT_EQ(Get("d0009"), "four");
+  }
+}
+
+// A compaction still merging when a checkpoint replaces the dataset must not install its output
+// into the new dataset. The compactor is held at "compact:after_output" (the hook runs without the
+// engine lock) while InstallCheckpoint runs, then released; it must see the epoch change, discard
+// its output and leave the checkpoint's single table as the whole live set.
+TEST_F(LsmTest, ACompactionOverlappingACheckpointInstallIsDiscarded) {
+  BuildTables({Rows("a", 10, "1"), Rows("b", 10, "2"), Rows("c", 10, "3"), Rows("d", 10, "4")});
+  std::atomic<bool> reached{false}, release{false};
+  KVEngine::Options o = Opts(4);
+  o.test_crash_hook = [&](const char* p) {
+    if (std::string(p) == "compact:after_output" && !reached.exchange(true)) {
+      while (!release) std::this_thread::sleep_for(1ms);
+    }
+    return false;  // never a crash
+  };
+  ASSERT_EQ(Open(o), Status::kOk);
+  struct Release {  // never leave the compactor blocked, whatever happens below
+    std::atomic<bool>& flag;
+    ~Release() { flag = true; }
+  } release_guard{release};
+  ASSERT_TRUE(WaitFor([&] { return reached.load(); }));
+
+  std::string body;
+  AppendCheckpointEntry(&body, "ck", "cv");
+  ASSERT_EQ(engine_->InstallCheckpoint(CheckpointHeader(1) + body, 77), Status::kOk);
+  release = true;
+
+  // The stale output is deleted once the compactor resumes; the checkpoint's table is all that is left.
+  ASSERT_TRUE(WaitFor([&] { return Files(".sst").size() == 1; }));
+  const ManifestState m = Manifest();
+  ASSERT_EQ(m.files.size(), 1u);
+  EXPECT_EQ(Files(".sst")[0], KVEngine::SstFileName(m.files[0].file_number));
+  EXPECT_EQ(engine_->GetStats().compactions_done, 0u) << "the stale result must not be installed";
+  EXPECT_EQ(engine_->GetStats().compaction_failures, 0u)
+      << "the epoch check discards it as stale; it is not a failed compaction to be retried";
+  EXPECT_EQ(engine_->GetStats().sstables, 1u);
+  EXPECT_EQ(Get("ck"), "cv");
+  EXPECT_EQ(Get("a0000"), "<absent>") << "the old dataset is gone";
+  EXPECT_EQ(engine_->AppliedIndex(), 77u);
+  ASSERT_EQ(Open(Opts(4)), Status::kOk);
+  EXPECT_EQ(Manifest().files.size(), 1u);
+  EXPECT_EQ(Get("ck"), "cv");
+  EXPECT_EQ(Get("d0009"), "<absent>");
+  EXPECT_EQ(engine_->AppliedIndex(), 77u);
 }
 
 // Many flush/compaction cycles through the real write path: reads always match a model, the live

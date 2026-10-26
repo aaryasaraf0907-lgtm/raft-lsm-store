@@ -161,3 +161,44 @@ TEST_F(ManifestTest, ADamagedManifestOnDiskIsCorruptionNotAnEmptyDatabase) {
 TEST_F(ManifestTest, StoreToAMissingDirectoryFailsCleanly) {
   EXPECT_EQ(StoreManifest(dir_ + "/does-not-exist", Sample()), Status::kIOError);
 }
+
+// The test-only fault after the rename (standing for a failed directory fsync): StoreManifest must
+// report kIOError, yet the manifest in the directory is already the NEW one. This is the ambiguous
+// outcome callers have to handle. The hook runs only once the rename has happened.
+TEST_F(ManifestTest, AFailureAfterTheRenameIsReportedWithTheNewManifestAlreadyInPlace) {
+  ManifestState a = Sample(), b;
+  b.next_file_number = 31;
+  b.flushed_through = 30;
+  b.files = {SSTableMeta{25, 1, 30}};
+  ASSERT_EQ(StoreManifest(dir_, a), Status::kOk);
+  int calls = 0;
+  bool new_manifest_was_visible_in_the_hook = false;
+  EXPECT_EQ(StoreManifest(dir_, b, [&] {
+              ++calls;
+              ManifestState now;
+              bool found = false;
+              new_manifest_was_visible_in_the_hook =
+                  LoadManifest(dir_, &now, &found) == Status::kOk && found && now.files.size() == 1;
+              return true;
+            }),
+            Status::kIOError);
+  EXPECT_EQ(calls, 1);
+  EXPECT_TRUE(new_manifest_was_visible_in_the_hook) << "the hook must run after the rename";
+  ManifestState got;
+  bool found = false;
+  ASSERT_EQ(LoadManifest(dir_, &got, &found), Status::kOk);
+  ASSERT_EQ(got.files.size(), 1u) << "after the reported failure the directory holds the new manifest";
+  EXPECT_EQ(got.files[0].file_number, 25u);
+  EXPECT_FALSE(fs::exists(ManifestPath(dir_) + ".tmp"));
+
+  // A hook that returns false changes nothing; a failure before the rename never calls the hook.
+  EXPECT_EQ(StoreManifest(dir_, a, [] { return false; }), Status::kOk);
+  calls = 0;
+  EXPECT_EQ(StoreManifest(dir_ + "/does-not-exist", b,
+                          [&] {
+                            ++calls;
+                            return true;
+                          }),
+            Status::kIOError);
+  EXPECT_EQ(calls, 0);
+}
