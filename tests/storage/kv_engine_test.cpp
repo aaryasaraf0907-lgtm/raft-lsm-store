@@ -38,7 +38,7 @@ class KVEngineTest : public ::testing::Test {
     std::string v;
     return s.Get(k, &v) == Status::kOk ? v : "<none>";
   }
-  std::string WalPath() { return dir_ + "/wal.log"; }
+  std::string WalPath() { return dir_ + "/wal-000001.log"; }
 
   std::string dir_;
 };
