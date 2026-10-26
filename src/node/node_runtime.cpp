@@ -67,9 +67,19 @@ void NodeRuntime::Start() {
     if (p.first != options_.id && !p.second.empty()) peer_addresses.insert(p);
   }
   transport_ = std::make_unique<GrpcTransport>(options_.raft_listen, std::move(peer_addresses));
-  node_ = std::make_unique<RaftNodeImpl>(options_.id, peer_ids, transport_.get(), options_.raft,
+  RaftConfig raft_config = options_.raft;
+  if (options_.use_sstables) {  // only the LSM engine can checkpoint its data
+    raft_config.snapshot_threshold_entries = options_.snapshot_threshold_entries;
+    raft_config.snapshot_trailing_entries = options_.snapshot_trailing_entries;
+  }
+  node_ = std::make_unique<RaftNodeImpl>(options_.id, peer_ids, transport_.get(), raft_config,
                                          storage_.get());
   node_->SetApplyCallback(machine_->AsCallback());
+  if (options_.use_sstables) {
+    KVStateMachine* machine = machine_.get();
+    node_->SetSnapshotCallbacks([machine] { return machine->TakeSnapshot(); },
+                                [machine](const std::string& bytes) { machine->RestoreSnapshot(bytes); });
+  }
 
   service_ = std::make_unique<ClientService>(node_.get(), engine_.get(), machine_.get());
   RaftNodeImpl* node = node_.get();

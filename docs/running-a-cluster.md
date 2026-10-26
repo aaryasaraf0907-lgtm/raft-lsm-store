@@ -91,15 +91,20 @@ throughput and p50/p95/p99 latency. Numbers depend heavily on fsync: compare wit
 | `--data-dir DIR` | Raft log and storage engine files |
 | `--no-sync` | no fsync (testing only) |
 | `--memtable-bytes N`, `--compaction-trigger N` | flush size of a memtable (default 4 MiB) and how many SSTables trigger a merge (default 4; 0 = never) |
+| `--snapshot-threshold N`, `--snapshot-trailing N` | snapshot the data and drop the Raft log every N applied entries (default 10000; 0 = never) and how many log entries to keep below it (default 100) |
 | `--no-sstables` | use the old WAL + memtable engine instead of the LSM engine (the default) |
 | `--no-prevote` | turn PreVote off |
 | `--heartbeat-ms N`, `--election-ms MIN,MAX` | timing (defaults 50 and 150,300) |
 
 ## Known limitations
 
-- **No snapshots on a real node yet.** The Raft layer supports snapshots and `InstallSnapshot` over
-  gRPC (tested with an in-memory state machine), but the storage engine cannot export its data yet, so
-  `raftkv_node` runs with snapshots off. The Raft log therefore grows without bound, and a restarting
-  node replays all of it. This lifts once the engine can write a checkpoint.
-- The cluster membership is fixed when the nodes start.
+- **Snapshots need the LSM engine.** With `--no-sstables` the node cannot snapshot, so its Raft log
+  grows without bound. With the default engine, every `--snapshot-threshold` applied entries the node
+  snapshots its data (a merged copy of every live key plus the client-session table) and drops the
+  Raft log. A node that has no data, or is far behind, is sent the leader's snapshot in chunks. A
+  snapshot is built in memory, so its size is bounded by the node's RAM.
+- The cluster membership is fixed when the nodes start. In particular a node must keep its disk: one
+  that is wiped and returns under the same id breaks Raft's assumption that persisted state survives,
+  and a leader that believes the node had caught up cannot bring it back. Replacing a machine needs a
+  membership change (remove the old id, add a new one), which is not implemented.
 - Communication is unencrypted and unauthenticated: run it on a trusted network only.

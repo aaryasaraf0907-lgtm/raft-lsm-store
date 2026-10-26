@@ -8,6 +8,7 @@
 
 #include "raft/client_sessions.h"
 #include "raft/raft_interface.h"
+#include "storage/checkpoint.h"
 #include "storage/kv_store.h"
 
 namespace raftkv {
@@ -40,6 +41,9 @@ class KVStateMachine {
   // Preferred for an indexed store; overload resolution picks it automatically for a KVEngine.
   explicit KVStateMachine(IndexedKVStore* store)
       : store_(store), indexed_(store), replay_floor_(store->AppliedIndex()) {}
+  // A store that can also checkpoint (the real engine): enables TakeSnapshot / RestoreSnapshot.
+  explicit KVStateMachine(CheckpointableStore* store)
+      : store_(store), indexed_(store), replay_floor_(store->AppliedIndex()), checkpointable_(store) {}
 
   void Apply(const LogEntry& entry) {
     const Command& cmd = entry.command;
@@ -84,6 +88,56 @@ class KVStateMachine {
   }
 
   uint64_t Applied() const { return applied_.load(); }
+  // ---- Raft snapshots (RaftNodeImpl::SetSnapshotCallbacks) ----
+  // A snapshot is the store's whole dataset plus the client-session table (without it a node
+  // restored from a snapshot would apply retried writes a second time):
+  //   "RKVSNAP1" | u64 store_applied_index | u64 sessions_length | sessions | u64 data_length | data
+  // Both are called on the Raft apply thread, between applies, so they see a state in which exactly
+  // the entries up to the snapshot index have been applied. Failure is fatal, like any apply failure.
+  std::string TakeSnapshot() {
+    MustSucceed(checkpointable_ != nullptr, "this store cannot snapshot");
+    std::string data;
+    uint64_t index = 0;
+    MustSucceed(checkpointable_->Checkpoint(&data, &index) == Status::kOk, "checkpoint");
+    const std::string sessions = sessions_.Serialize();
+    std::string out = "RKVSNAP1";
+    PutU64(&out, index);
+    PutU64(&out, sessions.size());
+    out += sessions;
+    PutU64(&out, data.size());
+    out += data;
+    return out;
+  }
+
+  // Makes this state machine at least as new as the snapshot. The session table is always replaced.
+  // The store is only replaced if it is BEHIND the snapshot: a node restarting from its own
+  // snapshot already holds that state in its engine (and usually more), and must not rewrite its
+  // whole dataset on every start.
+  void RestoreSnapshot(const std::string& bytes) {
+    MustSucceed(checkpointable_ != nullptr, "this store cannot restore a snapshot");
+    size_t pos = 8;
+    MustSucceed(bytes.size() >= 8 && bytes.compare(0, 8, "RKVSNAP1") == 0, "snapshot header");
+    auto get64 = [&]() {
+      MustSucceed(bytes.size() - pos >= 8, "snapshot truncated");
+      uint64_t v = 0;
+      for (int i = 0; i < 8; ++i) v |= static_cast<uint64_t>(static_cast<uint8_t>(bytes[pos + static_cast<size_t>(i)])) << (8 * i);
+      pos += 8;
+      return v;
+    };
+    const uint64_t index = get64();
+    const uint64_t sessions_len = get64();
+    MustSucceed(bytes.size() - pos >= sessions_len, "snapshot sessions truncated");
+    const std::string sessions = bytes.substr(pos, static_cast<size_t>(sessions_len));
+    pos += static_cast<size_t>(sessions_len);
+    const uint64_t data_len = get64();
+    MustSucceed(bytes.size() - pos == data_len, "snapshot data length");
+    MustSucceed(sessions_.Restore(sessions), "snapshot sessions");
+    if (checkpointable_->AppliedIndex() < index) {
+      MustSucceed(checkpointable_->InstallCheckpoint(bytes.substr(pos), index) == Status::kOk, "install checkpoint");
+    }
+    replay_floor_ = checkpointable_->AppliedIndex();  // entries up to here are in the store already
+  }
+
   uint64_t DuplicatesSkipped() const { return duplicates_skipped_.load(); }
   // Store writes skipped because the store already held them (see the replay note above).
   uint64_t ReplaySkipped() const { return replay_skipped_.load(); }
@@ -120,12 +174,17 @@ class KVStateMachine {
   KVStore* store_;
   IndexedKVStore* indexed_ = nullptr;  // store_ again, if it is indexed
   uint64_t replay_floor_ = 0;
+  CheckpointableStore* checkpointable_ = nullptr;
   ClientSessionTable sessions_;
   mutable std::mutex outcomes_mutex_;
   std::map<LogIndex, RequestOutcome> request_outcomes_;
   std::atomic<uint64_t> applied_{0};
   std::atomic<uint64_t> duplicates_skipped_{0};
   std::atomic<uint64_t> replay_skipped_{0};
+
+  static void PutU64(std::string* s, uint64_t v) {
+    for (int i = 0; i < 8; ++i) s->push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
+  }
 };
 
 }  // namespace raftkv

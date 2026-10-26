@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <queue>
 #include <set>
 #include <system_error>
 
@@ -332,6 +333,171 @@ Status KVEngine::EnsureRoom(std::unique_lock<std::mutex>& lock) {
   }
 }
 
+namespace {
+
+class VectorIterator : public KVIterator {
+ public:
+  explicit VectorIterator(std::vector<Entry> v) : v_(std::move(v)) {}
+  bool Valid() const override { return i_ < v_.size(); }
+  void Next() override { ++i_; }
+  const Entry& Current() const override { return v_[i_]; }
+
+ private:
+  std::vector<Entry> v_;
+  size_t i_ = 0;
+};
+
+}  // namespace
+
+// Merges every memtable and SSTable, newest version of each key wins, tombstones and the engine's
+// own bookkeeping keys are left out. The active memtable is copied under the write lock so that
+// the copy and the applied index describe the same instant; everything else is immutable.
+Status KVEngine::Checkpoint(std::string* data, uint64_t* applied_index) {
+  std::vector<Entry> active_copy;
+  std::shared_ptr<const View> view;
+  uint64_t index = 0;
+  {
+    std::lock_guard<std::mutex> lock(write_mu_);
+    if (dead_) return Status::kIOError;
+    {
+      std::lock_guard<std::mutex> guard(view_mu_);
+      view = view_;
+    }
+    for (auto it = active_->NewIterator(); it.Valid(); it.Next()) active_copy.push_back(it.Current());
+    index = applied_index_.load();
+  }
+  std::vector<std::unique_ptr<KVIterator>> sources;  // newest first
+  sources.push_back(std::make_unique<VectorIterator>(std::move(active_copy)));
+  for (const auto& m : view->frozen) sources.push_back(std::make_unique<MemTable::Iterator>(m->NewIterator()));
+  for (const auto& t : view->sstables) sources.push_back(t->NewIterator());
+  // Only SSTable iterators can fail (a damaged block); a memtable cannot.
+  auto status_of = [&](size_t i) {
+    auto* sst = dynamic_cast<SSTable::Iterator*>(sources[i].get());
+    return sst != nullptr ? sst->status() : Status::kOk;
+  };
+  for (size_t i = 0; i < sources.size(); ++i) {
+    if (!sources[i]->Valid() && status_of(i) != Status::kOk) return status_of(i);
+  }
+  auto later = [&](size_t x, size_t y) {  // true if x should come out AFTER y
+    const std::string& kx = sources[x]->Current().key;
+    const std::string& ky = sources[y]->Current().key;
+    return kx != ky ? kx > ky : x > y;  // equal keys: the newer source (lower index) first
+  };
+  std::priority_queue<size_t, std::vector<size_t>, decltype(later)> heap(later);
+  for (size_t i = 0; i < sources.size(); ++i) {
+    if (sources[i]->Valid()) heap.push(i);
+  }
+  uint64_t count = 0;
+  std::string body;
+  while (!heap.empty()) {
+    const size_t top = heap.top();
+    heap.pop();
+    const Entry newest = sources[top]->Current();
+    auto advance = [&](size_t i) {
+      sources[i]->Next();
+      if (sources[i]->Valid()) heap.push(i);
+      return status_of(i);
+    };
+    Status s = advance(top);
+    while (s == Status::kOk && !heap.empty() && sources[heap.top()]->Current().key == newest.key) {
+      const size_t older = heap.top();
+      heap.pop();
+      s = advance(older);  // an older version of the same key: discard
+    }
+    if (s != Status::kOk) return s;
+    if (!newest.tombstone && !HasReservedKeyPrefix(newest.key)) {
+      AppendCheckpointEntry(&body, newest.key, newest.value);
+      ++count;
+    }
+  }
+  *data = CheckpointHeader(count) + body;
+  *applied_index = index;
+  return Status::kOk;
+}
+
+// Replaces the dataset. Order (the manifest edit is the commit point):
+//   1. write the new SSTable (all live keys + the applied index) -> an orphan until step 3
+//   2. create the new, empty WAL
+//   3. store the manifest: ONLY the new file, flushed_through above every old WAL
+//   4. switch the in-memory state, then delete the old WALs and SSTables
+// A crash before 3: startup deletes the orphan and keeps the old dataset. A crash after 3: startup
+// sees the new manifest, retires every old WAL (<= flushed_through) and deletes the old SSTables
+// (not listed). Flushes and compactions that were running notice the epoch change and discard
+// their results instead of installing them into the new dataset.
+Status KVEngine::InstallCheckpoint(const std::string& data, uint64_t applied_index) {
+  if (!options_.use_sstables) return Status::kInvalidArgument;
+  std::vector<std::pair<std::string, std::string>> pairs;
+  if (!ParseCheckpoint(data, &pairs)) return Status::kCorruption;
+  std::vector<Entry> entries;
+  entries.reserve(pairs.size() + 1);
+  const std::string index_key = AppliedIndexKey();
+  bool index_placed = false;
+  for (auto& p : pairs) {
+    if (!index_placed && index_key < p.first) {
+      entries.push_back(Entry{index_key, EncodeIndex(applied_index), false});
+      index_placed = true;
+    }
+    entries.push_back(Entry{std::move(p.first), std::move(p.second), false});
+  }
+  if (!index_placed) entries.push_back(Entry{index_key, EncodeIndex(applied_index), false});
+
+  std::unique_lock<std::mutex> lock(write_mu_);
+  if (dead_ || stop_) return Status::kIOError;
+  const uint64_t number = next_seq_++;
+  const SSTableMeta meta{number, number, number};
+  SSTableBuilderOptions bo;
+  bo.bits_per_key = options_.bloom_bits_per_key;
+  std::error_code ec;
+  std::filesystem::remove(Path(SstFileName(number)), ec);
+  VectorIterator source(std::move(entries));
+  Status s = WriteSSTable(Path(SstFileName(number)), meta, bo, &source);
+  std::unique_ptr<SSTable> opened;
+  if (s == Status::kOk) s = SSTable::Open(Path(SstFileName(number)), number, &opened);
+  if (s != Status::kOk) {
+    std::filesystem::remove(Path(SstFileName(number)), ec);
+    return s;
+  }
+  if (CrashPoint("install:after_sst")) return Status::kIOError;
+  const uint64_t wal_seq = next_seq_++;
+  std::unique_ptr<WAL> new_wal;
+  if (WAL::Open(Path(WalFileName(wal_seq)), &new_wal) != Status::kOk || !SyncDir()) {
+    new_wal.reset();
+    std::filesystem::remove(Path(WalFileName(wal_seq)), ec);
+    std::filesystem::remove(Path(SstFileName(number)), ec);
+    return Status::kIOError;
+  }
+  ManifestState next;
+  next.files = {meta};
+  next.flushed_through = number;  // every old WAL has a smaller number
+  next.next_file_number = next_seq_;
+  s = StoreManifest(options_.dir, next);
+  if (s != Status::kOk) {
+    new_wal.reset();
+    std::filesystem::remove(Path(WalFileName(wal_seq)), ec);
+    std::filesystem::remove(Path(SstFileName(number)), ec);
+    return s;
+  }
+  if (CrashPoint("install:after_manifest")) return Status::kIOError;
+
+  std::vector<std::string> stale;
+  stale.push_back(Path(WalFileName(active_seq_)));
+  for (const Frozen& f : frozen_) stale.push_back(Path(WalFileName(f.seq)));
+  for (const auto& t : sstables_) stale.push_back(Path(SstFileName(t->meta().file_number)));
+  manifest_ = std::move(next);
+  sstables_.clear();
+  sstables_.push_back(std::shared_ptr<SSTable>(std::move(opened)));
+  frozen_.clear();
+  active_ = std::make_shared<MemTable>(options_.memtable_bytes);
+  active_seq_ = wal_seq;
+  wal_ = std::move(new_wal);
+  applied_index_.store(applied_index);
+  ++epoch_;
+  PublishView();
+  cv_.notify_all();
+  for (const std::string& path : stale) std::filesystem::remove(path, ec);  // if this fails, startup cleans up
+  return Status::kOk;
+}
+
 Status KVEngine::Freeze() {
   if (wal_->Sync() != Status::kOk) return Status::kIOError;  // old WAL fully durable first
   const uint64_t new_seq = next_seq_;
@@ -406,6 +572,7 @@ void KVEngine::FlushLoop() {
     cv_.wait(lock, [&] { return stop_ || dead_ || !frozen_.empty(); });
     if (stop_ || dead_) return;
     const Frozen f = frozen_.back();  // oldest first, so SSTables appear in sequence order
+    const uint64_t epoch = epoch_;
     lock.unlock();
 
     Status s = Status::kOk;
@@ -432,6 +599,11 @@ void KVEngine::FlushLoop() {
     }
 
     lock.lock();
+    if (options_.use_sstables && epoch_ != epoch) {  // the dataset was replaced while we flushed: ours is stale
+      std::error_code ec;
+      std::filesystem::remove(Path(SstFileName(f.seq)), ec);
+      continue;
+    }
     if (options_.use_sstables && s == Status::kOk) {
       ManifestState next = manifest_;
       next.files.push_back(meta);
@@ -481,6 +653,7 @@ void KVEngine::CompactLoop() {
     std::vector<std::shared_ptr<SSTable>> inputs(sstables_.begin(), sstables_.begin() + static_cast<std::ptrdiff_t>(n));
     const std::vector<SSTableMeta> live = manifest_.files;
     const uint64_t out_number = next_seq_++;  // same counter as the WAL sequence numbers
+    const uint64_t epoch = epoch_;
     lock.unlock();
 
     std::vector<const SSTable*> raw;
@@ -500,6 +673,11 @@ void KVEngine::CompactLoop() {
     }
 
     lock.lock();
+    if (epoch_ != epoch) {  // the dataset was replaced while we merged: the output is stale
+      std::error_code ec;
+      std::filesystem::remove(out_path, ec);
+      continue;
+    }
     bool installed = false;
     if (s == Status::kOk) {
       ManifestState next = manifest_;
