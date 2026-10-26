@@ -51,7 +51,8 @@ void NodeRuntime::Start() {
   storage_ = std::make_unique<FileRaftStorage>((root / "raft").string(), options_.sync);
   KVEngine::Options engine_options;
   engine_options.dir = (root / "kv").string();
-  engine_options.sync_wal = options_.sync;
+  engine_options.sync_wal = options_.sync && options_.sync_engine_wal;
+  engine_options.wal_truncate_on_corruption = !options_.sync_engine_wal;
   engine_options.use_sstables = options_.use_sstables;
   engine_options.memtable_bytes = options_.memtable_bytes;
   engine_options.compaction_trigger = options_.compaction_trigger;

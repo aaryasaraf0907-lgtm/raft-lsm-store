@@ -27,6 +27,11 @@ struct NodeOptions {
   std::map<NodeId, std::string> peers;
   std::string data_dir;  // holds "raft/" (log, snapshots) and "kv/" (storage engine)
   bool sync = true;      // fsync every write (turn off only for tests and benchmarks)
+  // Also fsync the storage engine's own WAL on every write. Off by default: the Raft log is already
+  // durable, so the engine is rebuilt from it (or from a Raft snapshot) after a crash, and skipping
+  // this fsync removes one of the three that every write used to wait for. A damaged engine WAL is
+  // then truncated rather than refusing to start.
+  bool sync_engine_wal = false;
   // Use the real LSM engine (manifest, SSTables, compaction). Off = the old WAL + memtable engine.
   bool use_sstables = true;
   size_t memtable_bytes = 4 * 1024 * 1024;  // the engine freezes and flushes a memtable at this size

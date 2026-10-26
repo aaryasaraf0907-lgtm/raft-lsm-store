@@ -131,7 +131,7 @@ Status WAL::Append(uint8_t type, const std::string& key, const std::string& valu
 }
 
 Status WAL::Replay(const std::string& path, const std::function<void(const Entry&)>& apply,
-                   ReplayStats* stats) {
+                   ReplayStats* stats, bool truncate_mid_log_corruption) {
   ReplayStats local;
   int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) {
@@ -166,7 +166,7 @@ Status WAL::Replay(const std::string& path, const std::function<void(const Entry
     // the (possibly intact) records after it.
     const bool is_last = pos + kHeaderBytes + len == data.size();
     if (Crc32(payload, len) != crc) {
-      if (!is_last) return Status::kCorruption;
+      if (!is_last && !truncate_mid_log_corruption) return Status::kCorruption;
       break;
     }
 

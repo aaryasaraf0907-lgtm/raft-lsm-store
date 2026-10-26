@@ -92,6 +92,7 @@ throughput and p50/p95/p99 latency. Numbers depend heavily on fsync: compare wit
 | `--no-sync` | no fsync (testing only) |
 | `--memtable-bytes N`, `--compaction-trigger N` | flush size of a memtable (default 4 MiB) and how many SSTables trigger a merge (default 4; 0 = never) |
 | `--snapshot-threshold N`, `--snapshot-trailing N` | snapshot the data and drop the Raft log every N applied entries (default 10000; 0 = never) and how many log entries to keep below it (default 100) |
+| `--sync-engine-wal` | also fsync the engine's own WAL on every write. By default it is not: the Raft log is durable and the engine is rebuilt from it after a crash |
 | `--no-sstables` | use the old WAL + memtable engine instead of the LSM engine (the default) |
 | `--no-prevote` | turn PreVote off |
 | `--heartbeat-ms N`, `--election-ms MIN,MAX` | timing (defaults 50 and 150,300) |
