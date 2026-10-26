@@ -27,6 +27,9 @@ void Usage(FILE* out) {
       "  --client-addr ADDR   listen address for clients (required)\n"
       "  --data-dir DIR       where the Raft log and the storage engine live (required)\n"
       "  --no-sync            do not fsync (fast, NOT crash safe: testing and benchmarks only)\n"
+      "  --no-sstables        use the old WAL + memtable engine instead of the LSM engine\n"
+      "  --memtable-bytes N   flush a memtable to an SSTable at this size (default 4194304)\n"
+      "  --compaction-trigger N  merge SSTables when N are live; 0 = never (default 4)\n"
       "  --no-prevote         disable PreVote\n"
       "  --heartbeat-ms N     leader heartbeat interval (default 50)\n"
       "  --election-ms MIN,MAX  election timeout range (default 150,300)\n"
@@ -81,6 +84,12 @@ int main(int argc, char** argv) {
       options.data_dir = value("--data-dir");
     } else if (arg == "--no-sync") {
       options.sync = false;
+    } else if (arg == "--memtable-bytes") {
+      options.memtable_bytes = static_cast<size_t>(std::strtoull(value("--memtable-bytes"), nullptr, 10));
+    } else if (arg == "--compaction-trigger") {
+      options.compaction_trigger = static_cast<size_t>(std::strtoull(value("--compaction-trigger"), nullptr, 10));
+    } else if (arg == "--no-sstables") {
+      options.use_sstables = false;
     } else if (arg == "--no-prevote") {
       options.raft.enable_pre_vote = false;
     } else if (arg == "--heartbeat-ms") {

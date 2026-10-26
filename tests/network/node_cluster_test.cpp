@@ -44,7 +44,7 @@ struct TempDir {
 
 class NodeCluster {
  public:
-  explicit NodeCluster(int n) : n_(n), nodes_(n) {
+  explicit NodeCluster(int n, size_t memtable_bytes = 0) : n_(n), memtable_bytes_(memtable_bytes), nodes_(n) {
     for (int id = 1; id <= n; ++id) Boot(id);
     WireAll();
     KvClientOptions options;
@@ -89,6 +89,10 @@ class NodeCluster {
     for (int p = 1; p <= n_; ++p) options.cluster.push_back(p);
     options.data_dir = dir_.path + "/node" + std::to_string(id);
     options.sync = false;  // speed: crash safety is covered by the storage tests
+    if (memtable_bytes_ != 0) {
+      options.memtable_bytes = memtable_bytes_;  // small: the engine flushes and compacts during the test
+      options.compaction_trigger = 3;
+    }
     nodes_[id - 1] = std::make_unique<NodeRuntime>(options);
     nodes_[id - 1]->Start();
   }
@@ -104,6 +108,7 @@ class NodeCluster {
   std::string ClientAddress(int id) { return "127.0.0.1:" + std::to_string(nodes_[id - 1]->client_port()); }
 
   int n_;
+  size_t memtable_bytes_;
   TempDir dir_;
   std::vector<std::unique_ptr<NodeRuntime>> nodes_;
   std::unique_ptr<KvClient> client_;
@@ -235,6 +240,56 @@ TEST(NodeClusterTest, WholeClusterRestartKeepsTheData) {
     }
   }
   EXPECT_EQ(c.client().Put("after-restart", "ok").status, KvStatus::kOk);
+}
+
+// The real LSM engine under the cluster: tiny memtables so that flushes and compactions happen all
+// the time while a client writes and the leader dies. Restarting replays the Raft log through the
+// state machine, and the engine's applied index (kept in its SSTables) lets replay skip the writes
+// the engine already holds.
+TEST(NodeClusterTest, LeaderCrashWithFlushesAndCompactionsLosesNothing) {
+  NodeCluster c(3, /*memtable_bytes=*/8192);
+  ASSERT_EQ(c.client().Put("warm", "up").status, KvStatus::kOk);
+  constexpr int kN = 150;
+  const std::string pad(300, 'p');
+  std::atomic<int> acked{0};
+  std::atomic<bool> failed{false};
+  std::thread writer([&] {
+    for (int i = 0; i < kN; ++i) {
+      if (c.client().Put(KeyOf(i), ValueOf(i) + pad).status != KvStatus::kOk) {
+        failed = true;
+        return;
+      }
+      acked = i + 1;
+    }
+  });
+  while (acked.load() < 60 && !failed) std::this_thread::sleep_for(1ms);
+  const int victim = c.Leader();
+  ASSERT_NE(victim, 0);
+  c.Crash(victim);
+  writer.join();
+  ASSERT_FALSE(failed);
+  for (int id = 1; id <= 3; ++id) {
+    if (id == victim) continue;
+    ASSERT_TRUE(WaitFor(
+        [&] {
+          for (int i = 0; i < kN; ++i) {
+            if (!EngineHas(c.Node(id), KeyOf(i), ValueOf(i) + pad)) return false;
+          }
+          return true;
+        },
+        20000ms)) << "node " << id << " is missing an acknowledged write";
+  }
+  c.Restart(victim);
+  ASSERT_TRUE(WaitFor(
+      [&] {
+        for (int i = 0; i < kN; ++i) {
+          if (!EngineHas(c.Node(victim), KeyOf(i), ValueOf(i) + pad)) return false;
+        }
+        return true;
+      },
+      20000ms)) << "the restarted node did not recover from its SSTables and WAL";
+  EXPECT_GT(c.Node(victim)->state_machine()->ReplaySkipped(), 0u)
+      << "replay should have skipped what the engine already held";
 }
 
 }  // namespace raftkv
