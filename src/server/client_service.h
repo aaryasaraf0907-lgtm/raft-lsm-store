@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include "raft/raft_interface.h"
 #include "server/kv_state_machine.h"
 #include "storage/kv_store.h"
@@ -22,6 +24,14 @@ class ClientService final : public network::proto::ClientRpc::Service {
   grpc::Status Delete(grpc::ServerContext* context,
                       const network::proto::DeleteRequest* request,
                       network::proto::WriteResponse* response) override;
+  grpc::Status NodeStatus(grpc::ServerContext* context,
+                          const network::proto::StatusRequest* request,
+                          network::proto::StatusResponse* response) override;
+
+  // Fills in the node-specific part of a Status reply. Without a provider, NodeStatus returns
+  // UNIMPLEMENTED. The provider may be called from any gRPC thread.
+  using StatusProvider = std::function<void(network::proto::StatusResponse*)>;
+  void SetStatusProvider(StatusProvider provider) { status_provider_ = std::move(provider); }
 
  private:
  public:
@@ -45,6 +55,7 @@ class ClientService final : public network::proto::ClientRpc::Service {
   RaftNode* node_;
   KVStore* store_;
   KVStateMachine* state_machine_;
+  StatusProvider status_provider_;
 };
 
 }  // namespace raftkv

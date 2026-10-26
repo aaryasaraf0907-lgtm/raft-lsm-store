@@ -97,6 +97,7 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
 
   Role GetRole() const;
   NodeId Id() const { return id_; }
+  NodeId LeaderHint() const;  // the leader this node last heard from (0 = unknown)
   LogIndex CommitIndex() const;
   LogIndex LastApplied() const;
   LogIndex SnapshotIndex() const;  // last log index covered by the snapshot (0 = none)

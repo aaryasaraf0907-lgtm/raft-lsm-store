@@ -201,6 +201,11 @@ void RaftNodeImpl::SetSnapshotCallbacks(SnapshotTaker take, SnapshotRestorer res
   apply_cv_.notify_all();
 }
 
+NodeId RaftNodeImpl::LeaderHint() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return role_ == Role::kLeader ? id_ : leader_hint_;
+}
+
 LogIndex RaftNodeImpl::SnapshotIndex() const {
   std::lock_guard<std::mutex> lk(mu_);
   return snapshot_index_;

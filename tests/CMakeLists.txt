@@ -28,9 +28,13 @@ if(RAFTKV_BUILD_NETWORK)
     network/proto_conversions_test.cpp
     network/grpc_transport_test.cpp
     network/client_service_test.cpp
-    network/raft_over_grpc_test.cpp)
+    network/raft_over_grpc_test.cpp
+    network/node_cluster_test.cpp
+    network/kv_client_test.cpp)
   target_link_libraries(network_proto_tests
     raftkv_client_service
+    raftkv_node_runtime
+    raftkv_kv_client
     raftkv_raft
     GTest::gtest_main)
   gtest_discover_tests(network_proto_tests DISCOVERY_MODE PRE_TEST)

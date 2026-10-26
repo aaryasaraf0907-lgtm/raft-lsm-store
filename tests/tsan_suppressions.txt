@@ -1,0 +1,25 @@
+# ThreadSanitizer suppressions for the gRPC tests.
+#
+# The system gRPC library is not built with TSan, so TSan cannot see its internal synchronization and
+# reports false data races inside it (and in the inline gRPC headers that touch its data). The same
+# reports appear for the original RequestVote/AppendEntries tests. Use:
+#
+#   TSAN_OPTIONS="suppressions=tests/tsan_suppressions.txt" ./tsan-build/tests/network_proto_tests
+#
+# This is NOT needed for the Raft and storage tests (raft_tests, storage_tests), which are TSan-clean
+# without any suppression.
+race:libgrpc
+race:libgpr
+race:libgrpc++
+race:libabsl
+race:libprotobuf
+race:libcares
+race:libre2
+race:libupb
+race:libssl
+race:libcrypto
+called_from_lib:libgrpc.so.29
+called_from_lib:libgrpc++.so.1.51
+called_from_lib:libprotobuf.so.32
+mutex:libgrpc
+deadlock:libgrpc

@@ -106,6 +106,15 @@ void ClientService::SetCommitResponse(
   response->set_leader_id_hint(commit.leader_hint);
 }
 
+grpc::Status ClientService::NodeStatus(grpc::ServerContext*, const network::proto::StatusRequest*,
+                                       network::proto::StatusResponse* response) {
+  if (!status_provider_) {
+    return {grpc::StatusCode::UNIMPLEMENTED, "this node has no status provider"};
+  }
+  status_provider_(response);
+  return grpc::Status::OK;
+}
+
 grpc::Status ClientService::Put(grpc::ServerContext*,
                                 const network::proto::PutRequest* request,
                                 network::proto::WriteResponse* response) {
