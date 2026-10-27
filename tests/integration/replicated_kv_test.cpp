@@ -185,13 +185,16 @@ void ExpectExactlyOnce(ReplicatedCluster& c, uint64_t n) {
   for (NodeId id = 1; id <= 3; ++id) {
     ASSERT_TRUE(WaitFor(
         [&] {
+          // A restarted node's engine kept the data on disk, so the values are there at once; its
+          // log is re-applied only after it hears the commit index from the leader. Wait for both.
+          if (c.Machine(id)->Applied() < n) return false;
           for (uint64_t s = 1; s <= n; ++s) {
             if (!c.HasValue(id, KeyOf(s), ValueOf(s))) return false;
           }
           return true;
         },
         20000ms))
-        << "node " << id << " is missing an acknowledged write";
+        << "node " << id << " is missing an acknowledged write or has not finished replaying its log";
   }
   for (NodeId id = 1; id <= 3; ++id) {
     EXPECT_EQ(c.Machine(id)->Sessions().LastSeq(kClient), n) << "node " << id;
@@ -224,8 +227,8 @@ TEST(ReplicatedKV, LeaderKilledMidWriteLosesNothingAndDoublesNothing) {
       }
     });
     while (acked.load() < kill_after) std::this_thread::sleep_for(1ms);
-    NodeId victim = c.Leader();
-    ASSERT_NE(victim, 0u);
+    NodeId victim = 0;  // an election may be in progress at any given instant: wait for a leader
+    ASSERT_TRUE(WaitFor([&] { return (victim = c.Leader()) != 0; }, 8000ms));
     down = victim;
     c.Crash(victim);  // mid-stream: the client is still sending
     client.join();
