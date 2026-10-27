@@ -993,10 +993,12 @@ namespace {
 std::string FileIdentity(const std::string& path) {
   struct stat st;
   if (::stat(path.c_str(), &st) != 0) return "<missing>";
-  // std::filesystem, not st_mtim: that field is spelled st_mtimespec on macOS.
+  // std::filesystem, not st_mtim: that field is spelled st_mtimespec on macOS. The tick count is a
+  // 128-bit integer in libc++ (macOS), which std::to_string cannot take, hence the cast.
   std::error_code ec;
   const auto mtime = std::filesystem::last_write_time(path, ec);
-  return std::to_string(st.st_ino) + ":" + (ec ? std::string("?") : std::to_string(mtime.time_since_epoch().count()));
+  return std::to_string(st.st_ino) + ":" +
+         (ec ? std::string("?") : std::to_string(static_cast<long long>(mtime.time_since_epoch().count())));
 }
 }  // namespace
 
