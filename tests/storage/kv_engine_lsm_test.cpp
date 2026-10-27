@@ -993,7 +993,10 @@ namespace {
 std::string FileIdentity(const std::string& path) {
   struct stat st;
   if (::stat(path.c_str(), &st) != 0) return "<missing>";
-  return std::to_string(st.st_ino) + ":" + std::to_string(st.st_mtim.tv_sec) + "." + std::to_string(st.st_mtim.tv_nsec);
+  // std::filesystem, not st_mtim: that field is spelled st_mtimespec on macOS.
+  std::error_code ec;
+  const auto mtime = std::filesystem::last_write_time(path, ec);
+  return std::to_string(st.st_ino) + ":" + (ec ? std::string("?") : std::to_string(mtime.time_since_epoch().count()));
 }
 }  // namespace
 
