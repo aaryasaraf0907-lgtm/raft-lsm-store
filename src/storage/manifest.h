@@ -52,7 +52,8 @@ std::string ManifestPath(const std::string& dir);
 std::string EncodeManifest(const ManifestState& state);
 Status DecodeManifest(const std::string& bytes, ManifestState* out);
 
-// kOk with *found = false if there is no manifest (a fresh directory); kCorruption if it is damaged.
+// kOk with *found = false if there is no manifest (a fresh directory); kCorruption if it is damaged;
+// kIOError if it cannot be checked for or opened.
 Status LoadManifest(const std::string& dir, ManifestState* out, bool* found);
 // Atomically replaces the manifest. kIOError on failure. A failure before the rename leaves the
 // previous manifest in place; a failure of the directory fsync after it leaves the NEW manifest in

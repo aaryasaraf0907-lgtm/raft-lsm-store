@@ -75,6 +75,17 @@ TEST_F(ManifestTest, AMissingManifestIsAFreshDirectoryNotAnError) {
   EXPECT_FALSE(found);
 }
 
+// The existence check itself can fail (here ELOOP: the directory is a symlink loop, which fails the
+// same way for every user, root included). That is an I/O error, never "no manifest": otherwise an
+// unreachable directory could be taken for a fresh, empty one.
+TEST_F(ManifestTest, AFailedExistenceCheckIsAnIOErrorNotAMissingManifest) {
+  const std::string loop = dir_ + "/loop";
+  fs::create_symlink(loop, loop);
+  ManifestState s;
+  bool found = false;
+  EXPECT_EQ(LoadManifest(loop, &s, &found), Status::kIOError);
+}
+
 TEST_F(ManifestTest, EveryDamagedByteAndEveryTruncationIsRejected) {
   const std::string good = EncodeManifest(Sample());
   ManifestState out;
