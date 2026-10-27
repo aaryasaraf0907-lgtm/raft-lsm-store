@@ -1,10 +1,118 @@
 name: CI
-on: [push, pull_request]
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same PR cancels the older run instead of queueing behind it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GRPC_PACKAGES: libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc
+
 jobs:
-  build:
+  # The core library and its tests (no gRPC): fast feedback, warnings are errors.
+  core:
+    name: core (Linux, -Werror)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - run: cmake -S . -B build
-      - run: cmake --build build -j
-      - run: ctest --test-dir build --output-on-failure
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+          -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST
+      - name: Build
+        run: cmake --build build -j
+      - name: "Test (serial, because the Raft tests are timer based)"
+        run: ctest --test-dir build --output-on-failure
+
+  # Everything, including the gRPC transport, the node, the client and the cluster tests.
+  network:
+    name: network (Linux, gRPC, -Werror)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gRPC and protobuf
+        run: sudo apt-get update && sudo apt-get install -y $GRPC_PACKAGES
+      - name: Configure
+        run: >
+          cmake -S . -B build-net -DCMAKE_BUILD_TYPE=Debug -DRAFTKV_BUILD_NETWORK=ON
+          -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Werror"
+          -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST
+      - name: Build
+        run: cmake --build build-net -j
+      - name: Test
+        run: ctest --test-dir build-net --output-on-failure
+
+  # Memory errors and undefined behaviour, over the whole system including real gRPC clusters.
+  asan:
+    name: AddressSanitizer + UBSan (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gRPC and protobuf
+        run: sudo apt-get update && sudo apt-get install -y $GRPC_PACKAGES
+      - name: Configure
+        run: >
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DRAFTKV_BUILD_NETWORK=ON
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST
+      - name: Build
+        run: cmake --build build-asan -j
+      - name: Test
+        run: ctest --test-dir build-asan --output-on-failure
+
+  # Data races. Limited to the concurrency-heavy tests of the core library: the system gRPC is not
+  # TSan-instrumented, so network tests would report noise from inside gRPC itself.
+  tsan:
+    name: ThreadSanitizer (Linux, core)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+          -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST
+      - name: Build
+        run: cmake --build build-tsan -j --target raft_tests storage_tests integration_tests
+      - name: Storage engine
+        run: >
+          ./build-tsan/tests/storage_tests
+          --gtest_filter='LsmTest.*:FlushTest.*:Checkpoint*:InstallCheckpoint*:AsyncWalEngine.*:WalReplay.*'
+      - name: Raft (group commit, fault injection, replication)
+        run: >
+          ./build-tsan/tests/raft_tests
+          --gtest_filter='GroupCommit.*:RaftFaultInjection.*:RaftReplication.*:ExactlyOnce*:CommitRule*'
+      - name: Integration
+        run: ./build-tsan/tests/integration_tests
+
+  # The project targets macOS and Linux. Not -Werror here: Apple clang warns about different things
+  # than gcc, and this job exists to catch portability problems (fsync semantics, paths, linking).
+  macos:
+    name: network (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    continue-on-error: true  # informational until it has been green for a while; then remove this line
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gRPC and protobuf
+        run: brew install grpc protobuf
+      - name: Configure
+        run: >
+          cmake -S . -B build-net -DCMAKE_BUILD_TYPE=Debug -DRAFTKV_BUILD_NETWORK=ON
+          -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST
+      - name: Build
+        run: cmake --build build-net -j 4
+      - name: Test
+        run: ctest --test-dir build-net --output-on-failure
