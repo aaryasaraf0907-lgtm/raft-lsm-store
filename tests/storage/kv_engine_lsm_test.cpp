@@ -1165,6 +1165,8 @@ TEST_F(LsmTest, ACheckpointInstallWhoseStoreAndRestoreBothFailRecoversEitherData
       out << install_manifest;
     }
     ASSERT_EQ(Open(Opts()), Status::kOk);
+    Settle();  // the reopened engine may still be flushing a replayed WAL: its new table is written before the
+               // manifest names it, so wait for that before counting. A real leftover file would still fail.
     EXPECT_EQ(Files(".sst").size(), Manifest().files.size()) << "every unlisted table is deleted";
     if (checkpoint_survives) {
       EXPECT_EQ(Get("ck"), "cv");
@@ -1300,6 +1302,8 @@ TEST_F(LsmTest, ACheckpointInstallWhoseStoreAndRestoreBothFailStopsTheEngine) {
     }
     ASSERT_EQ(Open(Opts()), Status::kOk);
     EXPECT_FALSE(engine_->GetStats().fail_stopped) << "reopening ends the fail-stop";
+    Settle();  // the reopened engine may still be flushing a replayed WAL: its new table is written before the
+               // manifest names it, so wait for that before counting. A real leftover file would still fail.
     EXPECT_EQ(Files(".sst").size(), Manifest().files.size()) << "every unlisted table is deleted";
     if (checkpoint_survives) {
       EXPECT_EQ(Get("ck"), "cv");
