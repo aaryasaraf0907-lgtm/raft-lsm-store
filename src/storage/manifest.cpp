@@ -119,7 +119,11 @@ Status DecodeManifest(const std::string& bytes, ManifestState* out) {
 Status LoadManifest(const std::string& dir, ManifestState* out, bool* found) {
   const std::string path = ManifestPath(dir);
   std::error_code ec;
-  if (!std::filesystem::exists(path, ec)) {
+  const bool present = std::filesystem::exists(path, ec);
+  // exists() also returns false when the check itself fails (ec set, e.g. ELOOP): that is an I/O
+  // error, not a fresh directory, or a damaged directory could be taken for an empty database.
+  if (ec) return Status::kIOError;
+  if (!present) {
     *found = false;
     return Status::kOk;
   }
