@@ -209,7 +209,25 @@ void RaftNodeImpl::RecordAckLocked(NodeId peer, uint64_t seq) {
   if (seq > acked) {
     acked = seq;
     wait_cv_.notify_all();  // a ReadIndex waiter may now have its majority
+    if (role_ == Role::kLeader && read_round_in_flight_ && MajorityAckedAfterLocked(read_round_mark_)) {
+      read_round_in_flight_ = false;
+      if (read_round_wanted_) BroadcastAppendEntriesLocked();  // one round for every read that waited
+    }
   }
+}
+
+bool RaftNodeImpl::MajorityAckedAfterLocked(uint64_t mark) const {
+  size_t acks = 1;  // ourselves
+  for (NodeId peer : peers_) {
+    auto it = acked_seq_.find(peer);
+    if (it != acked_seq_.end() && it->second > mark) ++acks;
+  }
+  return acks > (peers_.size() + 1) / 2;
+}
+
+uint64_t RaftNodeImpl::ReplicationMessagesSent() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return send_seq_;
 }
 
 CommitResponse RaftNodeImpl::ReadIndex(std::chrono::milliseconds timeout) {
@@ -218,7 +236,6 @@ CommitResponse RaftNodeImpl::ReadIndex(std::chrono::milliseconds timeout) {
   if (role_ != Role::kLeader) return {CommitResult::kNotLeader, 0, leader_hint_};
 
   const Term term = current_term_;
-  const size_t cluster_size = peers_.size() + 1;
   bool have_index = false;
   LogIndex read_index = 0;
   uint64_t seq_mark = 0;
@@ -239,14 +256,16 @@ CommitResponse RaftNodeImpl::ReadIndex(std::chrono::milliseconds timeout) {
       read_index = commit_index_;
       seq_mark = send_seq_;
       have_index = true;
-      BroadcastAppendEntriesLocked();  // a heartbeat round that starts after the index was fixed
+      // We need a round that starts after seq_mark. If none is in flight, start one now; otherwise
+      // the in-flight round is too old for us, so ask for the next one, which every read that
+      // arrives meanwhile will share.
+      if (!read_round_in_flight_) {
+        BroadcastAppendEntriesLocked();
+      } else {
+        read_round_wanted_ = true;
+      }
     }
-    size_t acks = 1;  // ourselves
-    for (NodeId peer : peers_) {
-      auto it = acked_seq_.find(peer);
-      if (it != acked_seq_.end() && it->second > seq_mark) ++acks;
-    }
-    if (acks <= cluster_size / 2) return false;  // not yet known to still be the leader
+    if (!MajorityAckedAfterLocked(seq_mark)) return false;  // not yet known to still be the leader
     if (last_applied_ < read_index) return false;  // state machine has not caught up
     outcome = CommitResult::kApplied;
     return true;
@@ -504,6 +523,9 @@ void RaftNodeImpl::BecomeLeaderLocked() {
 // ---- replication (leader side) ----
 
 void RaftNodeImpl::BroadcastAppendEntriesLocked() {
+  read_round_mark_ = send_seq_;  // every message of this round gets a larger number
+  read_round_in_flight_ = true;
+  read_round_wanted_ = false;    // this round serves every read that was waiting for one
   next_heartbeat_ = Clock::now() + std::chrono::milliseconds(cfg_.heartbeat_interval_ms);
   for (NodeId peer : peers_) SendAppendEntriesToLocked(peer);
 }

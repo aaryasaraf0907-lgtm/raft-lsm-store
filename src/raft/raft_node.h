@@ -102,7 +102,9 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   LogIndex CommitIndex() const;
   LogIndex LastApplied() const;
   LogIndex SnapshotIndex() const;  // last log index covered by the snapshot (0 = none)
-  size_t LogLength() const;        // log entries still stored (after the snapshot)
+  size_t LogLength() const;
+  // Replication messages (AppendEntries and InstallSnapshot) this node has sent as leader. For tests.
+  uint64_t ReplicationMessagesSent() const;        // log entries still stored (after the snapshot)
 
   // RpcHandler
   RequestVoteReply HandleRequestVote(const RequestVoteRequest& req) override;
@@ -231,6 +233,16 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   // acked a number above the send_seq_ value taken when its read index was fixed.
   uint64_t send_seq_ = 0;
   std::map<NodeId, uint64_t> acked_seq_;
+  // Read batching. A read still needs a majority to acknowledge a message sent AFTER its read index
+  // was fixed; what changes is how many rounds are sent. Every broadcast is a "round" (proposal
+  // batches and heartbeats too). At most one round is in flight for reads: a read that arrives while
+  // one is in flight cannot use it (its messages were sent before the read's index was fixed), so it
+  // marks read_round_wanted_, and ONE new round for all such reads starts when the in-flight round is
+  // acknowledged by a majority (or with the next heartbeat, if it never is).
+  uint64_t read_round_mark_ = 0;     // send_seq_ just before the latest round was broadcast
+  bool read_round_in_flight_ = false;
+  bool read_round_wanted_ = false;
+  bool MajorityAckedAfterLocked(uint64_t mark) const;  // a majority acknowledged a message numbered > mark
   LogIndex term_start_index_ = 0;  // index of the no-op this leader appended when elected
 
   // PreVote state (guarded by mu_). A round is identified by prevote_round_ so late replies from
