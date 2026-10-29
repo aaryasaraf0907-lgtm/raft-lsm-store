@@ -176,3 +176,17 @@ TEST_F(AppliedIndexTest, EveryFlushedMemtableCarriesTheIndexOfItsOwnData) {
     EXPECT_EQ(index, highest_index_in_seq[f.first]) << "memtable " << f.first;
   }
 }
+
+TEST_F(AppliedIndexTest, RejectsMalformedPersistedAppliedIndex) {
+  std::unique_ptr<WAL> wal;
+  ASSERT_EQ(WAL::Open(Wal(), &wal), Status::kOk);
+  ASSERT_EQ(wal->AppendPut(kIndexKey, "bad", false), Status::kOk);
+  wal.reset();
+
+  KVEngine::Options options;
+  options.dir = dir_;
+  options.sync_wal = false;
+  std::unique_ptr<KVEngine> recovered;
+  EXPECT_EQ(KVEngine::Open(options, &recovered), Status::kCorruption);
+  EXPECT_EQ(recovered, nullptr);
+}

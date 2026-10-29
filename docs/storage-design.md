@@ -210,9 +210,9 @@ After the checkpoint fail-stop (section 11) every `Get` started afterwards retur
    frozen and flushed again; empty older ones are deleted. If no WAL needs replay, a fresh active WAL
    is created.
 5. `PublishView`, then the applied index is read through `Get` (the reserved key), so it is found in
-   whichever layer holds it, including an SSTable after its WAL was retired. If that read fails, or
-   the stored value is not 8 bytes, the error is not reported: the applied index starts at 0
-   (section 12).
+   whichever layer holds it, including an SSTable after its WAL was retired. A missing key means no
+   index has been persisted and leaves the applied index at 0. A malformed value returns
+   `kCorruption`; any other read error is propagated and opening fails.
 
 The crash walkthroughs are tested by the `LsmTest.ACrash*` tests (flush: before and after the
 manifest store; compaction: after the output and after the manifest store; ambiguous manifest stores),
@@ -375,8 +375,6 @@ whichever dataset is on disk. Tested by
   above `kMaxPayloadBytes` or past the end of the file, and on a checksum-valid record with a bad type,
   a bad key length, or a delete that carries a value). Telling these apart from a torn tail would
   need a WAL format change.
-- **A damaged or unreadable applied-index record is not reported.** `KVEngine::Open` treats a failed
-  `Get` of the reserved key, or a value that is not 8 bytes, as applied index 0.
 - **Startup cleanup matches `.tmp` anywhere in a name** (`LoadLsmState`), so any file in the data
   directory whose name contains `.tmp` is deleted. The directory is assumed to belong to the engine.
 - **No data-directory lock.** Nothing stops two engines from opening the same directory; the
