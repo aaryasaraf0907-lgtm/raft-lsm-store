@@ -121,10 +121,14 @@ Status KVEngine::Open(const Options& options, std::unique_ptr<KVEngine>* out) {
   if (s != Status::kOk) return s;
   engine->PublishView();
   {
-    std::string stored;  // the applied index that survived in the WAL (0 if there is none)
+    std::string stored;
     uint64_t index = 0;
-    if (engine->Get(AppliedIndexKey(), &stored) == Status::kOk && DecodeIndex(stored, &index)) {
+    s = engine->Get(AppliedIndexKey(), &stored);
+    if (s == Status::kOk) {
+      if (!DecodeIndex(stored, &index)) return Status::kCorruption;
       engine->applied_index_.store(index);
+    } else if (s != Status::kNotFound) {
+      return s;
     }
   }
   if (options.flush_writer || options.use_sstables) engine->flusher_ = std::thread([e = engine.get()] { e->FlushLoop(); });
