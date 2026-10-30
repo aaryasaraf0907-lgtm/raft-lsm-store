@@ -13,6 +13,9 @@ enum ClientStatus {
   CLIENT_STATUS_UNAVAILABLE = 7;
   CLIENT_STATUS_INTERNAL_ERROR = 8;
   CLIENT_STATUS_DUPLICATE_OUTCOME_UNKNOWN = 9;
+  // This client's session was forgotten (idle too long, or too many clients), so the request was NOT
+  // applied: it might have been a retry of one applied before. Start a new session (new client id).
+  CLIENT_STATUS_SESSION_EXPIRED = 10;
 }
 
 message PutRequest {

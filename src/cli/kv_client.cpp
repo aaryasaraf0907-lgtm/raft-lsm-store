@@ -28,19 +28,30 @@ uint32_t ServerTimeoutMs(std::chrono::milliseconds rpc_timeout) {
   return static_cast<uint32_t>(std::max<long long>(50, ms));
 }
 
+uint64_t RandomClientId() {
+  std::random_device rd;
+  std::mt19937_64 rng((static_cast<uint64_t>(rd()) << 32) ^ rd() ^
+                      static_cast<uint64_t>(Clock::now().time_since_epoch().count()));
+  uint64_t id = 0;
+  do {
+    id = rng();
+  } while (id == 0);
+  return id;
+}
+
 }  // namespace
+
+void KvClient::RenewSession() {
+  uint64_t id = RandomClientId();
+  while (id == client_id_) id = RandomClientId();
+  client_id_ = id;
+  seq_ = 0;
+}
 
 KvClient::KvClient(KvClientOptions options) : options_(std::move(options)) {
   if (options_.servers.empty()) throw std::invalid_argument("KvClient needs at least one server");
   client_id_ = options_.client_id;
-  if (client_id_ == 0) {
-    std::random_device rd;
-    std::mt19937_64 rng((static_cast<uint64_t>(rd()) << 32) ^ rd() ^
-                        static_cast<uint64_t>(Clock::now().time_since_epoch().count()));
-    do {
-      client_id_ = rng();
-    } while (client_id_ == 0);
-  }
+  if (client_id_ == 0) client_id_ = RandomClientId();
   for (const auto& s : options_.servers) {
     ids_.push_back(s.first);
     stubs_[s.first] = MakeStub(s.second);
@@ -71,7 +82,10 @@ KvResult KvClient::Put(const std::string& key, const std::string& value) { retur
 KvResult KvClient::Delete(const std::string& key) { return Write(false, key, ""); }
 
 KvResult KvClient::Write(bool is_put, const std::string& key, const std::string& value) {
-  const uint64_t seq = ++seq_;  // ONE number for the request and every retry of it
+  uint64_t seq = ++seq_;  // ONE number for the request and every retry of it
+  // Whether an earlier attempt of THIS request might have been applied (it reached a server and we
+  // did not get a definite "not applied"). Decides what to do if the session turns out to be expired.
+  bool may_have_applied = false;
   const auto deadline = Clock::now() + options_.op_timeout;
   KvResult result;
   result.message = "no response before the deadline";
@@ -103,6 +117,7 @@ KvResult KvClient::Write(bool is_put, const std::string& key, const std::string&
     }
     if (!status.ok()) {  // node down or unreachable: try the next one
       result.message = status.error_message().empty() ? "rpc failed" : status.error_message();
+      may_have_applied = true;  // the request may have arrived before the call failed
       Rotate();
       if (++quiet_failures % ids_.size() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(50));
       continue;
@@ -112,6 +127,19 @@ KvResult KvClient::Write(bool is_put, const std::string& key, const std::string&
       case ClientStatus::CLIENT_STATUS_OK:
         result.status = KvStatus::kOk;
         result.message.clear();
+        return result;
+      case ClientStatus::CLIENT_STATUS_SESSION_EXPIRED:
+        // This attempt was refused, not applied. If no earlier attempt can have been applied
+        // either, the request simply never happened: retry it as request 1 of a new session.
+        // Otherwise an earlier attempt may have taken effect, and retrying could apply it twice.
+        RenewSession();
+        if (!may_have_applied) {
+          seq = ++seq_;
+          result.message = "session expired; retried under a new session";
+          break;
+        }
+        result.status = KvStatus::kOutcomeUnknown;
+        result.message = "session expired after an attempt whose outcome is unknown: the write may or may not have happened";
         return result;
       case ClientStatus::CLIENT_STATUS_INVALID_ARGUMENT:
         result.status = KvStatus::kInvalidArgument;
@@ -133,10 +161,12 @@ KvResult KvClient::Write(bool is_put, const std::string& key, const std::string&
       case ClientStatus::CLIENT_STATUS_STOPPED:
       case ClientStatus::CLIENT_STATUS_UNAVAILABLE:
         result.message = response.error_message();
+        may_have_applied = true;  // the proposal may already be in the log
         Rotate();
         break;
       default:  // NOT_COMMITTED, OUTCOME_UNKNOWN, INTERNAL_ERROR: retry the SAME request number
         result.message = response.error_message();
+        may_have_applied = true;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         break;
     }

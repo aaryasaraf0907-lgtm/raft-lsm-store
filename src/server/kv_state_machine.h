@@ -35,7 +35,7 @@ namespace raftkv {
 // so a storage failure is fatal.
 class KVStateMachine {
  public:
-  enum class RequestOutcome { kApplied, kDuplicate, kUnknown };
+  enum class RequestOutcome { kApplied, kDuplicate, kUnknown, kSessionExpired };
 
   explicit KVStateMachine(KVStore* store) : store_(store) {}
   // Preferred for an indexed store; overload resolution picks it automatically for a KVEngine.
@@ -47,9 +47,15 @@ class KVStateMachine {
 
   void Apply(const LogEntry& entry) {
     const Command& cmd = entry.command;
-    if (!sessions_.ShouldApply(cmd)) {
+    const SessionDecision decision = sessions_.Decide(cmd, entry.index);
+    if (decision == SessionDecision::kDuplicate) {
       ++duplicates_skipped_;
       RecordRequestOutcome(entry.index, RequestOutcome::kDuplicate);
+      return;
+    }
+    if (decision == SessionDecision::kSessionExpired) {  // might be a retry of a forgotten request
+      ++sessions_expired_;
+      RecordRequestOutcome(entry.index, RequestOutcome::kSessionExpired);
       return;
     }
     switch (cmd.type) {
@@ -139,6 +145,10 @@ class KVStateMachine {
   }
 
   uint64_t DuplicatesSkipped() const { return duplicates_skipped_.load(); }
+  // Requests refused because their client's session may have been forgotten.
+  uint64_t SessionsExpired() const { return sessions_expired_.load(); }
+  // Tests only: shorter session limits, to exercise expiry without millions of entries.
+  void SetSessionLimits(SessionLimits limits) { sessions_.SetLimits(limits); }
   // Store writes skipped because the store already held them (see the replay note above).
   uint64_t ReplaySkipped() const { return replay_skipped_.load(); }
   // The store's applied index when this state machine was created (0 for a plain store).
@@ -180,6 +190,7 @@ class KVStateMachine {
   std::map<LogIndex, RequestOutcome> request_outcomes_;
   std::atomic<uint64_t> applied_{0};
   std::atomic<uint64_t> duplicates_skipped_{0};
+  std::atomic<uint64_t> sessions_expired_{0};
   std::atomic<uint64_t> replay_skipped_{0};
 
   static void PutU64(std::string* s, uint64_t v) {

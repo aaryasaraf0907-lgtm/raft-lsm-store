@@ -91,6 +91,11 @@ void ClientService::SetCommitResponse(const CommitResponse& commit, uint64_t cli
       response->set_status(network::proto::CLIENT_STATUS_DUPLICATE_OUTCOME_UNKNOWN);
       response->set_error_message("stale request sequence: a newer request from this client was applied");
       return;
+    case KVStateMachine::RequestOutcome::kSessionExpired:
+      response->set_status(network::proto::CLIENT_STATUS_SESSION_EXPIRED);
+      response->set_error_message(
+          "client session expired: this request was not applied; start a new session (new client id)");
+      return;
     case KVStateMachine::RequestOutcome::kUnknown:
       response->set_status(network::proto::CLIENT_STATUS_OUTCOME_UNKNOWN);
       response->set_error_message(

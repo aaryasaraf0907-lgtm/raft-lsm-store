@@ -28,6 +28,8 @@ enum class KvStatus {
   kInvalidArgument,  // rejected (empty or oversize key, oversize value); retrying cannot help
   kStaleRequest,     // a newer request from this client was already applied
   kUnavailable,      // no node answered usefully before op_timeout
+  kOutcomeUnknown,   // the session expired after an attempt that may have been applied: the write
+                     // may or may not have happened (later requests use a new session)
 };
 
 struct KvResult {
@@ -62,6 +64,8 @@ class KvClient {
   NodeId Current() const { return ids_[current_]; }
 
   KvClientOptions options_;
+  // Starts a new session: a fresh random client id, numbering requests from 1 again.
+  void RenewSession();
   uint64_t client_id_;
   uint64_t seq_ = 0;
   std::vector<NodeId> ids_;  // sorted
