@@ -69,6 +69,38 @@ the node rebuilds its state from its own disk and catches up from the leader.
 With 3 nodes the cluster keeps working while any 2 are up. Kill 2 and writes (and reads) wait until a
 majority is back; they never return stale data.
 
+## Recover a node whose storage engine will not open
+
+A node whose engine finds damaged data refuses to start rather than serve it. It exits with
+`raftkv_node: cannot open the storage engine in <data-dir>/kv (status 3)`; status 3 is
+`kCorruption`. Each node's data directory holds two parts: `raft/` (its term, vote, Raft log and
+latest snapshot) and `kv/` (the storage engine). The engine's contents can be rebuilt from `raft/`,
+so for that one node:
+
+1. Make sure the node is stopped, and that the other nodes are up with a leader
+   (`scripts/run_cluster.sh status`).
+2. Move that node's `kv/` aside, for example
+   `mv /tmp/raftkv-cluster/node2/kv /tmp/raftkv-cluster/node2/kv.damaged`
+   (with `run_cluster.sh` the data directory is `$RAFTKV_DIR/node<ID>`, by default
+   `/tmp/raftkv-cluster/node<ID>`). Leave `raft/` where it is.
+3. Restart the node (`scripts/run_cluster.sh restart 2`). It starts with an empty engine, restores
+   its stored snapshot if one exists, applies subsequent committed Raft log entries, and catches up
+   from the leader. If the node has fallen too far behind for the retained log entries, the leader
+   can send it a snapshot.
+4. Check with `status` that the node's `applied` reaches the others' before deleting `kv.damaged`.
+
+This is what `NodeClusterTest.ANodeWhoseEngineDirectoryIsGoneRebuildsFromItsSnapshotAndLog` does.
+Be careful:
+
+- Moving `kv/` away removes that node's local engine state. The node gets its data back only from
+  the Raft log entries and snapshot that are still available, in its own `raft/` or from the leader.
+  If they are not (for example `raft/` was also lost or damaged, or a `--no-sync` node lost writes in
+  a power failure and no other node has them), recovery is not guaranteed. Keep `kv.damaged` until
+  the node has caught up.
+- Do this for the affected node's `kv/` only. Never move or delete its `raft/`, another node's
+  directory, or a whole data directory: a node that returns without its Raft state is the unsupported
+  case described under Known limitations.
+
 ## Measure
 
 ```

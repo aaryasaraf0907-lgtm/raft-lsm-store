@@ -1370,3 +1370,49 @@ TEST_F(LsmTest, RepeatedFlushAndCompactionCyclesStayCorrectAndSettle) {
   }
   EXPECT_GE(engine_->GetStats().compactions_done + engine_->GetStats().flushes_done, 1u);
 }
+
+// Open reads the applied index through Get. If that read fails with anything but kNotFound, Open must
+// fail with that error, never start at applied index 0 (Raft would then re-apply entries the data
+// already holds). The index record is made to live only in an SSTable, and that table's data block is
+// damaged so that SSTable::Open (footer, filter and index checks) still succeeds and only reading the
+// block fails: the error therefore comes from the applied-index read, not from table validation.
+TEST_F(LsmTest, AnUnreadableAppliedIndexInAnSstableFailsOpen) {
+  ASSERT_EQ(Open(Opts()), Status::kOk);  // compaction off: the flushed table stays as it is
+  Write("a", "1", 1);
+  Write("b", "2", 2);
+  ForceAFreeze();  // plain Puts: the new active memtable (and its WAL) holds no applied-index record
+  Settle();
+  engine_.reset();
+
+  const ManifestState m = Manifest();
+  ASSERT_EQ(m.files.size(), 1u);
+  const std::string sst = dir_ + "/" + KVEngine::SstFileName(m.files[0].file_number);
+  ASSERT_EQ(TableGet(m.files[0].file_number, kIndexKey), SSTable::GetResult::kFound);
+  for (const std::string& wal : Files(".log")) {
+    EXPECT_EQ(FileBytes(dir_ + "/" + wal).find(kIndexKey), std::string::npos) << wal;
+  }
+  // So a clean reopen finds the index in the SSTable.
+  ASSERT_EQ(Open(Opts()), Status::kOk);
+  EXPECT_EQ(engine_->AppliedIndex(), 2u);
+  engine_.reset();
+
+  // The reserved prefix sorts first, so the index record is the first record of data block 0, which
+  // starts at offset 0 (sstable-format.md §3), and its key starts after the 9-byte record header (§4).
+  // Check that layout on disk, then flip the key's first byte: block 0's checksum no longer matches.
+  std::string bytes = FileBytes(sst);
+  const size_t header = SSTableFormat::kRecordHeaderBytes;
+  ASSERT_GT(bytes.size(), header + kIndexKey.size());
+  ASSERT_EQ(bytes.compare(header, kIndexKey.size(), kIndexKey), 0) << "the index record is not first";
+  bytes[header] ^= 0x01;
+  { std::ofstream(sst, std::ios::binary | std::ios::trunc) << bytes; }
+
+  std::unique_ptr<SSTable> table;
+  ASSERT_EQ(SSTable::Open(sst, m.files[0].file_number, &table), Status::kOk) << "only the data block is damaged";
+  SSTable::GetResult result = SSTable::GetResult::kAbsent;
+  std::string value;
+  EXPECT_EQ(table->Get(kIndexKey, &result, &value), Status::kCorruption);
+  table.reset();
+
+  EXPECT_EQ(Open(Opts()), Status::kCorruption);
+  EXPECT_EQ(engine_, nullptr);
+}
