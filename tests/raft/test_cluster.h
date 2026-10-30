@@ -79,14 +79,22 @@ struct Cluster {
   FakeNetwork net;
   std::vector<std::unique_ptr<FakeTransport>> transports;
   std::vector<std::unique_ptr<FileRaftStorage>> storages;  // null entries when not persistent
+  // Set BEFORE constructing (see the constructor taking a factory): node id -> its storage, kept for
+  // the cluster's lifetime (a restarted node gets the same storage back).
+  std::function<std::unique_ptr<RaftStorage>(NodeId)> storage_factory;
+  std::vector<std::unique_ptr<RaftStorage>> custom_storages;
   std::vector<std::unique_ptr<RaftNodeImpl>> nodes;
   int size;
   std::function<void(RaftConfig&)> tweak_;
   std::set<NodeId> joining_;  // nodes started with join_existing_cluster
 
   // `tweak` may adjust each node's RaftConfig before it is built (e.g. to turn PreVote off).
-  explicit Cluster(int n, bool persistent = false, std::function<void(RaftConfig&)> tweak = nullptr)
+  // `factory`, if given, makes each node's storage (instead of none, or files when persistent).
+  explicit Cluster(int n, bool persistent = false, std::function<void(RaftConfig&)> tweak = nullptr,
+                   std::function<std::unique_ptr<RaftStorage>(NodeId)> factory = nullptr)
       : applied(static_cast<size_t>(n)), size(n), tweak_(std::move(tweak)) {
+    storage_factory = std::move(factory);
+    custom_storages.resize(32);
     if (persistent) tmp = std::make_unique<TempDir>();
     nodes.reserve(32);  // AddJoiningNode must never move the node list while threads use it
     transports.reserve(32);
@@ -182,6 +190,10 @@ struct Cluster {
       if (static_cast<NodeId>(p) != id) peers.push_back(static_cast<NodeId>(p));
     }
     RaftStorage* storage = nullptr;
+    if (storage_factory) {  // tests that need a particular storage behaviour
+      if (!custom_storages[id - 1]) custom_storages[id - 1] = storage_factory(id);
+      storage = custom_storages[id - 1].get();
+    }
     if (tmp) {  // reopening the same directory reloads what the previous incarnation saved
       std::string dir = (tmp->path / ("node" + std::to_string(id))).string();
       storages[id - 1] = std::make_unique<FileRaftStorage>(dir, /*sync=*/false);

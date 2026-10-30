@@ -41,6 +41,10 @@ class FileRaftStorage : public RaftStorage {
   bool Load(PersistentState* out) override;
   bool SaveHardState(Term term, NodeId voted_for) override;
   bool AppendEntries(const std::vector<LogEntry>& entries) override;
+  bool AppendEntriesNoSync(const std::vector<LogEntry>& entries) override;
+  // Syncs through a dup() of the log's descriptor, so it needs no lock: if a compaction meanwhile
+  // replaces the file, syncing the old one is harmless (the compaction synced everything it kept).
+  std::function<bool()> PrepareSync() override;
   bool TruncateSuffix(LogIndex from_index) override;
   using RaftStorage::SaveSnapshot;
   bool SaveSnapshot(LogIndex snapshot_index, Term snapshot_term, const std::string& data,
@@ -48,7 +52,7 @@ class FileRaftStorage : public RaftStorage {
                     const std::vector<LogEntry>& entries_after_base) override;
 
  private:
-  bool WriteRecords(const std::string& bytes);
+  bool WriteRecords(const std::string& bytes, bool sync = true);
 
   std::string dir_;
   std::string path_;
