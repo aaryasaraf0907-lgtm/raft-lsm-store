@@ -390,7 +390,12 @@ on by default in `raftkv_node` (every 10,000 applied entries), so the Raft log s
 - **No leader leases.** Reads still need a confirmation round (now shared by concurrent reads). Leases
   would remove it at the cost of depending on bounded clock drift.
 - **Snapshots are built in memory**, so a snapshot must fit in RAM; streaming them would remove that.
-- **Session table** grows by one small entry per client and never expires idle clients.
+- **Client sessions** are forgotten deterministically (idle for 1,000,000 log entries, or the least
+  recently active beyond 100,000 sessions); a request that might be a retry of a forgotten one is refused
+  with `SESSION_EXPIRED`, never applied twice. One narrow case remains: a client's *first* request,
+  retried after its session was already forgotten, can apply twice. Closing it needs server-assigned
+  client ids (registration through the log). All nodes must run the same version, or their expiry
+  decisions differ.
 - A storage failure aborts the node by design.
 
 Done since the first version of this document: snapshots of the engine's data, the persisted applied
