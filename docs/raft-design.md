@@ -173,9 +173,22 @@ matter how many clients there are. Concurrent proposals are therefore batched:
 - A proposer queues its command and, if no batch is being written, becomes the **batcher**: it takes
   everything queued, appends it to the log with **one** write and **one** fsync, then wakes the others.
   While one batch is being written the next one accumulates, so batches grow with the load.
-- Every storage write still happens under the node lock, exactly as before; only the number of fsyncs
-  per entry changes. A background persister thread would also let the leader's fsync overlap the
-  followers', but it interleaves with follower truncation, snapshots and step-down, so it was not done.
+- **The leader's fsync overlaps the followers'** (Raft thesis 10.2.1). Under the node lock the batcher
+  writes the batch to the log file without syncing it and sends it to the followers at once; then it
+  syncs **outside** the lock, while the followers write theirs. The leader counts itself toward a commit
+  majority only up to `durable_index_`, the last index known to be on its disk; followers still sync
+  before acknowledging. So a commit still means a majority holds the entry on disk, and a write waits for
+  about one fsync instead of two in a row.
+- The sync goes through a `dup()` of the log's descriptor, so it needs no lock: if a compaction replaces
+  the file meanwhile, syncing the old one is harmless (the compaction wrote and synced everything it
+  kept). `log_epoch_` changes whenever entries are removed (truncation, snapshot install), so a sync
+  that finishes after its entries were replaced cannot mark the replacements durable. At startup a node
+  syncs its loaded log once, so entries written but not yet synced before a restart cannot count as
+  durable. Every other storage write (votes, truncations, the leader's no-op and configuration
+  entries, a follower's appends) is still synchronous under the lock; a storage that does not
+  implement the split (`AppendEntriesNoSync`, `PrepareSync`) stays fully synchronous.
+- Measured with simulated 150 ms fsyncs (`FsyncOverlap.AWriteWaitsForOneFsyncNotTwo`): a write takes about
+  150 ms instead of about 300 ms.
 - **Adaptive delay.** Proposers that just finished a batch are about to propose again. If the next batcher
   wrote at once it would catch only the stragglers, and the group would fall apart into tiny batches
   (it did, on a laptop: 161 writes for 320 proposals). So a batcher waits up to 2 ms for as many proposals
@@ -391,6 +404,7 @@ In practice: start the new node with `raftkv_node --join` (or `scripts/run_clust
 | Follower down while the leader compacts its log | It is sent the leader's snapshot, which replaces its engine's data | `NodeClusterTest.ALaggingFollowerCatchesUpFromASnapshotThatReplacesItsOldData` |
 | A node loses its engine's WAL or whole data directory | Rebuilt from its Raft log or snapshot | `NodeClusterTest.ANodeWhoseEngineLostItsWalRebuildsFromTheRaftLog`, `...EngineDirectoryIsGone...` |
 | Many concurrent clients | Writes share fsyncs, reads share confirmation rounds | `GroupCommit.*`, `ReadBatching.*` |
+| The leader's disk is slow | It replicates before its own fsync finishes, but counts itself toward a commit only once its copy is on disk | `FsyncOverlap.TheLeaderDoesNotCountItselfBeforeItsOwnFsync` |
 | A machine dies and is replaced | Its id is removed and a new node is added; the new node catches up first | `Membership.AFailedServerIsReplacedByANewOne`, `NodeClusterTest.ANewNodeIsAddedOverGrpcAndAnOldOneRemoved` |
 | The leader removes itself | It leads until the change commits, then steps down; the others elect a leader | `Membership.TheLeaderCanRemoveItselfAndHandsOver` |
 
@@ -409,6 +423,12 @@ In practice: start the new node with `raftkv_node --join` (or `scripts/run_clust
   time, and the configuration surviving snapshots and a full restart. One rule is not covered by a
   test: a new leader waiting for an entry of its own term before a change (it needs a leader that has
   been elected but cannot commit, which the simulated network cannot arrange deterministically).
+- **Overlapped fsyncs** (`fsync_overlap_test.cpp`): with simulated slow disks, a write waits for one
+  fsync, not two; the leader and one fast follower (an exact majority) do not commit before the leader's
+  own fsync finishes; acknowledged writes survive a full restart; the file storage's duplicate-descriptor
+  sync survives a compaction that replaces the log file. Two defensive guards are not covered by a test:
+  `log_epoch_` (it needs a sync to outlast a lost leadership, a truncation and a re-election) and the
+  sync of the loaded log at startup (it protects against a machine crash, which a test cannot cause).
 - **Fault injection.** `FakeNetwork` can also drop, duplicate, delay and reorder messages and cut single
   links, while checkers verify election safety, log agreement and that committed entries survive
   (`docs/fault-injection.md`).
@@ -431,8 +451,6 @@ In practice: start the new node with `raftkv_node --join` (or `scripts/run_clust
   first; the same id may then be added again with an empty data directory.
 - **A removed server is not told.** It stops receiving messages and stays idle (PreVote keeps it from
   disrupting the others); stop it once its removal has committed.
-- **The leader's and the followers' fsyncs are not overlapped.** A write waits for the leader's fsync
-  and then a follower's; a background persister thread would let them run in parallel (see group commit).
 - **No leader leases.** Reads still need a confirmation round (now shared by concurrent reads). Leases
   would remove it at the cost of depending on bounded clock drift.
 - **Snapshots are built in memory**, so a snapshot must fit in RAM; streaming them would remove that.
@@ -446,7 +464,7 @@ In practice: start the new node with `raftkv_node --join` (or `scripts/run_clust
 
 Done since the first version of this document: snapshots of the engine's data, the persisted applied
 index, `InstallSnapshot` and PreVote over gRPC, group commit for writes, batching for reads, client
-session expiry, and membership changes.
+session expiry, membership changes, and the leader's fsync overlapping the followers'.
 
 ## 13. Where the paper's rules live
 
@@ -462,4 +480,5 @@ session expiry, and membership changes.
 | InstallSnapshot RPC | `SendSnapshotChunkLocked`, `HandleInstallSnapshot`, `InstallSnapshotLocked` |
 | Log compaction | `CompactLocked` |
 | Read-only operations | `ReadIndex` |
+| The leader writes its disk in parallel with replication (thesis 10.2.1) | `SubmitProposal`, `durable_index_`, `AdvanceCommitIndexLocked` |
 | Membership changes (thesis chapter 4) | `AddServer`, `RemoveServer`, `RecomputeConfigLocked`, `MajorityLocked` |
