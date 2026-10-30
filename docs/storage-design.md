@@ -226,7 +226,8 @@ encoded-block search does); a node flag for it is left as a follow-up.
 values: an empty `end` means no upper bound, `limit == 0` means no limit, `start >= end` (with a
 non-empty `end`) gives an empty result. Deleted keys and the engine's reserved keys are never returned
 and do not count against `limit`. On an error `out` is empty and the status is returned. It works in
-both modes and is not part of `KVStore` or of the client/gRPC API.
+both modes and is not part of `KVStore`. Clients reach it through the `Scan` RPC (`raftkv_cli scan`),
+which runs it only after ReadIndex, so a client's scan is linearizable like a `Get`.
 
 It takes the view as `Get` does and builds one source per layer, newest first, each positioned at
 `start`: the active memtable and every frozen memtable (`MemTable::NewIterator(start)`) and every SSTable
