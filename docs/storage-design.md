@@ -159,8 +159,8 @@ which; section 8 describes how each caller handles it.
 `LoadManifest` reports a missing manifest as `found = false` with `kOk` (a fresh directory). A
 manifest that exists but cannot be opened is `kIOError`; one that fails to decode returns the
 `DecodeManifest` status, `kCorruption` for a damaged manifest, never "empty". The existence check
-(`std::filesystem::exists(path, ec)`) does not inspect `ec`, so a filesystem error during that check
-may be reported as a missing manifest.
+(`std::filesystem::exists(path, ec)`) does inspect `ec`: a filesystem error during that check (for
+example a symlink loop) is `kIOError`, never a missing manifest.
 
 Every manifest store happens while holding `write_mu_` (the flush and compaction commits, and
 `InstallCheckpoint`), so there is never more than one store in progress. This is what
@@ -391,7 +391,8 @@ These documents are not changed by this one; they are listed so readers know whi
 
 - `docs/sstable-format.md` Appendix A.3–A.4 recommends an **append-only** manifest log of edits.
   The implementation replaces the **whole** manifest atomically (section 5).
-- `docs/raft-design.md` §11 lists an engine checkpoint and a persisted applied index as future
-  work. Both exist: `Checkpoint` / `InstallCheckpoint` (section 9), and the applied index is an
-  ordinary reserved key written with every `PutAt` / `DeleteAt` (section 3) and skipped on replay by
-  `KVStateMachine`.
+- `docs/raft-design.md` §11 records the engine checkpoint and the persisted applied index as done.
+  Both exist: `Checkpoint` / `InstallCheckpoint` (section 9), and the applied index is an ordinary
+  reserved key written with every `PutAt` / `DeleteAt` (section 3) as a second record after the data
+  record. On replay after a restart, `KVStateMachine` skips the store writes for entries at or below
+  the index the engine reports, but still replays their client-session effects.
