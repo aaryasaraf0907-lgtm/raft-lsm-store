@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "node/node_runtime.h"
+#include "node/option_parsing.h"
 
 namespace {
 
@@ -35,6 +36,8 @@ void Usage(FILE* out) {
       "  --no-sstables        use the old WAL + memtable engine instead of the LSM engine\n"
       "  --memtable-bytes N   flush a memtable to an SSTable at this size (default 4194304)\n"
       "  --compaction-trigger N  merge SSTables when N are live; 0 = never (default 4)\n"
+      "  --block-cache-bytes N  keep up to N bytes of decoded SSTable blocks in memory; 0 = no cache\n"
+      "                       (default 0). Plain decimal digits only (no units); LSM engine only\n"
       "  --snapshot-threshold N  snapshot the data and drop the Raft log every N applied entries;\n"
       "                       0 = never (default 10000)\n"
       "  --snapshot-trailing N  Raft log entries kept below each snapshot (default 100)\n"
@@ -51,8 +54,9 @@ bool ParsePeers(const std::string& list, std::map<raftkv::NodeId, std::string>* 
   while (std::getline(ss, item, ',')) {
     const size_t eq = item.find('=');
     if (eq == std::string::npos || eq == 0 || eq + 1 == item.size()) return false;
+    const std::string id_text = item.substr(0, eq);  // `end` points into it, so it must outlive the check
     char* end = nullptr;
-    const unsigned long id = std::strtoul(item.substr(0, eq).c_str(), &end, 10);
+    const unsigned long id = std::strtoul(id_text.c_str(), &end, 10);
     if (*end != '\0' || id == 0) return false;
     (*out)[static_cast<raftkv::NodeId>(id)] = item.substr(eq + 1);
   }
@@ -98,6 +102,13 @@ int main(int argc, char** argv) {
       options.memtable_bytes = static_cast<size_t>(std::strtoull(value("--memtable-bytes"), nullptr, 10));
     } else if (arg == "--compaction-trigger") {
       options.compaction_trigger = static_cast<size_t>(std::strtoull(value("--compaction-trigger"), nullptr, 10));
+    } else if (arg == "--block-cache-bytes") {
+      if (!raftkv::ParseByteCount(value("--block-cache-bytes"), &options.block_cache_bytes)) {
+        std::fputs("raftkv_node: --block-cache-bytes must be a non-negative whole number of bytes "
+                   "(digits only, no sign or unit) that fits in 64 bits\n",
+                   stderr);
+        return 2;
+      }
     } else if (arg == "--snapshot-threshold") {
       options.snapshot_threshold_entries = static_cast<size_t>(std::strtoull(value("--snapshot-threshold"), nullptr, 10));
     } else if (arg == "--snapshot-trailing") {
@@ -130,6 +141,9 @@ int main(int argc, char** argv) {
                stderr);
     Usage(stderr);
     return 2;
+  }
+  if (!options.use_sstables && options.block_cache_bytes != 0) {
+    std::fputs("raftkv_node: warning: --block-cache-bytes has no effect with --no-sstables\n", stderr);
   }
   for (const auto& p : peers) options.cluster.push_back(p.first);
   options.raft_listen = raft_addr.empty() ? peers[options.id] : raft_addr;

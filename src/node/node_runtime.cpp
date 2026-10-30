@@ -90,10 +90,14 @@ void NodeRuntime::Start() {
   engine_options.use_sstables = options_.use_sstables;
   engine_options.memtable_bytes = options_.memtable_bytes;
   engine_options.compaction_trigger = options_.compaction_trigger;
+  engine_options.block_cache_bytes = options_.block_cache_bytes;
   const Status opened = KVEngine::Open(engine_options, &engine_);
   if (opened != Status::kOk) {
-    throw std::runtime_error("cannot open the storage engine in " + engine_options.dir +
-                             " (status " + std::to_string(static_cast<int>(opened)) + ")");
+    std::string why = " (status " + std::to_string(static_cast<int>(opened)) + ")";
+    if (opened == Status::kIOError) {
+      why += "; if another raftkv_node is running on this data directory, stop it first";
+    }
+    throw std::runtime_error("cannot open the storage engine in " + engine_options.dir + why);
   }
   machine_ = std::make_unique<KVStateMachine>(engine_.get());
 
