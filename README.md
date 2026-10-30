@@ -20,6 +20,9 @@ Built as a data structures and algorithms course project at VIT Pune. It runs on
   behind the compacted log is sent the leader's snapshot in chunks.
 - **Group commit**: concurrent proposals share one log write and one fsync, with an adaptive batching
   delay so that batching survives slow thread wake-ups.
+- **Membership changes**: nodes are added and removed one at a time while the cluster keeps serving
+  (Raft thesis, chapter 4); a new node catches up as a non-voting learner before it counts toward any
+  majority, and the configuration survives log compaction inside snapshots.
 
 **Storage (LSM tree)**
 - A concurrent **skip-list memtable** behind a checksummed **write-ahead log**.
@@ -106,6 +109,13 @@ scripts/run_cluster.sh restart 1
 scripts/run_cluster.sh stop
 scripts/run_cluster.sh clean
 ```
+Grow or shrink a running cluster (each node's `status` line ends with its members):
+```
+scripts/run_cluster.sh start 3
+scripts/run_cluster.sh add 4
+scripts/run_cluster.sh remove 2
+scripts/run_cluster.sh status
+```
 Every flag of `raftkv_node` and `raftkv_cli` is described in
 [`docs/running-a-cluster.md`](docs/running-a-cluster.md).
 
@@ -166,9 +176,8 @@ and macOS:
 
 ## Limitations
 
-- **Fixed membership.** The set of nodes is fixed at start-up. A node must keep its disk: one that is
-  wiped and rejoins under the same id breaks Raft's assumption that persisted state survives, and
-  replacing a machine would need membership change, which is not implemented.
+- **Membership changes one server at a time** (no joint consensus), and a member must keep its disk:
+  to replace a machine, remove its id and add the new node (`run_cluster.sh remove`, then `add`).
 - **Snapshots are built in memory**, so a snapshot must fit in RAM.
 - **No range scans.** The API is `Put`, `Get` and `Delete`.
 - **macOS and Linux only.** Windows users can use WSL2.
