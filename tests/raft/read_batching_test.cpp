@@ -68,7 +68,9 @@ TEST(ReadBatching, ConcurrentReadsShareRoundsInsteadOfEachSendingOne) {
 // A read that arrives while a round is in flight cannot use that round; it must not then have to wait
 // for the next heartbeat. Every message is delayed 100 ms, so the first read's round takes ~200 ms;
 // a second read starts 50 ms in, during that round, and nothing else happens afterwards. Its own
-// round must start as soon as the first one is acknowledged: ~400 ms in all, not the 2 s heartbeat.
+// round must start as soon as the first one is acknowledged: ~350 ms in all. Waiting for the heartbeat
+// instead (the bug this test exists for) takes ~2,100 ms. The limit sits well between the two, so a
+// slow shared CI machine (the macOS runner once measured 850 ms) does not fail a correct build.
 TEST(ReadBatching, AReadThatMissedTheInFlightRoundDoesNotWaitForAHeartbeat) {
   Cluster c(3, false, [](RaftConfig& cfg) {
     cfg.heartbeat_interval_ms = 2000;
@@ -93,7 +95,7 @@ TEST(ReadBatching, AReadThatMissedTheInFlightRoundDoesNotWaitForAHeartbeat) {
   const auto took = std::chrono::steady_clock::now() - start;
   first.join();
   c.net.HealAll();
-  EXPECT_LT(took, 800ms) << "the second read waited for a heartbeat instead of the follow-up round";
+  EXPECT_LT(took, 1400ms) << "the second read waited for a heartbeat instead of the follow-up round";
 }
 
 TEST(ReadBatching, ReadsStillCompleteWithAFollowerDown) {
