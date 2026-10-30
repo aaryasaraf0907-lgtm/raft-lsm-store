@@ -132,7 +132,7 @@ bool ApplyRecord(const char* payload, size_t len, PersistentState* st) {
         e.command.client_id = r.U64();
         e.command.seq = r.U64();
       }
-      if (!r.ok || cmd > static_cast<uint8_t>(CommandType::kNoop)) return false;
+      if (!r.ok || cmd > static_cast<uint8_t>(CommandType::kConfig)) return false;
       e.command.type = static_cast<CommandType>(cmd);
       if (e.index != st->log_base_index + st->log.size() + 1) return false;  // contiguous
       st->log.push_back(std::move(e));

@@ -10,7 +10,9 @@ using Term = uint64_t;
 using LogIndex = uint64_t;
 using NodeId = uint32_t;
 
-enum class CommandType : uint8_t { kPut, kDelete, kNoop };
+// kConfig carries a cluster configuration (membership change); it is created only by the Raft node
+// itself (AddServer / RemoveServer) and is never delivered to the state machine.
+enum class CommandType : uint8_t { kPut, kDelete, kNoop, kConfig };
 
 struct Command {
   CommandType type;

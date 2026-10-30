@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <set>
 #include <random>
 #include <thread>
 #include <vector>
@@ -36,6 +37,27 @@ struct RaftConfig {
   // Transport::SupportsPreVote). A node that is cut off then cannot inflate its term while it is
   // away and force a healthy leader to step down when it returns.
   bool enable_pre_vote = true;
+  // Start as a node that is NOT yet a member: it holds no configuration and never starts an
+  // election until the leader adds it (AddServer) and the new configuration reaches it through the
+  // log. Its peer list is then ignored. Without this, an empty peer list means a one-node cluster.
+  bool join_existing_cluster = false;
+};
+
+// Outcome of a membership change (AddServer / RemoveServer).
+enum class MembershipResult {
+  kOk,              // the new configuration is committed (or there was nothing to change)
+  kNotLeader,       // only the leader changes membership: see leader_hint
+  kInProgress,      // another change is not committed yet, or this leader has not yet committed an
+                    // entry of its own term (Raft thesis 4.1): try again shortly
+  kInvalid,         // bad id or address, or removing the last member
+  kCatchUpFailed,   // the new server did not catch up with the log in time; nothing was changed
+  kTimeout,         // the configuration entry was not committed in time: it may still commit
+  kLost,            // a new leader replaced the configuration entry: nothing was changed
+  kStopped,
+};
+struct MembershipResponse {
+  MembershipResult result = MembershipResult::kNotLeader;
+  NodeId leader_hint = 0;
 };
 
 enum class Role { kFollower, kCandidate, kLeader };
@@ -103,6 +125,26 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   LogIndex LastApplied() const;
   LogIndex SnapshotIndex() const;  // last log index covered by the snapshot (0 = none)
   size_t LogLength() const;
+
+  // ---- membership changes: one server at a time (Raft thesis, chapter 4) ----
+  // The configuration is the set of voting members, with the address of each (which the network
+  // layer needs to reach a new member; the Raft layer itself only uses the ids). It travels through
+  // the log as a kConfig entry, and every server uses the LATEST configuration in its log, committed
+  // or not. Adding or removing one server at a time is safe because any majority of the old
+  // configuration overlaps any majority of the new one.
+  //
+  // AddServer first replicates the log to the new server as a non-voting learner until it has caught
+  // up, so that adding it does not stall the cluster, then appends the new configuration and waits
+  // for it to commit. RemoveServer appends the configuration without the server; a leader that
+  // removes itself keeps leading until that entry commits, then steps down.
+  MembershipResponse AddServer(NodeId id, const std::string& address, std::chrono::milliseconds timeout);
+  MembershipResponse RemoveServer(NodeId id, std::chrono::milliseconds timeout);
+  std::map<NodeId, std::string> Configuration() const;  // the voting members and their addresses
+  bool IsMember() const;                                 // whether this node is a voting member
+  // Called with every server that should be reachable (members and learners) each time that set
+  // changes, under the node's lock: it must be quick and must not call back into the node.
+  using ConfigCallback = std::function<void(const std::map<NodeId, std::string>&)>;
+  void SetConfigCallback(ConfigCallback cb);
   // Replication messages (AppendEntries and InstallSnapshot) this node has sent as leader. For tests.
   uint64_t ReplicationMessagesSent() const;        // log entries still stored (after the snapshot)
 
@@ -122,7 +164,7 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   void StartElectionLocked();
   void StartElectionOrPreVoteLocked();
   void StartPreVoteLocked();
-  void OnPreVoteReply(uint64_t round, const PreVoteReply& reply);
+  void OnPreVoteReply(uint64_t round, NodeId from, const PreVoteReply& reply);
   void NoteLeaderContactLocked();
   void BecomeFollowerLocked(Term term, bool persist = true);
   void BecomeLeaderLocked();
@@ -166,7 +208,7 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   std::atomic<size_t> inflight_proposers_{0};
   static constexpr std::chrono::microseconds kBatchWait{2000};
   void ResetElectionDeadlineLocked();
-  void OnRequestVoteReply(Term election_term, const RequestVoteReply& reply);
+  void OnRequestVoteReply(Term election_term, NodeId from, const RequestVoteReply& reply);
   void OnAppendEntriesReply(NodeId peer, Term sent_term, uint64_t seq, LogIndex prev_index,
                             size_t n_entries, const AppendEntriesReply& reply);
   void RecordAckLocked(NodeId peer, uint64_t seq);
@@ -179,7 +221,35 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   void PersistTruncateLocked(LogIndex from_index);
 
   const NodeId id_;
-  const std::vector<NodeId> peers_;
+  const std::vector<NodeId> peers_;  // the initial configuration's other members (see initial_config_)
+  // ---- membership (guarded by mu_) ----
+  using ClusterConfig = std::map<NodeId, std::string>;  // member id -> address (may be empty)
+  ClusterConfig initial_config_;   // before any kConfig entry or snapshot: ourselves + peers_
+  ClusterConfig snapshot_config_;  // the configuration as of snapshot_index_
+  ClusterConfig config_;           // the configuration in force: the latest in the log
+  LogIndex config_index_ = 0;      // index of the kConfig entry config_ came from (0: none in the log)
+  ClusterConfig learners_;         // leader only: being caught up before becoming voters
+  ConfigCallback config_cb_;
+  bool IsMemberLocked(NodeId id) const { return config_.count(id) != 0; }
+  std::vector<NodeId> VotersExceptSelfLocked() const;
+  std::vector<NodeId> ReplicationTargetsLocked() const;  // members (but us) and learners
+  // Whether a majority of the current configuration satisfies `has`.
+  bool MajorityLocked(const std::function<bool(NodeId)>& has) const;
+  void RecomputeConfigLocked();
+  ClusterConfig ConfigAtLocked(LogIndex index) const;  // the configuration in force at `index`
+  void EnsurePeerStateLocked(NodeId peer);
+  void NotifyConfigLocked();
+  MembershipResponse ChangePreconditionsLocked() const;
+  LogIndex AppendConfigEntryLocked(const ClusterConfig& config);
+  MembershipResponse WaitForConfigCommitLocked(std::unique_lock<std::mutex>& lk, LogIndex index, Term term,
+                                               std::chrono::steady_clock::time_point deadline);
+  static std::string EncodeConfig(const ClusterConfig& config);
+  static bool DecodeConfig(const std::string& text, ClusterConfig* config);
+  // Snapshot bytes as stored and sent carry the configuration at the snapshot point in front of the
+  // state machine's data. Snapshots written before membership changes existed have no envelope;
+  // they mean the initial configuration.
+  static std::string WrapSnapshot(const ClusterConfig& config, const std::string& data);
+  static bool UnwrapSnapshot(const std::string& stored, ClusterConfig* config, std::string* data);
   Transport* transport_;
   const RaftConfig cfg_;
   RaftStorage* storage_;
@@ -198,7 +268,7 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   Term current_term_ = 0;
   NodeId voted_for_ = 0;
   NodeId leader_hint_ = 0;
-  int votes_ = 0;
+  std::set<NodeId> votes_from_;  // who voted for us in the current election
   // log_[0] stands for the last entry that has been dropped from the log (index base_index_, term
   // base_term_; both 0 if nothing was dropped), so the entry with index i is
   // log_[i - base_index_] and real entries start at base_index_ + 1.
@@ -249,7 +319,7 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   // an earlier round are ignored.
   bool prevote_active_ = false;
   uint64_t prevote_round_ = 0;
-  int prevotes_ = 0;
+  std::set<NodeId> prevotes_from_;  // who granted our current pre-vote
   // When we last heard from a valid leader. A node that heard one within the minimum election
   // timeout refuses to pre-vote: the leader is alive, so nobody should be starting an election.
   bool have_leader_contact_ = false;

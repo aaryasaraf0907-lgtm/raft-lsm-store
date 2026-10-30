@@ -6,6 +6,7 @@ enum CommandType {
   COMMAND_TYPE_PUT = 0;
   COMMAND_TYPE_DELETE = 1;
   COMMAND_TYPE_NOOP = 2;
+  COMMAND_TYPE_CONFIG = 3;  // a cluster configuration (membership change)
 }
 
 message Command {

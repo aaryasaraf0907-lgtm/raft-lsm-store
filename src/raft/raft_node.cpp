@@ -48,6 +48,17 @@ RaftNodeImpl::RaftNodeImpl(NodeId id, std::vector<NodeId> peers, Transport* tran
       restore_pending_ = true;  // the applier restores the state machine before applying more
     }
   }
+  if (!cfg_.join_existing_cluster) {  // a joining node has no configuration until it is added
+    initial_config_[id_] = "";
+    for (NodeId peer : peers_) initial_config_[peer] = "";
+  }
+  snapshot_config_ = initial_config_;
+  if (snapshot_index_ > 0) {
+    ClusterConfig stored;
+    std::string unused;
+    if (UnwrapSnapshot(snapshot_data_, &stored, &unused)) snapshot_config_ = stored;
+  }
+  RecomputeConfigLocked();
 }
 
 RaftNodeImpl::~RaftNodeImpl() { Stop(); }
@@ -146,6 +157,7 @@ struct InflightGuard {  // counts a proposer for as long as it is inside Propose
 }  // namespace
 
 ProposeResponse RaftNodeImpl::Propose(const Command& cmd) {
+  if (cmd.type == CommandType::kConfig) return {ProposeResult::kNotLeader, 0, 0};  // use AddServer/RemoveServer
   InflightGuard inflight(inflight_proposers_);
   PendingProposal p;
   p.cmd = cmd;
@@ -155,6 +167,7 @@ ProposeResponse RaftNodeImpl::Propose(const Command& cmd) {
 }
 
 CommitResponse RaftNodeImpl::ProposeAndWait(const Command& cmd, std::chrono::milliseconds timeout) {
+  if (cmd.type == CommandType::kConfig) return {CommitResult::kLost, 0, 0};  // use AddServer/RemoveServer
   InflightGuard inflight(inflight_proposers_);
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   PendingProposal p;
@@ -217,12 +230,11 @@ void RaftNodeImpl::RecordAckLocked(NodeId peer, uint64_t seq) {
 }
 
 bool RaftNodeImpl::MajorityAckedAfterLocked(uint64_t mark) const {
-  size_t acks = 1;  // ourselves
-  for (NodeId peer : peers_) {
-    auto it = acked_seq_.find(peer);
-    if (it != acked_seq_.end() && it->second > mark) ++acks;
-  }
-  return acks > (peers_.size() + 1) / 2;
+  return MajorityLocked([&](NodeId m) {
+    if (m == id_) return true;
+    auto it = acked_seq_.find(m);
+    return it != acked_seq_.end() && it->second > mark;
+  });
 }
 
 uint64_t RaftNodeImpl::ReplicationMessagesSent() const {
@@ -354,7 +366,9 @@ void RaftNodeImpl::ApplierLoop() {
 
     if (restore_pending_) {
       restore_pending_ = false;  // a snapshot installed while we restore sets it again
-      std::string data = snapshot_data_;
+      std::string data;
+      ClusterConfig unused;
+      if (!UnwrapSnapshot(snapshot_data_, &unused, &data)) data = snapshot_data_;
       const LogIndex index = snapshot_index_;
       SnapshotRestorer restore = snap_restorer_;
       lk.unlock();
@@ -372,7 +386,7 @@ void RaftNodeImpl::ApplierLoop() {
 
     lk.unlock();
     for (const LogEntry& e : batch) {
-      if (e.command.type != CommandType::kNoop) cb(e);
+      if (e.command.type != CommandType::kNoop && e.command.type != CommandType::kConfig) cb(e);
     }
     lk.lock();
     if (!restore_pending_) last_applied_ = batch_end;  // else the restore sets it, further ahead
@@ -422,7 +436,11 @@ void RaftNodeImpl::NoteLeaderContactLocked() {
 // An election timer fired. With PreVote we first ask, without touching any state, whether a real
 // election could be won; only a majority of "yes" turns into one.
 void RaftNodeImpl::StartElectionOrPreVoteLocked() {
-  if (cfg_.enable_pre_vote && !peers_.empty() && transport_->SupportsPreVote()) {
+  if (!IsMemberLocked(id_)) {  // not a voting member (joining, or removed): never campaign
+    ResetElectionDeadlineLocked();
+    return;
+  }
+  if (cfg_.enable_pre_vote && !VotersExceptSelfLocked().empty() && transport_->SupportsPreVote()) {
     StartPreVoteLocked();
   } else {
     StartElectionLocked();
@@ -433,20 +451,20 @@ void RaftNodeImpl::StartPreVoteLocked() {
   role_ = Role::kFollower;  // a candidate whose election timed out starts over as a follower
   prevote_active_ = true;
   ++prevote_round_;
-  prevotes_ = 1;  // ourselves
+  prevotes_from_ = {id_};
   leader_hint_ = 0;
   ResetElectionDeadlineLocked();  // if this round gets no majority, the next timeout retries
   // Nothing is persisted and our term is unchanged: only the PROPOSED term goes on the wire.
   PreVoteRequest req{current_term_ + 1, id_, LastLogIndexLocked(), LastLogTermLocked()};
   const uint64_t round = prevote_round_;
-  for (NodeId peer : peers_) {
-    transport_->SendPreVote(peer, req, [this, round](const PreVoteReply& reply) {
-      OnPreVoteReply(round, reply);
+  for (NodeId peer : VotersExceptSelfLocked()) {
+    transport_->SendPreVote(peer, req, [this, round, peer](const PreVoteReply& reply) {
+      OnPreVoteReply(round, peer, reply);
     });
   }
 }
 
-void RaftNodeImpl::OnPreVoteReply(uint64_t round, const PreVoteReply& reply) {
+void RaftNodeImpl::OnPreVoteReply(uint64_t round, NodeId from, const PreVoteReply& reply) {
   std::lock_guard<std::mutex> lk(mu_);
   if (!running_) return;
   if (reply.term > current_term_) {  // we are behind: adopt the newer term, no election for us
@@ -454,9 +472,8 @@ void RaftNodeImpl::OnPreVoteReply(uint64_t round, const PreVoteReply& reply) {
     return;
   }
   if (!prevote_active_ || round != prevote_round_ || !reply.granted) return;
-  ++prevotes_;
-  const size_t cluster_size = peers_.size() + 1;
-  if (static_cast<size_t>(prevotes_) > cluster_size / 2) {
+  prevotes_from_.insert(from);  // only members' answers count (MajorityLocked looks at members only)
+  if (MajorityLocked([&](NodeId m) { return prevotes_from_.count(m) != 0; })) {
     prevote_active_ = false;
     StartElectionLocked();  // the real thing: new term, persisted, RequestVote
   }
@@ -466,26 +483,26 @@ void RaftNodeImpl::StartElectionLocked() {
   role_ = Role::kCandidate;
   ++current_term_;
   voted_for_ = id_;  // vote for ourselves
-  votes_ = 1;
+  votes_from_ = {id_};
   leader_hint_ = 0;
   ResetElectionDeadlineLocked();
   PersistHardStateLocked();  // our new term and our own vote must be durable before asking for votes
 
-  if (peers_.empty()) {  // single-node cluster wins immediately
+  if (MajorityLocked([&](NodeId m) { return votes_from_.count(m) != 0; })) {  // e.g. a one-node cluster
     BecomeLeaderLocked();
     return;
   }
 
   RequestVoteRequest req{current_term_, id_, LastLogIndexLocked(), LastLogTermLocked()};
   Term election_term = current_term_;
-  for (NodeId peer : peers_) {
-    transport_->SendRequestVote(peer, req, [this, election_term](const RequestVoteReply& reply) {
-      OnRequestVoteReply(election_term, reply);
+  for (NodeId peer : VotersExceptSelfLocked()) {
+    transport_->SendRequestVote(peer, req, [this, election_term, peer](const RequestVoteReply& reply) {
+      OnRequestVoteReply(election_term, peer, reply);
     });
   }
 }
 
-void RaftNodeImpl::OnRequestVoteReply(Term election_term, const RequestVoteReply& reply) {
+void RaftNodeImpl::OnRequestVoteReply(Term election_term, NodeId from, const RequestVoteReply& reply) {
   std::lock_guard<std::mutex> lk(mu_);
   if (!running_) return;
   if (reply.term > current_term_) {
@@ -495,16 +512,19 @@ void RaftNodeImpl::OnRequestVoteReply(Term election_term, const RequestVoteReply
   // Ignore stale replies from an older election, or if we are no longer a candidate.
   if (role_ != Role::kCandidate || current_term_ != election_term || !reply.vote_granted) return;
 
-  ++votes_;
-  size_t cluster_size = peers_.size() + 1;
-  if (static_cast<size_t>(votes_) > cluster_size / 2) BecomeLeaderLocked();  // majority
+  votes_from_.insert(from);
+  if (MajorityLocked([&](NodeId m) { return votes_from_.count(m) != 0; })) BecomeLeaderLocked();
 }
 
 void RaftNodeImpl::BecomeLeaderLocked() {
   role_ = Role::kLeader;
   leader_hint_ = id_;
   snap_offset_.clear();
-  for (NodeId peer : peers_) {
+  if (!learners_.empty()) {  // learners belong to the leader that was adding them
+    learners_.clear();
+    NotifyConfigLocked();
+  }
+  for (NodeId peer : ReplicationTargetsLocked()) {
     next_index_[peer] = LastLogIndexLocked() + 1;  // optimistic: assume followers are caught up
     match_index_[peer] = 0;                        // nothing is known to be replicated yet
   }
@@ -527,7 +547,7 @@ void RaftNodeImpl::BroadcastAppendEntriesLocked() {
   read_round_in_flight_ = true;
   read_round_wanted_ = false;    // this round serves every read that was waiting for one
   next_heartbeat_ = Clock::now() + std::chrono::milliseconds(cfg_.heartbeat_interval_ms);
-  for (NodeId peer : peers_) SendAppendEntriesToLocked(peer);
+  for (NodeId peer : ReplicationTargetsLocked()) SendAppendEntriesToLocked(peer);
 }
 
 // Sends the follower everything from next_index_ onwards (empty = plain heartbeat).
@@ -641,16 +661,23 @@ void RaftNodeImpl::OnAppendEntriesReply(NodeId peer, Term sent_term, uint64_t se
 // Commit rule: an entry is committed once a majority stores it AND it is from the current
 // term. Entries from earlier terms become committed indirectly, when a later one does.
 void RaftNodeImpl::AdvanceCommitIndexLocked() {
-  size_t cluster_size = peers_.size() + 1;
   for (LogIndex n = LastLogIndexLocked(); n > commit_index_; --n) {
     if (EntryLocked(n).term != current_term_) break;  // older terms cannot commit yet
-    size_t replicas = 1;                       // the leader itself
-    for (NodeId peer : peers_) {
-      if (match_index_[peer] >= n) ++replicas;
-    }
-    if (replicas > cluster_size / 2) {
+    // A majority of the CURRENT configuration. The leader counts only if it is a member: a leader
+    // that is removing itself commits the new configuration with the other servers alone.
+    const bool replicated = MajorityLocked([&](NodeId m) {
+      if (m == id_) return true;
+      auto it = match_index_.find(m);
+      return it != match_index_.end() && it->second >= n;
+    });
+    if (replicated) {
       commit_index_ = n;
       apply_cv_.notify_all();
+      wait_cv_.notify_all();  // a membership change waiting for its entry to commit
+      if (role_ == Role::kLeader && !IsMemberLocked(id_) && config_index_ != 0 && commit_index_ >= config_index_) {
+        BecomeFollowerLocked(current_term_);  // we removed ourselves and that is committed: step down
+        leader_hint_ = 0;
+      }
       break;
     }
   }
@@ -745,6 +772,9 @@ AppendEntriesReply RaftNodeImpl::HandleAppendEntries(const AppendEntriesRequest&
   }
   if (!appended.empty()) PersistAppendLocked(appended);  // durable before we acknowledge
   if (truncated) wait_cv_.notify_all();  // entries a waiter proposed may just have been replaced
+  bool config_changed = truncated;  // a truncation may have removed a configuration entry
+  for (const LogEntry& e : appended) config_changed = config_changed || e.command.type == CommandType::kConfig;
+  if (config_changed) RecomputeConfigLocked();  // in force as soon as it is in the log
 
   // Follow the leader's commit point, but never past what this message verified.
   LogIndex last_new = req.prev_log_index + req.entries.size();
@@ -805,6 +835,12 @@ void RaftNodeImpl::InstallSnapshotLocked(LogIndex index, Term term, std::string 
   snapshot_index_ = index;
   snapshot_term_ = term;
   snapshot_data_ = std::move(data);
+  {
+    ClusterConfig at_snapshot;
+    std::string unused;
+    snapshot_config_ = UnwrapSnapshot(snapshot_data_, &at_snapshot, &unused) ? at_snapshot : initial_config_;
+  }
+  RecomputeConfigLocked();
   commit_index_ = std::max(commit_index_, index);
   restore_pending_ = true;  // the applier restores the state machine, then continues after `index`
   apply_cv_.notify_all();
@@ -816,6 +852,8 @@ void RaftNodeImpl::InstallSnapshotLocked(LogIndex index, Term term, std::string 
 // entries up to `index`, which stay so that a slightly slow follower needs no snapshot.
 void RaftNodeImpl::CompactLocked(LogIndex index, std::string data) {
   const Term term = EntryLocked(index).term;
+  const ClusterConfig at_snapshot = ConfigAtLocked(index);  // the log that carried it is being dropped
+  data = WrapSnapshot(at_snapshot, data);
   LogIndex new_base = index > cfg_.snapshot_trailing_entries ? index - cfg_.snapshot_trailing_entries : 0;
   new_base = std::max(new_base, base_index_);  // the log never grows backwards
   const Term new_base_term = EntryLocked(new_base).term;
@@ -831,6 +869,7 @@ void RaftNodeImpl::CompactLocked(LogIndex index, std::string data) {
   snapshot_index_ = index;
   snapshot_term_ = term;
   snapshot_data_ = std::move(data);
+  snapshot_config_ = at_snapshot;
   snap_offset_.clear();  // any transfer in progress was of the older snapshot
 }
 
@@ -849,5 +888,239 @@ void RaftNodeImpl::PersistTruncateLocked(LogIndex from_index) {
 LogIndex RaftNodeImpl::LastLogIndexLocked() const { return log_.back().index; }
 
 Term RaftNodeImpl::LastLogTermLocked() const { return log_.back().term; }
+
+// ---- membership changes ----
+
+std::vector<NodeId> RaftNodeImpl::VotersExceptSelfLocked() const {
+  std::vector<NodeId> out;
+  for (const auto& m : config_) {
+    if (m.first != id_) out.push_back(m.first);
+  }
+  return out;
+}
+
+std::vector<NodeId> RaftNodeImpl::ReplicationTargetsLocked() const {
+  std::vector<NodeId> out = VotersExceptSelfLocked();
+  for (const auto& l : learners_) {
+    if (l.first != id_ && config_.count(l.first) == 0) out.push_back(l.first);
+  }
+  return out;
+}
+
+bool RaftNodeImpl::MajorityLocked(const std::function<bool(NodeId)>& has) const {
+  size_t yes = 0;
+  for (const auto& m : config_) yes += has(m.first) ? 1 : 0;
+  return !config_.empty() && yes > config_.size() / 2;
+}
+
+// The configuration in force is the latest kConfig entry in the log, committed or not; if there is
+// none, the one at the snapshot (or the initial one). Entries of the log below the snapshot index
+// that are still kept are covered: the latest configuration entry among them is the one in force at
+// the snapshot.
+void RaftNodeImpl::RecomputeConfigLocked() {
+  const ClusterConfig before = config_;
+  config_ = snapshot_config_;
+  config_index_ = 0;
+  for (size_t i = log_.size(); i-- > 1;) {
+    if (log_[i].command.type == CommandType::kConfig) {
+      MustSucceed(DecodeConfig(log_[i].command.value, &config_), "configuration entry in the log");
+      config_index_ = log_[i].index;
+      break;
+    }
+  }
+  if (config_ == before) return;
+  for (const auto& m : config_) learners_.erase(m.first);  // a learner that became a member
+  if (role_ == Role::kLeader) {
+    for (NodeId peer : ReplicationTargetsLocked()) EnsurePeerStateLocked(peer);
+  }
+  NotifyConfigLocked();
+}
+
+RaftNodeImpl::ClusterConfig RaftNodeImpl::ConfigAtLocked(LogIndex index) const {
+  for (size_t i = log_.size(); i-- > 1;) {
+    if (log_[i].index <= index && log_[i].command.type == CommandType::kConfig) {
+      ClusterConfig c;
+      MustSucceed(DecodeConfig(log_[i].command.value, &c), "configuration entry in the log");
+      return c;
+    }
+  }
+  return snapshot_config_;
+}
+
+void RaftNodeImpl::EnsurePeerStateLocked(NodeId peer) {
+  if (next_index_.count(peer) == 0) {
+    next_index_[peer] = LastLogIndexLocked() + 1;
+    match_index_[peer] = 0;
+  }
+}
+
+void RaftNodeImpl::NotifyConfigLocked() {
+  if (!config_cb_) return;
+  ClusterConfig all = config_;
+  for (const auto& l : learners_) all.insert(l);
+  config_cb_(all);
+}
+
+void RaftNodeImpl::SetConfigCallback(ConfigCallback cb) {
+  std::lock_guard<std::mutex> lk(mu_);
+  config_cb_ = std::move(cb);
+  NotifyConfigLocked();
+}
+
+std::map<NodeId, std::string> RaftNodeImpl::Configuration() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return config_;
+}
+
+bool RaftNodeImpl::IsMember() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return IsMemberLocked(id_);
+}
+
+// Only the leader changes membership, only one change at a time, and only once it has committed an
+// entry of its own term: a new leader may still hold an uncommitted configuration entry from an
+// earlier term, and changing again on top of it could break the overlap of majorities (the bug in
+// the original single-server algorithm, fixed in the Raft thesis erratum).
+MembershipResponse RaftNodeImpl::ChangePreconditionsLocked() const {
+  if (!running_) return {MembershipResult::kStopped, leader_hint_};
+  if (role_ != Role::kLeader) return {MembershipResult::kNotLeader, leader_hint_};
+  if (commit_index_ < term_start_index_) return {MembershipResult::kInProgress, id_};
+  if (config_index_ > commit_index_ || !learners_.empty()) return {MembershipResult::kInProgress, id_};
+  return {MembershipResult::kOk, id_};
+}
+
+LogIndex RaftNodeImpl::AppendConfigEntryLocked(const ClusterConfig& config) {
+  log_.push_back(LogEntry{current_term_, LastLogIndexLocked() + 1, Command{CommandType::kConfig, "", EncodeConfig(config)}});
+  PersistAppendLocked({log_.back()});
+  const LogIndex index = log_.back().index;
+  RecomputeConfigLocked();  // in force from now on, before it commits
+  AdvanceCommitIndexLocked();
+  BroadcastAppendEntriesLocked();
+  return index;
+}
+
+MembershipResponse RaftNodeImpl::WaitForConfigCommitLocked(std::unique_lock<std::mutex>& lk, LogIndex index, Term term,
+                                                          std::chrono::steady_clock::time_point deadline) {
+  for (;;) {
+    if (!running_) return {MembershipResult::kStopped, leader_hint_};
+    if (index > base_index_ && (index > LastLogIndexLocked() || EntryLocked(index).term != term)) {
+      return {MembershipResult::kLost, leader_hint_};  // replaced by another leader's entry
+    }
+    if (commit_index_ >= index) return {MembershipResult::kOk, leader_hint_};
+    if (std::chrono::steady_clock::now() >= deadline) return {MembershipResult::kTimeout, leader_hint_};
+    wait_cv_.wait_until(lk, std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(20)));
+  }
+}
+
+MembershipResponse RaftNodeImpl::AddServer(NodeId id, const std::string& address, std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  std::unique_lock<std::mutex> lk(mu_);
+  if (id == 0 || address.find_first_of(",=") != std::string::npos) return {MembershipResult::kInvalid, leader_hint_};
+  MembershipResponse pre = ChangePreconditionsLocked();
+  if (pre.result != MembershipResult::kOk) return pre;
+  if (IsMemberLocked(id)) return {MembershipResult::kOk, id_};  // nothing to do
+
+  // Catch-up: replicate to it as a learner (not counted in any majority) until it has the log.
+  // Rounds as in the thesis: each round waits for it to reach the leader's last index as of the
+  // round's start; a round that finishes within an election timeout means it has caught up.
+  learners_[id] = address;
+  EnsurePeerStateLocked(id);
+  NotifyConfigLocked();
+  SendAppendEntriesToLocked(id);
+  const auto round_limit = std::chrono::milliseconds(cfg_.election_timeout_max_ms);
+  bool caught_up = false;
+  for (int round = 0; round < 50 && !caught_up && std::chrono::steady_clock::now() < deadline; ++round) {
+    const LogIndex target = LastLogIndexLocked();
+    const auto round_start = std::chrono::steady_clock::now();
+    while (running_ && role_ == Role::kLeader && match_index_[id] < target && std::chrono::steady_clock::now() < deadline) {
+      wait_cv_.wait_for(lk, std::chrono::milliseconds(10));
+    }
+    if (!running_ || role_ != Role::kLeader) break;
+    caught_up = match_index_[id] >= target && std::chrono::steady_clock::now() - round_start <= round_limit;
+  }
+  if (!running_ || role_ != Role::kLeader || !caught_up) {
+    learners_.erase(id);
+    NotifyConfigLocked();
+    if (!running_) return {MembershipResult::kStopped, leader_hint_};
+    if (role_ != Role::kLeader) return {MembershipResult::kNotLeader, leader_hint_};
+    return {MembershipResult::kCatchUpFailed, id_};
+  }
+  ClusterConfig next = config_;
+  next[id] = address;
+  learners_.erase(id);
+  const Term term = current_term_;
+  const LogIndex index = AppendConfigEntryLocked(next);
+  return WaitForConfigCommitLocked(lk, index, term, deadline);
+}
+
+MembershipResponse RaftNodeImpl::RemoveServer(NodeId id, std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  std::unique_lock<std::mutex> lk(mu_);
+  MembershipResponse pre = ChangePreconditionsLocked();
+  if (pre.result != MembershipResult::kOk) return pre;
+  if (!IsMemberLocked(id)) return {MembershipResult::kOk, id_};  // nothing to do
+  if (config_.size() == 1) return {MembershipResult::kInvalid, id_};  // cannot remove the last member
+  ClusterConfig next = config_;
+  next.erase(id);
+  const Term term = current_term_;
+  const LogIndex index = AppendConfigEntryLocked(next);
+  return WaitForConfigCommitLocked(lk, index, term, deadline);
+}
+
+std::string RaftNodeImpl::EncodeConfig(const ClusterConfig& config) {
+  std::string out;
+  for (const auto& m : config) {
+    if (!out.empty()) out += ",";
+    out += std::to_string(m.first) + "=" + m.second;
+  }
+  return out;
+}
+
+bool RaftNodeImpl::DecodeConfig(const std::string& text, ClusterConfig* config) {
+  config->clear();
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t end = text.find(',', pos);
+    if (end == std::string::npos) end = text.size();
+    const std::string item = text.substr(pos, end - pos);
+    const size_t eq = item.find('=');
+    if (eq == std::string::npos || eq == 0) return false;
+    uint64_t id = 0;
+    for (size_t i = 0; i < eq; ++i) {
+      if (item[i] < '0' || item[i] > '9') return false;
+      id = id * 10 + static_cast<uint64_t>(item[i] - '0');
+    }
+    if (id == 0 || !config->emplace(static_cast<NodeId>(id), item.substr(eq + 1)).second) return false;
+    pos = end + 1;
+  }
+  return true;
+}
+
+namespace {
+constexpr char kSnapshotEnvelopeMagic[] = "RKVRCFG1";
+constexpr size_t kSnapshotEnvelopeMagicLen = sizeof(kSnapshotEnvelopeMagic) - 1;
+}  // namespace
+
+std::string RaftNodeImpl::WrapSnapshot(const ClusterConfig& config, const std::string& data) {
+  const std::string text = EncodeConfig(config);
+  std::string out(kSnapshotEnvelopeMagic, kSnapshotEnvelopeMagicLen);
+  const uint32_t len = static_cast<uint32_t>(text.size());
+  for (int i = 0; i < 4; ++i) out.push_back(static_cast<char>((len >> (8 * i)) & 0xFF));
+  out += text;
+  out += data;
+  return out;
+}
+
+bool RaftNodeImpl::UnwrapSnapshot(const std::string& stored, ClusterConfig* config, std::string* data) {
+  if (stored.size() < kSnapshotEnvelopeMagicLen + 4 || stored.compare(0, kSnapshotEnvelopeMagicLen, kSnapshotEnvelopeMagic) != 0) {
+    return false;  // written before membership changes existed: no envelope
+  }
+  uint32_t len = 0;
+  for (int i = 0; i < 4; ++i) len |= static_cast<uint32_t>(static_cast<uint8_t>(stored[kSnapshotEnvelopeMagicLen + static_cast<size_t>(i)])) << (8 * i);
+  const size_t start = kSnapshotEnvelopeMagicLen + 4;
+  MustSucceed(stored.size() - start >= len && DecodeConfig(stored.substr(start, len), config), "snapshot configuration");
+  *data = stored.substr(start + len);
+  return true;
+}
 
 }  // namespace raftkv
