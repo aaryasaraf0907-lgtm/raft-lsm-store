@@ -1,7 +1,5 @@
-// Point-read and range-scan micro-benchmark for KVEngine (SSTable mode).
-//
-// A minimal, reproducible measurement for the read path only; the full storage benchmark suite
-// (fill, overwrite, write amplification) is separate work. Built only with
+// Point-read and range-scan benchmark for KVEngine (SSTable mode). Fill, overwrite and write
+// amplification are measured by storage_write_bench.cpp. Built only with
 // -DRAFTKV_BUILD_BENCHMARKS=ON; use a Release build:
 //
 //   cmake -S . -B build-bench -DCMAKE_BUILD_TYPE=Release -DRAFTKV_BUILD_BENCHMARKS=ON
@@ -35,6 +33,7 @@
 #include <utility>
 #include <vector>
 
+#include "bench_common.h"
 #include "storage/kv_engine.h"
 
 namespace {
@@ -51,22 +50,10 @@ struct Args {
   std::string dir;
 };
 
-std::string Key(uint64_t n) {
-  char buf[32];
-  std::snprintf(buf, sizeof(buf), "k%015llu", static_cast<unsigned long long>(n));
-  return buf;
-}
+using raftkv::bench::Key;
+using raftkv::bench::Value;
 
-std::string Value(uint64_t n) {
-  std::string v = Key(n);
-  v.resize(100, static_cast<char>('a' + n % 26));
-  return v;
-}
-
-[[noreturn]] void Die(const char* what) {
-  std::fprintf(stderr, "storage_read_bench: %s\n", what);
-  std::exit(1);
-}
+[[noreturn]] void Die(const char* what) { raftkv::bench::Die("storage_read_bench", what); }
 
 Args Parse(int argc, char** argv) {
   Args a;
@@ -105,10 +92,10 @@ void Measure(const char* name, uint64_t n, int runs, const std::function<void()>
     const auto t0 = std::chrono::steady_clock::now();
     for (uint64_t i = 0; i < n; ++i) op();
     const auto t1 = std::chrono::steady_clock::now();
-    if (r >= 0) ns.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count() / n);
+    if (r >= 0) ns.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count() / static_cast<double>(n));
   }
-  std::sort(ns.begin(), ns.end());
-  std::printf("%-22s %12.1f %12.1f %12.1f\n", name, ns[ns.size() / 2], ns.front(), ns.back());
+  const raftkv::bench::Spread sp = raftkv::bench::Summarize(ns);
+  std::printf("%-22s %12.1f %12.1f %12.1f\n", name, sp.median, sp.min, sp.max);
 }
 
 }  // namespace
@@ -140,14 +127,9 @@ int main(int argc, char** argv) {
     if (db->Put(Key(n), Value(n)) != Status::kOk) Die("put failed");
   }
   // Wait until every frozen memtable is flushed (and, with a trigger, compactions are done).
-  for (;;) {
-    const KVEngine::Stats s = db->GetStats();
-    if (s.flush_failing) Die("flush failing");
-    const bool compacting = args.trigger >= 2 && s.sstables >= args.trigger;
-    if (s.frozen_memtables == 0 && !compacting) break;
-    std::this_thread::yield();
-  }
+  if (!raftkv::bench::WaitUntilIdle(*db, args.trigger)) Die("flush failing");
   const KVEngine::Stats s = db->GetStats();
+  raftkv::bench::PrintEnvironment("storage_read_bench");
   std::printf("keys %llu, reads/run %llu, runs %d, trigger %zu, cache_bytes %zu, sstables %zu\n",
               static_cast<unsigned long long>(args.keys), static_cast<unsigned long long>(args.reads),
               args.runs, args.trigger, args.cache_bytes, s.sstables);
