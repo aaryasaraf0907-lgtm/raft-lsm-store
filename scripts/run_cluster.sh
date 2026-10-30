@@ -5,7 +5,9 @@
 #   scripts/run_cluster.sh stop [ID]     stop one node (graceful), or all
 #   scripts/run_cluster.sh kill ID       crash a node (SIGKILL): it gets no chance to clean up
 #   scripts/run_cluster.sh restart ID    stop (if running) and start one node again
-#   scripts/run_cluster.sh status        role, term and log positions of every node
+#   scripts/run_cluster.sh status        role, term, log positions and members of every node
+#   scripts/run_cluster.sh add ID        start a NEW node ID (--join) and add it to the cluster
+#   scripts/run_cluster.sh remove ID     remove node ID from the cluster, then stop it
 #   scripts/run_cluster.sh leader        print the id of the current leader
 #   scripts/run_cluster.sh cli ARGS...   run raftkv_cli against this cluster (put/get/delete/bench/repl)
 #   scripts/run_cluster.sh logs ID       follow one node's log
@@ -43,19 +45,26 @@ peers_list() {
   echo "$out"
 }
 
-servers_list() {
+servers_list() {  # removed nodes are left out
   local n="$1" i out=""
-  for i in $(seq 1 "$n"); do out="$out${out:+,}$i=127.0.0.1:$((CLIENT_BASE + i))"; done
+  for i in $(seq 1 "$n"); do
+    is_removed "$i" && continue
+    out="$out${out:+,}$i=127.0.0.1:$((CLIENT_BASE + i))"
+  done
   echo "$out"
 }
+
+is_removed() { [ -f "$DIR/removed" ] && grep -qx "$1" "$DIR/removed"; }
 
 is_running() {
   local pidfile="$DIR/node$1.pid"
   [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null
 }
 
-start_node() {
+start_node() {  # start_node ID [extra raftkv_node flags]
   local id="$1" n
+  shift
+  local extra="$*"
   n="$(node_count)"
   if is_running "$id"; then echo "node $id is already running"; return 0; fi
   mkdir -p "$DIR/node$id"
@@ -64,7 +73,7 @@ start_node() {
   before="$(wc -l < "$DIR/node$id.log")"
   # shellcheck disable=SC2086
   nohup "$BIN/raftkv_node" --id "$id" --peers "$(peers_list "$n")" \
-    --client-addr "127.0.0.1:$((CLIENT_BASE + id))" --data-dir "$DIR/node$id" $NODE_FLAGS \
+    --client-addr "127.0.0.1:$((CLIENT_BASE + id))" --data-dir "$DIR/node$id" $NODE_FLAGS $extra \
     >> "$DIR/node$id.log" 2>&1 &
   echo $! > "$DIR/node$id.pid"
   local waited=0
@@ -137,6 +146,27 @@ case "$cmd" in
     ;;
   status)
     cli status
+    ;;
+  add)
+    [ $# -eq 1 ] || die "usage: add ID"
+    case "$1" in ''|*[!0-9]*|0) die "ID must be a number >= 1";; esac
+    need_binaries
+    is_running "$1" && die "node $1 is already running"
+    [ -d "$DIR/node$1" ] && [ -n "$(ls -A "$DIR/node$1" 2>/dev/null)" ] && \
+      die "node $1 has old data in $DIR/node$1; a new member must start empty (move it away first)"
+    [ "$1" -gt "$(node_count)" ] && echo "$1" > "$DIR/nodes"
+    if [ -f "$DIR/removed" ]; then grep -vx "$1" "$DIR/removed" > "$DIR/removed.tmp"; mv "$DIR/removed.tmp" "$DIR/removed"; fi
+    start_node "$1" --join || exit 1
+    cli add-node "$1" "127.0.0.1:$((RAFT_BASE + $1))" || exit 1
+    echo "node $1 is now a member"
+    ;;
+  remove)
+    [ $# -eq 1 ] || die "usage: remove ID"
+    need_binaries
+    cli remove-node "$1" || exit 1
+    echo "$1" >> "$DIR/removed"
+    is_running "$1" && stop_node "$1"
+    echo "node $1 removed from the cluster and stopped"
     ;;
   leader)
     cli status | awk '$3 == "leader" { print $2; found = 1 } END { exit found ? 0 : 1 }'

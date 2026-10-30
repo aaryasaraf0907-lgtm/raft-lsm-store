@@ -545,4 +545,49 @@ TEST(NodeClusterTest, DISABLED_ClientsSeeALinearizableStoreWhileTheLeaderIsKille
   EXPECT_GT(history.size(), 150u) << "too few operations were recorded for the check to mean much";
 }
 
+// Membership change end to end over gRPC: a node started with join is added through the client
+// API (the leader learns its address only from the configuration entry), receives all the data,
+// and an old member is then removed and stopped while writes keep working.
+TEST(NodeClusterTest, ANewNodeIsAddedOverGrpcAndAnOldOneRemoved) {
+  NodeCluster c(3);
+  for (int i = 0; i < 20; ++i) ASSERT_EQ(c.client().Put(KeyOf(i), ValueOf(i)).status, KvStatus::kOk);
+
+  TempDir dir4;
+  NodeOptions options;
+  options.id = 4;
+  options.cluster = {1, 2, 3, 4};
+  options.data_dir = dir4.path + "/node4";
+  options.sync = false;
+  options.join = true;
+  auto node4 = std::make_unique<NodeRuntime>(options);
+  node4->Start();
+  for (int b = 1; b <= 3; ++b) node4->SetPeerAddress(b, "127.0.0.1:" + std::to_string(c.Node(b)->raft_port()));
+  const std::string raft4 = "127.0.0.1:" + std::to_string(node4->raft_port());
+
+  KvResult r = c.client().AddServer(4, raft4, 30s);
+  ASSERT_EQ(r.status, KvStatus::kOk) << r.message;
+  ASSERT_TRUE(WaitFor([&] { return EngineHas(node4.get(), KeyOf(19), ValueOf(19)); }, 10s))
+      << "the new node did not receive the existing data";
+
+  c.client().SetServer(4, "127.0.0.1:" + std::to_string(node4->client_port()));
+  for (int id = 1; id <= 4; ++id) {
+    ASSERT_TRUE(WaitFor([&] {
+      network::proto::StatusResponse s;
+      std::string error;
+      if (!c.client().NodeStatus(id, &s, &error)) return false;
+      return std::vector<uint32_t>(s.members().begin(), s.members().end()) == std::vector<uint32_t>{1, 2, 3, 4};
+    }, 10s)) << "node " << id << " does not report the four members";
+  }
+
+  const int leader = c.Leader();
+  ASSERT_NE(leader, 0);
+  const int victim = leader == 1 ? 2 : 1;
+  r = c.client().RemoveServer(static_cast<NodeId>(victim), 30s);
+  ASSERT_EQ(r.status, KvStatus::kOk) << r.message;
+  c.Crash(victim);
+  ASSERT_EQ(c.client().Put("after", "x").status, KvStatus::kOk);
+  EXPECT_TRUE(WaitFor([&] { return EngineHas(node4.get(), "after", "x"); }, 10s));
+  node4->Stop();
+}
+
 }  // namespace raftkv

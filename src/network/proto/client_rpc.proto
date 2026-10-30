@@ -63,6 +63,34 @@ message StatusResponse {
   uint64 last_applied = 6;
   uint64 log_length = 7;      // log entries still stored
   uint64 snapshot_index = 8;  // 0 = no snapshot
+  repeated uint32 members = 9;  // the voting members in this node's configuration
+}
+
+// ---- membership changes (administration; sent to the leader) ----
+message AddServerRequest {
+  uint32 node_id = 1;
+  string raft_address = 2;  // where the other nodes reach the new node's Raft service (HOST:PORT)
+  uint32 timeout_ms = 3;    // how long the leader may take, catch-up included (0 = 30 s)
+}
+message RemoveServerRequest {
+  uint32 node_id = 1;
+  uint32 timeout_ms = 2;  // 0 = 30 s
+}
+enum MembershipStatus {
+  MEMBERSHIP_OK = 0;              // committed (or there was nothing to change)
+  MEMBERSHIP_NOT_LEADER = 1;      // ask leader_id_hint
+  MEMBERSHIP_IN_PROGRESS = 2;     // another change is not committed yet: retry shortly
+  MEMBERSHIP_INVALID = 3;         // bad id or address, or removing the last member
+  MEMBERSHIP_CATCH_UP_FAILED = 4; // the new node did not catch up in time; nothing changed
+  MEMBERSHIP_TIMEOUT = 5;         // not committed in time: it may still take effect
+  MEMBERSHIP_LOST = 6;            // replaced by a new leader: nothing changed
+  MEMBERSHIP_STOPPED = 7;
+  MEMBERSHIP_UNSUPPORTED = 8;     // this server cannot change membership
+}
+message MembershipReply {
+  MembershipStatus status = 1;
+  uint32 leader_id_hint = 2;
+  string error_message = 3;
 }
 
 service ClientRpc {
@@ -70,4 +98,6 @@ service ClientRpc {
   rpc Put(PutRequest) returns (WriteResponse);
   rpc Get(GetRequest) returns (GetResponse);
   rpc Delete(DeleteRequest) returns (WriteResponse);
+  rpc AddServer(AddServerRequest) returns (MembershipReply);
+  rpc RemoveServer(RemoveServerRequest) returns (MembershipReply);
 }

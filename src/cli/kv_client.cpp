@@ -279,4 +279,78 @@ bool HexDecode(const std::string& hex, std::string* out) {
   return true;
 }
 
+KvResult KvClient::AddServer(NodeId id, const std::string& raft_address, std::chrono::milliseconds timeout) {
+  return ChangeMembership(true, id, raft_address, timeout);
+}
+
+KvResult KvClient::RemoveServer(NodeId id, std::chrono::milliseconds timeout) {
+  return ChangeMembership(false, id, "", timeout);
+}
+
+KvResult KvClient::ChangeMembership(bool add, NodeId id, const std::string& raft_address,
+                                    std::chrono::milliseconds timeout) {
+  KvResult result;
+  result.status = KvStatus::kUnavailable;
+  result.message = "no node answered";
+  const auto deadline = Clock::now() + timeout;
+  while (Clock::now() < deadline) {
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now());
+    if (remaining.count() <= 0) break;
+    network::proto::MembershipReply reply;
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + remaining + std::chrono::milliseconds(500));
+    grpc::Status status;
+    if (add) {
+      network::proto::AddServerRequest req;
+      req.set_node_id(id);
+      req.set_raft_address(raft_address);
+      req.set_timeout_ms(static_cast<uint32_t>(remaining.count()));
+      status = stubs_[Current()]->AddServer(&ctx, req, &reply);
+    } else {
+      network::proto::RemoveServerRequest req;
+      req.set_node_id(id);
+      req.set_timeout_ms(static_cast<uint32_t>(remaining.count()));
+      status = stubs_[Current()]->RemoveServer(&ctx, req, &reply);
+    }
+    if (!status.ok()) {
+      result.message = status.error_message().empty() ? "rpc failed" : status.error_message();
+      Rotate();
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      continue;
+    }
+    result.message = reply.error_message();
+    switch (reply.status()) {
+      case network::proto::MEMBERSHIP_OK:
+        result.status = KvStatus::kOk;
+        result.message.clear();
+        return result;
+      case network::proto::MEMBERSHIP_NOT_LEADER:
+        if (reply.leader_id_hint() != 0) {
+          Prefer(reply.leader_id_hint());
+        } else {
+          Rotate();
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        continue;
+      case network::proto::MEMBERSHIP_IN_PROGRESS:
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        continue;
+      case network::proto::MEMBERSHIP_LOST:  // nothing changed: trying again is safe
+      case network::proto::MEMBERSHIP_STOPPED:
+        Rotate();
+        continue;
+      case network::proto::MEMBERSHIP_INVALID:
+        result.status = KvStatus::kInvalidArgument;
+        return result;
+      case network::proto::MEMBERSHIP_TIMEOUT:
+        result.status = KvStatus::kOutcomeUnknown;
+        return result;
+      default:  // CATCH_UP_FAILED, UNSUPPORTED: retrying here would not help
+        result.status = KvStatus::kUnavailable;
+        return result;
+    }
+  }
+  return result;
+}
+
 }  // namespace raftkv

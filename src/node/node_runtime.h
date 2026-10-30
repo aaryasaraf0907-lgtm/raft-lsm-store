@@ -27,6 +27,9 @@ struct NodeOptions {
   std::map<NodeId, std::string> peers;
   std::string data_dir;  // holds "raft/" (log, snapshots) and "kv/" (storage engine)
   bool sync = true;      // fsync every write (turn off only for tests and benchmarks)
+  // Start as a new node that is not yet a member: it waits until the leader adds it (AddServer).
+  // `cluster`/`peers` should still list the current members' Raft addresses and this node's own.
+  bool join = false;
   // Also fsync the storage engine's own WAL on every write. Off by default: the Raft log is already
   // durable, so the engine is rebuilt from it (or from a Raft snapshot) after a crash, and skipping
   // this fsync removes one of the three that every write used to wait for. A damaged engine WAL is

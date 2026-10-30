@@ -26,6 +26,9 @@ void Usage(FILE* out) {
       "  --raft-addr ADDR     listen address for other nodes (default: this node's --peers entry)\n"
       "  --client-addr ADDR   listen address for clients (required)\n"
       "  --data-dir DIR       where the Raft log and the storage engine live (required)\n"
+      "  --join               start as a NEW node that is not yet a member; it waits until the\n"
+      "                       leader adds it (raftkv_cli add-node). --peers lists the current\n"
+      "                       members and this node\n"
       "  --no-sync            do not fsync (fast, NOT crash safe: testing and benchmarks only)\n"
       "  --sync-engine-wal    also fsync the engine's own WAL on every write (slower; the Raft log\n"
       "                       is already durable, so the engine can be rebuilt from it)\n"
@@ -87,6 +90,8 @@ int main(int argc, char** argv) {
       options.client_listen = value("--client-addr");
     } else if (arg == "--data-dir") {
       options.data_dir = value("--data-dir");
+    } else if (arg == "--join") {
+      options.join = true;
     } else if (arg == "--no-sync") {
       options.sync = false;
     } else if (arg == "--memtable-bytes") {
