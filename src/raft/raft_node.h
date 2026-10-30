@@ -229,6 +229,13 @@ class RaftNodeImpl : public RaftNode, public RpcHandler {
   ClusterConfig config_;           // the configuration in force: the latest in the log
   LogIndex config_index_ = 0;      // index of the kConfig entry config_ came from (0: none in the log)
   ClusterConfig learners_;         // leader only: being caught up before becoming voters
+  // ---- the leader's own durability (guarded by mu_) ----
+  // The leader replicates a batch BEFORE its own fsync finishes (Raft thesis 10.2.1), so it may
+  // count itself toward a commit majority only up to durable_index_: the last index known to be on
+  // its disk. log_epoch_ changes whenever entries are removed (truncation, snapshot install), so a
+  // sync that completes after its entries were replaced cannot mark the replacements durable.
+  LogIndex durable_index_ = 0;
+  uint64_t log_epoch_ = 0;
   ConfigCallback config_cb_;
   bool IsMemberLocked(NodeId id) const { return config_.count(id) != 0; }
   std::vector<NodeId> VotersExceptSelfLocked() const;

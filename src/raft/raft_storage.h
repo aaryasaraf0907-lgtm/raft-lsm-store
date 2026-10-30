@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include <string>
 #include <vector>
 #include "raft/raft_interface.h"
@@ -36,6 +37,15 @@ class RaftStorage {
   virtual bool AppendEntries(const std::vector<LogEntry>& entries) = 0;
   // Removes entry `from_index` and everything after it.
   virtual bool TruncateSuffix(LogIndex from_index) = 0;
+
+  // Split durability, so a leader can replicate while its own disk write completes (Raft thesis
+  // 10.2.1). AppendEntriesNoSync writes like AppendEntries but need not make the entries durable;
+  // PrepareSync returns a function that, when called, makes everything written before
+  // PrepareSync durable. That function may be called WITHOUT the node's lock and concurrently
+  // with later storage calls (it must be called exactly once). The defaults are fully synchronous,
+  // so a storage that does not override them behaves as before.
+  virtual bool AppendEntriesNoSync(const std::vector<LogEntry>& entries) { return AppendEntries(entries); }
+  virtual std::function<bool()> PrepareSync() { return [] { return true; }; }
   // Durably stores a snapshot (the state machine as of `snapshot_index`) and drops every log entry
   // up to `log_base_index` (<= snapshot_index). `entries_after_base` are the log entries after
   // log_base_index to keep, including those up to the snapshot (possibly none). Crash safe: after

@@ -52,6 +52,12 @@ RaftNodeImpl::RaftNodeImpl(NodeId id, std::vector<NodeId> peers, Transport* tran
     initial_config_[id_] = "";
     for (NodeId peer : peers_) initial_config_[peer] = "";
   }
+  if (storage_ != nullptr) {
+    // Entries may have been written without fsync before a restart and still be in the OS cache:
+    // make them durable now, so everything in the loaded log can count as on disk.
+    MustSucceed(storage_->PrepareSync()(), "sync the loaded log");
+  }
+  durable_index_ = LastLogIndexLocked();
   snapshot_config_ = initial_config_;
   if (snapshot_index_ > 0) {
     ClusterConfig stored;
@@ -114,6 +120,9 @@ void RaftNodeImpl::SubmitProposal(PendingProposal* p) {
       proposals_.pop_front();
     }
     ql.unlock();  // proposers keep queueing while this batch is being written
+    std::function<bool()> sync;  // set if this batch still has to be made durable
+    LogIndex sync_upto = 0;
+    uint64_t sync_epoch = 0;
     {
       std::lock_guard<std::mutex> lk(mu_);
       if (!running_) {
@@ -136,9 +145,27 @@ void RaftNodeImpl::SubmitProposal(PendingProposal* p) {
           x->term = current_term_;
           x->leader_hint = id_;
         }
-        PersistAppendLocked(entries);  // durable on the leader before we replicate or count it
-        AdvanceCommitIndexLocked();    // a single-node cluster commits immediately
-        BroadcastAppendEntriesLocked();  // replicate now instead of waiting for the next heartbeat
+        // Write, replicate, THEN sync: the followers' fsyncs run in parallel with ours. We count
+        // ourselves toward a commit majority only once ours is done (durable_index_), so a
+        // commit still means a majority holds the entries on disk.
+        if (storage_ != nullptr) MustSucceed(storage_->AppendEntriesNoSync(entries), "append log entries");
+        BroadcastAppendEntriesLocked();
+        if (storage_ != nullptr) {
+          sync = storage_->PrepareSync();
+          sync_upto = index;
+          sync_epoch = log_epoch_;
+        } else {
+          durable_index_ = std::max(durable_index_, index);
+          AdvanceCommitIndexLocked();  // a single-node cluster commits immediately
+        }
+      }
+    }
+    if (sync) {  // the fsync, without the node's lock: replies and reads proceed meanwhile
+      MustSucceed(sync(), "sync log entries");
+      std::lock_guard<std::mutex> lk(mu_);
+      if (sync_epoch == log_epoch_) {
+        durable_index_ = std::max(durable_index_, sync_upto);
+        AdvanceCommitIndexLocked();
       }
     }
     ql.lock();
@@ -666,7 +693,7 @@ void RaftNodeImpl::AdvanceCommitIndexLocked() {
     // A majority of the CURRENT configuration. The leader counts only if it is a member: a leader
     // that is removing itself commits the new configuration with the other servers alone.
     const bool replicated = MajorityLocked([&](NodeId m) {
-      if (m == id_) return true;
+      if (m == id_) return durable_index_ >= n;  // our own copy counts once it is on disk
       auto it = match_index_.find(m);
       return it != match_index_.end() && it->second >= n;
     });
@@ -841,6 +868,8 @@ void RaftNodeImpl::InstallSnapshotLocked(LogIndex index, Term term, std::string 
     snapshot_config_ = UnwrapSnapshot(snapshot_data_, &at_snapshot, &unused) ? at_snapshot : initial_config_;
   }
   RecomputeConfigLocked();
+  ++log_epoch_;  // entries were replaced; the storage wrote what is kept durably
+  durable_index_ = LastLogIndexLocked();
   commit_index_ = std::max(commit_index_, index);
   restore_pending_ = true;  // the applier restores the state machine, then continues after `index`
   apply_cv_.notify_all();
@@ -871,6 +900,7 @@ void RaftNodeImpl::CompactLocked(LogIndex index, std::string data) {
   snapshot_data_ = std::move(data);
   snapshot_config_ = at_snapshot;
   snap_offset_.clear();  // any transfer in progress was of the older snapshot
+  durable_index_ = LastLogIndexLocked();  // the new log file was written and synced in full
 }
 
 void RaftNodeImpl::PersistHardStateLocked() {
@@ -879,10 +909,13 @@ void RaftNodeImpl::PersistHardStateLocked() {
 
 void RaftNodeImpl::PersistAppendLocked(const std::vector<LogEntry>& entries) {
   if (storage_ != nullptr) MustSucceed(storage_->AppendEntries(entries), "append log entries");
+  if (!entries.empty()) durable_index_ = std::max(durable_index_, entries.back().index);
 }
 
 void RaftNodeImpl::PersistTruncateLocked(LogIndex from_index) {
   if (storage_ != nullptr) MustSucceed(storage_->TruncateSuffix(from_index), "truncate log");
+  ++log_epoch_;  // a sync still in flight covered entries that are now gone
+  durable_index_ = std::min(durable_index_, from_index - 1);
 }
 
 LogIndex RaftNodeImpl::LastLogIndexLocked() const { return log_.back().index; }

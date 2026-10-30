@@ -349,7 +349,7 @@ bool FileRaftStorage::Load(PersistentState* out) {
   return true;
 }
 
-bool FileRaftStorage::WriteRecords(const std::string& bytes) {
+bool FileRaftStorage::WriteRecords(const std::string& bytes, bool sync) {
   if (fd_ < 0) return false;
   size_t done = 0;
   while (done < bytes.size()) {
@@ -358,7 +358,7 @@ bool FileRaftStorage::WriteRecords(const std::string& bytes) {
     if (w <= 0) return false;
     done += static_cast<size_t>(w);
   }
-  return !sync_ || SyncFd(fd_);
+  return !sync_ || !sync || SyncFd(fd_);
 }
 
 bool FileRaftStorage::SaveHardState(Term term, NodeId voted_for) {
@@ -377,6 +377,24 @@ bool FileRaftStorage::AppendEntries(const std::vector<LogEntry>& entries) {
   std::string frames;  // all entries go out in one write + one fsync
   for (const LogEntry& e : entries) EncodeEntryFrame(&frames, e);
   return WriteRecords(frames);
+}
+
+bool FileRaftStorage::AppendEntriesNoSync(const std::vector<LogEntry>& entries) {
+  std::string frames;
+  for (const LogEntry& e : entries) EncodeEntryFrame(&frames, e);
+  return WriteRecords(frames, /*sync=*/false);
+}
+
+std::function<bool()> FileRaftStorage::PrepareSync() {
+  if (!sync_) return [] { return true; };
+  if (fd_ < 0) return [] { return false; };
+  const int d = ::dup(fd_);
+  if (d < 0) return [] { return false; };
+  return [d] {
+    const bool ok = SyncFd(d);
+    ::close(d);
+    return ok;
+  };
 }
 
 bool FileRaftStorage::TruncateSuffix(LogIndex from_index) {
