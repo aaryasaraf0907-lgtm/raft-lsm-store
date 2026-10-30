@@ -82,11 +82,15 @@ struct Cluster {
   std::vector<std::unique_ptr<RaftNodeImpl>> nodes;
   int size;
   std::function<void(RaftConfig&)> tweak_;
+  std::set<NodeId> joining_;  // nodes started with join_existing_cluster
 
   // `tweak` may adjust each node's RaftConfig before it is built (e.g. to turn PreVote off).
   explicit Cluster(int n, bool persistent = false, std::function<void(RaftConfig&)> tweak = nullptr)
       : applied(static_cast<size_t>(n)), size(n), tweak_(std::move(tweak)) {
     if (persistent) tmp = std::make_unique<TempDir>();
+    nodes.reserve(32);  // AddJoiningNode must never move the node list while threads use it
+    transports.reserve(32);
+    storages.reserve(32);
     storages.resize(static_cast<size_t>(n));
     for (int id = 1; id <= n; ++id) transports.push_back(net.MakeTransport(static_cast<NodeId>(id)));
     for (int id = 1; id <= n; ++id) nodes.push_back(MakeNode(static_cast<NodeId>(id)));
@@ -113,7 +117,7 @@ struct Cluster {
   void RestartAll() {
     for (auto& node : nodes) node->Stop();
     for (auto& node : nodes) node.reset();
-    for (NodeId id = 1; id <= static_cast<NodeId>(size); ++id) {
+    for (NodeId id = 1; id <= static_cast<NodeId>(nodes.size()); ++id) {  // including added nodes
       ClearApplied(id);
       nodes[id - 1] = MakeNode(id);
     }
@@ -121,6 +125,22 @@ struct Cluster {
   }
 
   RaftNodeImpl* Node(NodeId id) { return nodes[id - 1].get(); }
+
+  // Starts a brand-new node that is not yet a member (RaftConfig::join_existing_cluster) and returns
+  // its id. It becomes a member when the leader's AddServer commits.
+  NodeId AddJoiningNode() {
+    const NodeId id = static_cast<NodeId>(nodes.size() + 1);
+    {
+      std::lock_guard<std::mutex> lk(applied_mu);
+      applied.emplace_back();
+    }
+    storages.emplace_back();
+    transports.push_back(net.MakeTransport(id));
+    joining_.insert(id);
+    nodes.push_back(MakeNode(id));
+    nodes.back()->Start();
+    return id;
+  }
 
   int CountLeaders(const std::set<NodeId>& exclude = {}) {
     int count = 0;
@@ -170,7 +190,28 @@ struct Cluster {
     RaftConfig cfg;
     cfg.random_seed = 42;
     if (tweak_) tweak_(cfg);
+    if (joining_.count(id) != 0) cfg.join_existing_cluster = true;
     auto node = std::make_unique<RaftNodeImpl>(id, peers, transports[id - 1].get(), cfg, storage);
+    if (cfg.snapshot_threshold_entries > 0) {
+      // The applied list is the state machine: a snapshot is its keys, one per line.
+      node->SetSnapshotCallbacks(
+          [this, id] {
+            std::lock_guard<std::mutex> lk(applied_mu);
+            std::string out;
+            for (const LogEntry& e : applied[id - 1]) out += e.command.key + "\n";
+            return out;
+          },
+          [this, id](const std::string& data) {
+            std::lock_guard<std::mutex> lk(applied_mu);
+            applied[id - 1].clear();
+            size_t pos = 0;
+            while (pos < data.size()) {
+              const size_t end = data.find('\n', pos);
+              applied[id - 1].push_back(LogEntry{0, 0, Command{CommandType::kPut, data.substr(pos, end - pos), ""}});
+              pos = end + 1;
+            }
+          });
+    }
     node->SetApplyCallback([this, id](const LogEntry& e) {
       std::lock_guard<std::mutex> lk(applied_mu);
       applied[id - 1].push_back(e);

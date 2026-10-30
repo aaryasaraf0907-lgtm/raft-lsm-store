@@ -14,6 +14,8 @@ proto::CommandType ToProto(CommandType type) {
       return proto::COMMAND_TYPE_DELETE;
     case CommandType::kNoop:
       return proto::COMMAND_TYPE_NOOP;
+    case CommandType::kConfig:
+      return proto::COMMAND_TYPE_CONFIG;
   }
   throw std::invalid_argument("unsupported Raft command type");
 }
@@ -26,6 +28,8 @@ CommandType FromProto(proto::CommandType type) {
       return CommandType::kDelete;
     case proto::COMMAND_TYPE_NOOP:
       return CommandType::kNoop;
+    case proto::COMMAND_TYPE_CONFIG:
+      return CommandType::kConfig;
     default:
       throw std::invalid_argument("unsupported Protobuf command type");
   }

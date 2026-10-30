@@ -85,6 +85,7 @@ class KVStateMachine {
         break;
       }
       case CommandType::kNoop:
+      case CommandType::kConfig:  // never delivered by the Raft node; nothing to do
         break;
     }
   }
