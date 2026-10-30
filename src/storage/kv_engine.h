@@ -32,8 +32,10 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include "storage/block_cache.h"
 #include "storage/iterator.h"
 #include "storage/checkpoint.h"
 #include "storage/kv_store.h"
@@ -76,6 +78,9 @@ class KVEngine : public CheckpointableStore {
     bool wal_truncate_on_corruption = false;
     size_t compaction_trigger = 4;  // merge when this many SSTables are live (min 2; 0 = never)
     uint32_t bloom_bits_per_key = BloomFilter::kDefaultBitsPerKey;
+    // SSTable mode: bytes of decoded data blocks kept in an LRU cache shared by every SSTable of
+    // this engine, for Get and Scan (block_cache.h). 0 (the default) disables the cache.
+    size_t block_cache_bytes = 0;
     // Tests only: called at named steps of flush and compaction ("flush:after_sst",
     // "flush:after_manifest", "compact:after_output", "compact:after_manifest"). Returning true
     // makes the engine stop right there, as if the process had died, leaving files as they are.
@@ -108,6 +113,17 @@ class KVEngine : public CheckpointableStore {
   Status Put(const std::string& key, const std::string& value) override;
   Status Get(const std::string& key, std::string* value) override;
   Status Delete(const std::string& key) override;  // writes a tombstone, even if key is absent
+
+  // Range read: the live keys in [start, end) in key order, each with its newest value, at most
+  // `limit` of them (0 = no limit). An empty `end` means no upper bound; start >= end (with a
+  // non-empty end) gives an empty result. Deleted keys and the engine's reserved keys are never
+  // returned. Works in both modes. Consistency is per key, as for Get: every write that completed
+  // before Scan was called is reflected (unless overwritten since); writes made while the scan
+  // runs may or may not be; it is NOT a point-in-time snapshot across keys. kOk with *out set, or
+  // kIOError / kCorruption (a block that the scan reads is damaged, even one just past `end`, or
+  // the engine has fail-stopped), in which case *out is empty.
+  Status Scan(const std::string& start, const std::string& end, size_t limit,
+              std::vector<std::pair<std::string, std::string>>* out);
 
   // Like Put/Delete, but also record `raft_index` as the applied index (see IndexedKVStore). The data
   // record and the index record are appended in that order and made durable by ONE sync, and
@@ -146,7 +162,11 @@ class KVEngine : public CheckpointableStore {
                                                      // even after compaction has deleted it)
   };
 
-  explicit KVEngine(const Options& options) : options_(options) {}
+  explicit KVEngine(const Options& options)
+      : options_(options),
+        block_cache_(options.use_sstables && options.block_cache_bytes > 0
+                         ? std::make_shared<BlockCache>(options.block_cache_bytes)
+                         : nullptr) {}
 
   Status Recover();
   Status LoadLsmState();  // SSTable mode: manifest, orphan cleanup, open the live tables
@@ -161,6 +181,7 @@ class KVEngine : public CheckpointableStore {
   std::string Path(const std::string& name) const;
 
   const Options options_;
+  const std::shared_ptr<BlockCache> block_cache_;  // null when disabled; shared by every SSTable
   uint64_t recovered_records_ = 0;  // set before any thread starts
   std::atomic<uint64_t> applied_index_{0};  // written under write_mu_, read anywhere
 

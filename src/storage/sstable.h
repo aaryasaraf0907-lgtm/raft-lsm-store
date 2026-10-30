@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "storage/block_cache.h"
 #include "storage/bloom_filter.h"
 #include "storage/iterator.h"
 #include "storage/kv_store.h"
@@ -117,9 +118,10 @@ class SSTable {
 
   // Opens and validates `path` in the order of §10.1. kIOError if the file cannot be opened or
   // read; kCorruption for any structural violation, including a footer file_number different
-  // from expected_file_number. On error *out is unchanged.
+  // from expected_file_number. On error *out is unchanged. With a `cache`, Get and the
+  // NewIterator(start) iterators keep validated blocks in it (see block_cache.h).
   static Status Open(const std::string& path, uint64_t expected_file_number,
-                     std::unique_ptr<SSTable>* out);
+                     std::unique_ptr<SSTable>* out, std::shared_ptr<BlockCache> cache = nullptr);
 
   ~SSTable();
   SSTable(const SSTable&) = delete;
@@ -134,32 +136,44 @@ class SSTable {
   uint64_t entry_count() const { return entry_count_; }
   uint64_t block_count() const { return index_.size(); }
 
-  // Ordered scan over every entry, tombstones included (§11.3). Holds one decoded block at a
-  // time and validates each block per §10.2. When Valid() becomes false, status() says why:
-  // kOk is a clean end (every record read and the count equals entry_count); kIOError or
-  // kCorruption means the scan stopped on an error. Errors are sticky; Next() on an invalid
-  // iterator is a no-op. Current() is valid only while Valid(), until the next Next().
-  // The SSTable must outlive the iterator. A single iterator is not thread-safe.
+  // Ordered scan, tombstones included (§11.3). Holds one decoded block at a time and validates
+  // each block per §10.2. When Valid() becomes false, status() says why: kOk is a clean end;
+  // kIOError or kCorruption means the scan stopped on an error. Errors are sticky; Next() and
+  // Seek() on a failed iterator are no-ops. Current() is valid only while Valid(), until the next
+  // Next() or Seek(). The SSTable must outlive the iterator. A single iterator is not thread-safe.
+  //
+  // A scan that starts at the first record and is never Seek()ed also checks at the clean end
+  // that the number of records read equals entry_count (else kCorruption); after a Seek() that
+  // count says nothing, so the check is skipped.
   class Iterator : public KVIterator {
    public:
-    bool Valid() const override { return status_ == Status::kOk && pos_ < entries_.size(); }
+    bool Valid() const override { return status_ == Status::kOk && block_ && pos_ < block_->size(); }
     void Next() override;
-    const Entry& Current() const override { return entries_[pos_]; }
+    const Entry& Current() const override { return (*block_)[pos_]; }
     Status status() const { return status_; }
+    // Positions at the first entry whose key is >= target (Valid() false with kOk if there is
+    // none, without reading any block). May be called again, in either direction.
+    void Seek(const std::string& target);
 
    private:
     friend class SSTable;
-    explicit Iterator(const SSTable* table);
+    Iterator(const SSTable* table, bool use_cache) : table_(table), use_cache_(use_cache) {}
     void LoadNextBlock();
 
     const SSTable* table_;
+    const bool use_cache_;
     size_t next_block_ = 0;
-    std::vector<Entry> entries_;  // the current block
+    BlockCache::Block block_;  // the current block
     size_t pos_ = 0;
     uint64_t records_seen_ = 0;
+    bool seeked_ = false;
     Status status_ = Status::kOk;
   };
+  // Full scan from the first record (compaction, checkpoints). Never uses the block cache, so a
+  // full scan re-validates every block from disk and does not evict the blocks reads are using.
   std::unique_ptr<Iterator> NewIterator() const;
+  // Range read: positioned as by Seek(start); uses the block cache if the table has one.
+  std::unique_ptr<Iterator> NewIterator(const std::string& start) const;
 
  private:
   struct IndexEntry {
@@ -169,14 +183,21 @@ class SSTable {
   };
 
   SSTable() = default;
+  // Reads block `i` and checks its trailer CRC (§10.2 steps 1-2) into *raw (records + trailer).
+  Status ReadRawBlock(size_t i, std::string* raw) const;
   // Reads block `i` and validates it per §10.2, decoding its records into *entries.
   Status ReadBlock(size_t i, std::vector<Entry>* entries) const;
+  // Block `i`, decoded and validated: from the cache if use_cache and the table has one (a miss
+  // reads it and caches it), else straight from disk. A failed block is never cached.
+  Status LoadBlock(size_t i, bool use_cache, BlockCache::Block* out) const;
 
   int fd_ = -1;
   SSTableMeta meta_;
   uint64_t entry_count_ = 0;
   std::vector<IndexEntry> index_;
   BloomFilter filter_;
+  std::shared_ptr<BlockCache> cache_;  // may be null
+  uint64_t cache_id_ = 0;              // this object's identity in cache_
 };
 
 }  // namespace raftkv

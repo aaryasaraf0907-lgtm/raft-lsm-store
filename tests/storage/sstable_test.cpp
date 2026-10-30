@@ -777,6 +777,67 @@ TEST_F(SSTableTest, GetDetectsCrossBlockOrderViolation) {
   EXPECT_EQ(GetKey(*t, "c", &r, &v), Status::kCorruption);
 }
 
+TEST_F(SSTableTest, GetValidatesTheWholeBlockEvenAfterFindingTheKey) {
+  // The lookup searches the encoded records in place, but it must not stop validating at the
+  // record it was looking for: damage AFTER the key in the same block is still kCorruption.
+  struct Case {
+    const char* what;
+    RawBlock block;
+  };
+  const std::string a = Record(0, "a", "1");
+  const std::vector<Case> cases = {
+      {"key out of order after the target", {a + Record(0, "c", "3") + Record(0, "b", "2"), "b"}},
+      {"tombstone with value after the target", {a + Record(1, "b", "2"), "b"}},
+      {"unknown flag bit after the target", {a + Record(4, "b", "2"), "b"}},
+      {"trailing bytes after the last record", {a + Record(0, "b", "2") + std::string(3, '\0'), "b"}},
+      {"last key differs from the index", {a + Record(0, "b", "2"), "bb"}},
+      {"record runs past the block", {a + Record(0, "b", "2").substr(0, 10), "b"}},
+  };
+  for (const Case& c : cases) {
+    WriteRaw(Encode({c.block}, {"a", "b"}, 2));
+    std::unique_ptr<SSTable> t;
+    ASSERT_EQ(SSTable::Open(path_, 1, &t), Status::kOk) << c.what;
+    R r;
+    std::string v;
+    EXPECT_EQ(GetKey(*t, "a", &r, &v), Status::kCorruption) << c.what;
+    EXPECT_EQ(r, R::kFound) << c.what << " (untouched)";
+    EXPECT_EQ(v, "untouched") << c.what;
+  }
+}
+
+TEST_F(SSTableTest, GetAnswersEveryKeyOfAMultiBlockTable) {
+  // Every present key (first, last and every block boundary included) is found or deleted, and
+  // every key between, before or after them is absent; the value is copied exactly.
+  const auto entries = ManyEntries(3000);
+  ASSERT_EQ(Write(entries), Status::kOk);
+  auto t = OpenOk();
+  ASSERT_NE(t, nullptr);
+  ASSERT_GT(t->block_count(), 10u);
+  for (int i = 0; i < 3000; ++i) {
+    const Entry& e = entries[static_cast<size_t>(i)];
+    R r;
+    std::string v;
+    ASSERT_EQ(GetKey(*t, e.key, &r, &v), Status::kOk) << e.key;
+    if (e.tombstone) {
+      EXPECT_EQ(r, R::kDeleted) << e.key;
+      EXPECT_EQ(v, "untouched") << e.key;
+    } else {
+      EXPECT_EQ(r, R::kFound) << e.key;
+      EXPECT_EQ(v, e.value) << e.key;
+    }
+    char odd[32];
+    std::snprintf(odd, sizeof(odd), "key%06d", i * 2 + 1);
+    ASSERT_EQ(GetKey(*t, odd, &r, &v), Status::kOk) << odd;
+    EXPECT_EQ(r, R::kAbsent) << odd;
+  }
+  R r;
+  std::string v;
+  for (const std::string k : {"", "a", "key", "key0000000", "key999999", "zzz"}) {
+    ASSERT_EQ(GetKey(*t, k, &r, &v), Status::kOk) << k;
+    EXPECT_EQ(r, R::kAbsent) << k;
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Iterator (§11.3)
 
@@ -892,6 +953,123 @@ TEST_F(SSTableTest, IteratorDetectsCrossBlockOrderViolation) {
   std::vector<Entry> got;
   EXPECT_EQ(Scan(*t, &got), Status::kCorruption);
   EXPECT_EQ(got.size(), 2u) << "only the valid first block is returned";
+}
+
+TEST_F(SSTableTest, IteratorSeekFindsTheFirstKeyAtOrAfterTheTarget) {
+  // Every present key (so every block boundary), every key between two of them, before the first
+  // and past the last; one iterator re-seeked forwards and backwards.
+  auto entries = ManyEntries(3000);
+  entries.insert(entries.begin(), Entry{"", "empty key", false});
+  ASSERT_EQ(Write(entries), Status::kOk);
+  auto t = OpenOk();
+  ASSERT_NE(t, nullptr);
+  ASSERT_GT(t->block_count(), 10u);
+  auto it = t->NewIterator();
+  auto expect_at = [&](const std::string& target, size_t want) {
+    it->Seek(target);
+    ASSERT_EQ(it->status(), Status::kOk) << target;
+    if (want == entries.size()) {
+      EXPECT_FALSE(it->Valid()) << target;
+      return;
+    }
+    ASSERT_TRUE(it->Valid()) << target;
+    EXPECT_EQ(it->Current().key, entries[want].key) << target;
+    EXPECT_EQ(it->Current().value, entries[want].value) << target;
+    EXPECT_EQ(it->Current().tombstone, entries[want].tombstone) << target;
+  };
+  for (size_t i = entries.size(); i-- > 1;) {  // backwards over the non-empty keys
+    expect_at(entries[i].key, i);
+    expect_at(entries[i].key + std::string(1, '\0'), i + 1);  // just after the key
+  }
+  for (size_t i = 1; i < entries.size(); ++i) {
+    char odd[32];
+    std::snprintf(odd, sizeof(odd), "key%06d", static_cast<int>(i - 1) * 2 + 1);  // between i and i+1
+    expect_at(odd, i + 1);
+  }
+  expect_at("", 0);  // the empty key itself
+  expect_at("a", 1);
+  expect_at("zzz", entries.size());
+  auto fresh = t->NewIterator("key000004");
+  ASSERT_TRUE(fresh->Valid());
+  EXPECT_EQ(fresh->Current().key, "key000004");
+}
+
+TEST_F(SSTableTest, IteratorSeekThenNextVisitsTheRestInOrder) {
+  const auto entries = ManyEntries(3000);
+  ASSERT_EQ(Write(entries), Status::kOk);
+  auto t = OpenOk();
+  ASSERT_NE(t, nullptr);
+  for (size_t start : {size_t{0}, size_t{1}, size_t{777}, size_t{2998}, size_t{2999}}) {
+    auto it = t->NewIterator(entries[start].key);
+    std::vector<Entry> got;
+    for (; it->Valid(); it->Next()) got.push_back(it->Current());
+    EXPECT_EQ(it->status(), Status::kOk) << start;
+    EXPECT_TRUE(SameEntries(got, std::vector<Entry>(entries.begin() + static_cast<long>(start), entries.end())))
+        << start;
+  }
+}
+
+TEST_F(SSTableTest, IteratorSeekOnAnEmptyTableEndsCleanly) {
+  ASSERT_EQ(Write({}), Status::kOk);
+  auto t = OpenOk();
+  ASSERT_NE(t, nullptr);
+  for (const std::string target : {"", "k"}) {
+    auto it = t->NewIterator(target);
+    EXPECT_FALSE(it->Valid());
+    EXPECT_EQ(it->status(), Status::kOk);
+    it->Seek("");
+    EXPECT_FALSE(it->Valid());
+    EXPECT_EQ(it->status(), Status::kOk);
+  }
+}
+
+TEST_F(SSTableTest, IteratorSeekReportsADamagedBlockAndTheErrorIsSticky) {
+  const auto entries = ManyEntries(3000);
+  ASSERT_EQ(Write(entries), Status::kOk);
+  std::string s = ReadAll();
+  const size_t f = FooterStart(s);
+  const size_t filter_off = static_cast<size_t>(GetU64(s, f + kFilterOffOff));
+  s[filter_off / 2] ^= 1;  // a byte in a middle data block
+  WriteRaw(s);
+  auto t = OpenOk();
+  ASSERT_NE(t, nullptr);
+
+  // Seeking into the damaged block fails; seeking elsewhere afterwards does not undo that.
+  auto it = t->NewIterator(entries.front().key);
+  ASSERT_TRUE(it->Valid());
+  it->Seek(entries[1500].key);
+  EXPECT_FALSE(it->Valid());
+  EXPECT_EQ(it->status(), Status::kCorruption);
+  it->Seek(entries.front().key);
+  it->Next();
+  EXPECT_FALSE(it->Valid());
+  EXPECT_EQ(it->status(), Status::kCorruption);
+
+  // Seeking before the damage and reading on reaches it as an error, never as a clean end.
+  auto from_start = t->NewIterator(entries.front().key);
+  size_t n = 0;
+  for (; from_start->Valid(); from_start->Next()) ++n;
+  EXPECT_EQ(from_start->status(), Status::kCorruption);
+  EXPECT_GT(n, 0u);
+  EXPECT_LT(n, entries.size());
+}
+
+TEST_F(SSTableTest, IteratorChecksTheRecordCountOnlyWhenNotSeeked) {
+  // The count in the footer describes the whole table: a scan from the first record checks it
+  // (IteratorChecksRecordCountAgainstFooter); a seeked scan never read the earlier blocks, so it
+  // does not.
+  const RawBlock b1{Record(0, "a", "1111111111") + Record(0, "b", "2222222222"), "b"};
+  const RawBlock b2{Record(0, "c", "3333333333"), "c"};
+  WriteRaw(Encode({b1, b2}, {"a", "b", "c"}, 4));  // actual count is 3
+  auto t = OpenOk();
+  ASSERT_NE(t, nullptr);
+  std::vector<Entry> got;
+  EXPECT_EQ(Scan(*t, &got), Status::kCorruption);
+  auto it = t->NewIterator("");
+  size_t n = 0;
+  for (; it->Valid(); it->Next()) ++n;
+  EXPECT_EQ(it->status(), Status::kOk);
+  EXPECT_EQ(n, 3u);
 }
 
 TEST_F(SSTableTest, ConcurrentIterators) {

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <limits>
+#include <string_view>
 #include <utility>
 
 #include "storage/wal.h"  // raftkv::Crc32 (IEEE CRC-32, spec §2)
@@ -42,6 +43,44 @@ uint64_t GetU64(const char* p) {
 }
 
 uint32_t Crc(const std::string& s) { return Crc32(s.data(), s.size()); }
+
+// Walks the record bytes of one block (raw[0, size); the trailer has already been checked) and
+// applies every per-record rule of §10.2 steps 3-4: header and payload in bounds, flags, tombstone
+// without a value, strictly increasing keys (the first one greater than prev_last_key, if any),
+// records ending exactly at `size`, at least one record, and a last key equal to `last_key`.
+// Calls visit(tombstone, key, value) for every record, in order; the views point into `raw`.
+// Validation never stops early, whatever the visitor is looking for.
+template <typename Visit>
+Status ParseBlock(const std::string& raw, size_t size, const std::string* prev_last_key,
+                  const std::string& last_key, Visit&& visit) {
+  size_t pos = 0;
+  std::string_view prev;
+  bool have_prev = prev_last_key != nullptr;
+  if (have_prev) prev = *prev_last_key;
+  while (pos < size) {
+    if (size - pos < F::kRecordHeaderBytes) return Status::kCorruption;
+    const uint8_t flags = static_cast<uint8_t>(raw[pos]);
+    const uint32_t key_len = GetU32(&raw[pos + 1]);
+    const uint32_t value_len = GetU32(&raw[pos + 5]);
+    pos += F::kRecordHeaderBytes;
+    if ((flags & ~kTombstoneFlag) != 0) return Status::kCorruption;
+    const bool tombstone = (flags & kTombstoneFlag) != 0;
+    if (tombstone && value_len != 0) return Status::kCorruption;
+    const uint64_t kv = uint64_t{key_len} + value_len;
+    if (kv > F::kMaxKeyValueBytes || kv > size - pos) return Status::kCorruption;
+    const std::string_view key(raw.data() + pos, key_len);
+    const std::string_view value(raw.data() + pos + key_len, value_len);
+    pos += static_cast<size_t>(kv);
+    if (have_prev && !(key > prev)) return Status::kCorruption;
+    visit(tombstone, key, value);
+    prev = key;
+    have_prev = true;
+  }
+  // A block holds at least one record (size >= 9) and its last key must match the index. With no
+  // record at all, `prev` is still the previous block's last key (or nothing): reject explicitly.
+  if (size == 0 || prev != last_key) return Status::kCorruption;
+  return Status::kOk;
+}
 
 // Same durability rule as the WAL (§12.2 P3): F_FULLFSYNC on macOS, fsync elsewhere.
 bool FullSync(int fd) {
@@ -296,11 +335,12 @@ Status WriteSSTable(const std::string& final_path, const SSTableMeta& meta,
 // Reader
 
 SSTable::~SSTable() {
+  if (cache_) cache_->EraseTable(cache_id_, index_.size());
   if (fd_ >= 0) ::close(fd_);
 }
 
 Status SSTable::Open(const std::string& path, uint64_t expected_file_number,
-                     std::unique_ptr<SSTable>* out) {
+                     std::unique_ptr<SSTable>* out, std::shared_ptr<BlockCache> cache) {
   std::unique_ptr<SSTable> t(new SSTable());
   t->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (t->fd_ < 0) return Status::kIOError;
@@ -405,73 +445,100 @@ Status SSTable::Open(const std::string& path, uint64_t expected_file_number,
   t->meta_ = SSTableMeta{file_number, min_seq, max_seq};
   t->entry_count_ = entry_count;
   t->index_ = std::move(entries);
+  if (cache) {
+    t->cache_ = std::move(cache);
+    t->cache_id_ = BlockCache::NewTableId();
+  }
   *out = std::move(t);
   return Status::kOk;
 }
 
-Status SSTable::ReadBlock(size_t i, std::vector<Entry>* entries) const {
+Status SSTable::ReadRawBlock(size_t i, std::string* raw) const {
   const IndexEntry& ie = index_[i];
-  std::string raw;
-  Status s = PreadExact(fd_, ie.offset, size_t{ie.size} + F::kBlockTrailerBytes, &raw);  // §10.2.1
+  Status s = PreadExact(fd_, ie.offset, size_t{ie.size} + F::kBlockTrailerBytes, raw);  // §10.2.1
   if (s != Status::kOk) return s;
-  if (GetU32(&raw[ie.size]) != Crc32(raw.data(), ie.size)) return Status::kCorruption;  // .2
+  if (GetU32(&(*raw)[ie.size]) != Crc32(raw->data(), ie.size)) return Status::kCorruption;  // .2
+  return Status::kOk;
+}
 
+Status SSTable::ReadBlock(size_t i, std::vector<Entry>* entries) const {
+  std::string raw;
+  Status s = ReadRawBlock(i, &raw);
+  if (s != Status::kOk) return s;
   entries->clear();
-  size_t pos = 0;
-  const size_t end = ie.size;
-  while (pos < end) {  // §10.2.3 and .4
-    if (end - pos < F::kRecordHeaderBytes) return Status::kCorruption;
-    const uint8_t flags = static_cast<uint8_t>(raw[pos]);
-    const uint32_t key_len = GetU32(&raw[pos + 1]);
-    const uint32_t value_len = GetU32(&raw[pos + 5]);
-    pos += F::kRecordHeaderBytes;
-    if ((flags & ~kTombstoneFlag) != 0) return Status::kCorruption;
-    const bool tombstone = (flags & kTombstoneFlag) != 0;
-    if (tombstone && value_len != 0) return Status::kCorruption;
-    const uint64_t kv = uint64_t{key_len} + value_len;
-    if (kv > F::kMaxKeyValueBytes || kv > end - pos) return Status::kCorruption;
-    Entry e;
-    e.key.assign(&raw[pos], key_len);
-    e.value.assign(&raw[pos + key_len], value_len);
-    e.tombstone = tombstone;
-    pos += static_cast<size_t>(kv);
-    const std::string* prev = !entries->empty() ? &entries->back().key
-                              : i > 0           ? &index_[i - 1].last_key
-                                                : nullptr;
-    if (prev != nullptr && !(e.key > *prev)) return Status::kCorruption;
-    entries->push_back(std::move(e));
+  return ParseBlock(raw, index_[i].size, i > 0 ? &index_[i - 1].last_key : nullptr, index_[i].last_key,
+                    [&](bool tombstone, std::string_view key, std::string_view value) {
+                      entries->push_back(Entry{std::string(key), std::string(value), tombstone});
+                    });
+}
+
+Status SSTable::LoadBlock(size_t i, bool use_cache, BlockCache::Block* out) const {
+  const bool cached = use_cache && cache_ != nullptr;
+  if (cached) {
+    BlockCache::Block hit = cache_->Lookup(cache_id_, i);
+    if (hit != nullptr) {
+      *out = std::move(hit);
+      return Status::kOk;
+    }
   }
-  // A block holds at least one record (size >= 9) and its last key must match the index.
-  if (entries->empty() || entries->back().key != ie.last_key) return Status::kCorruption;
+  auto block = std::make_shared<std::vector<Entry>>();
+  Status s = ReadBlock(i, block.get());
+  if (s != Status::kOk) return s;  // a block that failed to read or validate is never cached
+  if (cached) cache_->Insert(cache_id_, i, block);
+  *out = std::move(block);
   return Status::kOk;
 }
 
 std::unique_ptr<SSTable::Iterator> SSTable::NewIterator() const {
-  return std::unique_ptr<Iterator>(new Iterator(this));
+  std::unique_ptr<Iterator> it(new Iterator(this, /*use_cache=*/false));
+  it->LoadNextBlock();
+  return it;
 }
 
-SSTable::Iterator::Iterator(const SSTable* table) : table_(table) { LoadNextBlock(); }
+std::unique_ptr<SSTable::Iterator> SSTable::NewIterator(const std::string& start) const {
+  std::unique_ptr<Iterator> it(new Iterator(this, /*use_cache=*/true));
+  it->Seek(start);
+  return it;
+}
 
 void SSTable::Iterator::LoadNextBlock() {
-  entries_.clear();
+  block_.reset();
   pos_ = 0;
   if (next_block_ == table_->index_.size()) {
-    // End of the data: a clean end only if the record count matches the footer (§10.2).
-    if (records_seen_ != table_->entry_count_) status_ = Status::kCorruption;
+    // End of the data. From the first record on, a clean end only if the record count matches
+    // the footer (§10.2); after a Seek the blocks before the start were never read.
+    if (!seeked_ && records_seen_ != table_->entry_count_) status_ = Status::kCorruption;
     return;
   }
-  Status s = table_->ReadBlock(next_block_++, &entries_);
+  BlockCache::Block block;
+  Status s = table_->LoadBlock(next_block_++, use_cache_, &block);
   if (s != Status::kOk) {
-    entries_.clear();
     status_ = s;  // sticky: never reported as a normal end
     return;
   }
-  records_seen_ += entries_.size();
+  block_ = std::move(block);
+  records_seen_ += block_->size();
 }
 
 void SSTable::Iterator::Next() {
   if (!Valid()) return;
-  if (++pos_ == entries_.size()) LoadNextBlock();
+  if (++pos_ == block_->size()) LoadNextBlock();
+}
+
+void SSTable::Iterator::Seek(const std::string& target) {
+  if (status_ != Status::kOk) return;  // errors are sticky
+  seeked_ = true;
+  const auto& index = table_->index_;
+  // The first block whose last key is >= target holds the first entry >= target (§6).
+  auto it = std::lower_bound(index.begin(), index.end(), target,
+                             [](const IndexEntry& e, const std::string& k) { return e.last_key < k; });
+  next_block_ = static_cast<size_t>(it - index.begin());
+  LoadNextBlock();
+  if (!Valid()) return;
+  // The block's last key equals the index's last_key >= target, so this finds an entry.
+  pos_ = static_cast<size_t>(std::lower_bound(block_->begin(), block_->end(), target,
+                                              [](const Entry& e, const std::string& k) { return e.key < k; }) -
+                             block_->begin());
 }
 
 Status SSTable::Get(const std::string& key, GetResult* result, std::string* value) const {
@@ -486,17 +553,46 @@ Status SSTable::Get(const std::string& key, GetResult* result, std::string* valu
     *result = GetResult::kAbsent;
     return Status::kOk;
   }
-  std::vector<Entry> entries;
-  Status s = ReadBlock(static_cast<size_t>(it - index_.begin()), &entries);
+  const size_t i = static_cast<size_t>(it - index_.begin());
+  if (cache_ != nullptr) {
+    BlockCache::Block block;
+    Status s = LoadBlock(i, /*use_cache=*/true, &block);
+    if (s != Status::kOk) return s;
+    auto e = std::lower_bound(block->begin(), block->end(), key,
+                              [](const Entry& x, const std::string& k) { return x.key < k; });
+    if (e == block->end() || e->key != key) {
+      *result = GetResult::kAbsent;
+    } else if (e->tombstone) {
+      *result = GetResult::kDeleted;
+    } else {
+      *value = e->value;
+      *result = GetResult::kFound;
+    }
+    return Status::kOk;
+  }
+  std::string raw;
+  Status s = ReadRawBlock(i, &raw);
   if (s != Status::kOk) return s;
-  auto e = std::lower_bound(entries.begin(), entries.end(), key,
-                            [](const Entry& x, const std::string& k) { return x.key < k; });
-  if (e == entries.end() || e->key != key) {
+  // Search the encoded records in place: only the matching value is copied, and only after the
+  // WHOLE block has passed validation, so damage after the key is still reported (§10.2).
+  bool hit = false;
+  bool deleted = false;
+  std::string_view found;
+  s = ParseBlock(raw, it->size, i > 0 ? &index_[i - 1].last_key : nullptr, it->last_key,
+                 [&](bool tombstone, std::string_view k, std::string_view v) {
+                   if (k == key) {
+                     hit = true;
+                     deleted = tombstone;
+                     found = v;
+                   }
+                 });
+  if (s != Status::kOk) return s;
+  if (!hit) {
     *result = GetResult::kAbsent;
-  } else if (e->tombstone) {
+  } else if (deleted) {
     *result = GetResult::kDeleted;
   } else {
-    *value = e->value;
+    value->assign(found.data(), found.size());
     *result = GetResult::kFound;
   }
   return Status::kOk;
