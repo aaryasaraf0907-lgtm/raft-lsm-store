@@ -21,6 +21,12 @@ uint64_t WalRecord(size_t key, size_t value) { return 13 + key + value; }
 
 const std::string kIndexKey = std::string(kReservedKeyPrefix, sizeof(kReservedKeyPrefix) - 1) + "applied_index";
 
+size_t SstFilesOnDisk(const std::string& dir) {
+  size_t n = 0;
+  for (const auto& de : fs::directory_iterator(dir)) n += de.path().extension() == ".sst" ? 1 : 0;
+  return n;
+}
+
 uint64_t SstBytesOnDisk(const std::string& dir) {
   uint64_t total = 0;
   for (const auto& de : fs::directory_iterator(dir)) {
@@ -108,9 +114,13 @@ TEST(EngineStats, CompactionBytesCoverTheTablesCompactionsWrote) {
   for (int i = 0; i < 600; ++i) {
     ASSERT_EQ(e->Put("key" + std::to_string(1000 + i % 150), std::string(60, 'a' + i % 26)), Status::kOk);
   }
+  // A compaction installs its output first and deletes its input files afterwards, outside the
+  // engine's lock: wait until the directory holds exactly the live tables, or a table about to be
+  // deleted is listed and then gone when its size is read.
   ASSERT_TRUE(WaitFor([&] {
     const KVEngine::Stats s = e->GetStats();
-    return s.frozen_memtables == 0 && s.sstables < 2 && s.compactions_done > 0;
+    return s.frozen_memtables == 0 && s.sstables < 2 && s.compactions_done > 0 &&
+           SstFilesOnDisk(dir.path()) == s.sstables;
   }));
   const KVEngine::Stats s = e->GetStats();
   EXPECT_GT(s.compaction_bytes_written, 0u);
