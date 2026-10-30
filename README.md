@@ -172,7 +172,8 @@ on Linux and macOS:
   wiped and rejoins under the same id breaks Raft's assumption that persisted state survives, and
   replacing a machine would need membership change, which is not implemented.
 - **Snapshots are built in memory**, so a snapshot must fit in RAM.
-- **No range scans.** The API is `Put`, `Get` and `Delete`.
+- **Range scans are storage-engine only.** `KVEngine::Scan` exists, but the client and gRPC API is
+  `Put`, `Get` and `Delete`.
 - **macOS and Linux only.** Windows users can use WSL2.
 - **One known open issue**: a cluster-level linearizability test is disabled because it occasionally
   stalls inside a gRPC call for longer than the call's deadline; the cause has not been found yet.

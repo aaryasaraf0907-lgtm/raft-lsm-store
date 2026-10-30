@@ -340,6 +340,10 @@ blocks are **not** read at open time.
 A full scan (iterator reaching the end) additionally checks that the number of records read
 equals `entry_count`.
 
+A reader MAY keep blocks that passed this validation in memory and serve later reads of the same
+block from that copy (the RaftKV engine's optional block cache does). The file is immutable, so the
+copy is what this validation accepted; a block that failed is never kept.
+
 ### 10.3 Error mapping (existing `raftkv::Status`)
 
 | Condition | Status |
@@ -384,8 +388,8 @@ returned as the status; an error is never reported as Absent.
 
 ### 11.3 Iterator
 
-The SSTable iterator implements `raftkv::KVIterator` unchanged and adds one method on the
-concrete class only: `Status status() const`.
+The SSTable iterator implements `raftkv::KVIterator` unchanged and adds two methods on the
+concrete class only: `Status status() const` and `void Seek(const std::string& target)`.
 
 - Holds at most one decoded block in memory; reads blocks in order with §10.2 validation.
 - `Current()` is valid only while `Valid()`; the returned reference remains valid until the next
@@ -400,6 +404,11 @@ concrete class only: `Status status() const`.
 
 - Errors are sticky. `Next()` on an invalid iterator is a no-op. Consumers that must not treat
   corruption as end-of-data (compaction) MUST check `status()` whenever `Valid()` is false.
+- `Seek(target)` positions at the first entry whose key is `>= target`: the index (§6) gives the
+  first block whose `last_key >= target` (none: `Valid()` false, `status()` `kOk`, no block read);
+  that block is read with §10.2 validation and searched. Iteration continues with the next block.
+  `Seek` may be repeated in either direction; on a failed iterator it is a no-op. After a `Seek`
+  the record-count check at the clean end is skipped: the records before the target were not read.
 
 ## 12. Writer and publication
 
