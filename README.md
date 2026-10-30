@@ -127,31 +127,35 @@ Measured with `scripts/bench_cluster.sh` on an Apple M1 Pro laptop: three nodes 
 
 | Configuration | Operation | Client threads | Ops/s | p50 latency |
 |---|---|---|---|---|
-| durable (fsync on) | put | 1 | 60 | 16.5 ms |
-| durable (fsync on) | put | 32 | 526 | 67.1 ms |
-| no fsync | put | 1 | 2,346 | 0.42 ms |
-| no fsync | put | 32 | 10,362 | 2.46 ms |
-| durable | get (linearizable) | 1 | 2,407 | 0.39 ms |
-| durable | get (linearizable) | 4 | 5,499 | 0.61 ms |
-| durable | get (linearizable) | 32 | 11,785 | 1.45 ms |
+| durable (fsync on) | put | 1 | 67 | 14.9 ms |
+| durable (fsync on) | put | 32 | 707 | 46.7 ms |
+| no fsync | put | 1 | 2,268 | 0.43 ms |
+| no fsync | put | 32 | 10,234 | 2.48 ms |
+| durable | get (linearizable) | 1 | 2,636 | 0.36 ms |
+| durable | get (linearizable) | 4 | 5,156 | 0.63 ms |
+| durable | get (linearizable) | 32 | 10,534 | 1.44 ms |
 
-These rows are copied from `docs/benchmark-results.md` (commit `0e6e0da`), not re-measured. Single runs
-on a laptop vary by 10-20%.
+Single runs on a laptop vary by 10-20%; the comparisons below are between runs on this machine.
 
 What the numbers show:
-- **Durable writes are bounded by the disk.** With fsync off, writes scale from 2,346 to 10,362 ops/s
-  as clients are added, so the consensus and storage code paths are not the limit. With fsync on,
-  one write waits for about two sequential `F_FULLFSYNC` flushes (the leader's and a follower's).
-- **These durable numbers understate a real deployment.** All three nodes share one SSD here, and
-  `F_FULLFSYNC` flushes the whole drive cache, so the replicas' flushes queue behind each other. On
-  separate machines they would run in parallel. That is our explanation of the numbers; it has not
-  been measured on separate machines.
+- **Durable writes are bounded by the disk.** With fsync off, writes scale from 2,268 to 10,234 ops/s
+  as clients are added, so the consensus and storage code paths are not the limit. With fsync on, a
+  write needs the leader's and a follower's `F_FULLFSYNC`.
+- **The leader's fsync overlaps the followers'** (`docs/raft-design.md`, group commit): the leader now
+  syncs while the followers do, instead of before replicating. Against the previous run, durable writes
+  improved by 31-43% in throughput from 4 to 32 clients (32 writers: 526 to 707 ops/s, p50 67 to 47 ms).
+  A single client improved by about 10%, within run-to-run variation.
+- **Why a single client gains little here.** All three nodes share one SSD, and `F_FULLFSYNC` flushes
+  the whole drive cache, so the nodes' flushes still queue behind each other at the drive. On separate
+  machines they would run in parallel and a write would wait for about one flush instead of two; with
+  simulated disks the test suite measures exactly that halving (`FsyncOverlap.AWriteWaitsForOneFsyncNotTwo`).
+  It has not been measured on separate machines.
 - **Group commit is what makes concurrency help**: concurrent proposals share one log write and
-  fsync, so 32 durable writers get several times the throughput of one.
+  fsync, so 32 durable writers get about ten times the throughput of one.
 - **Reads scale with clients.** Reads used to peak at four clients and then fall (3,287 ops/s and
   8.5 ms p50 at 32 clients), because every read sent its own confirmation round. Concurrent reads now
-  share rounds (`docs/raft-design.md`, "Reads: ReadIndex"), and at 32 clients they reach 11,785 ops/s
-  at 1.45 ms p50: about 3.6x, measured before and after on the same machine.
+  share rounds (`docs/raft-design.md`, "Reads: ReadIndex"): at 32 clients, 10,534 ops/s at 1.44 ms p50
+  in this run (11,785 in the previous one), about 3.2-3.6x the old figure.
 
 ## Testing
 
