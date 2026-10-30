@@ -217,7 +217,8 @@ always re-validate from disk and cannot evict the blocks that reads use.
 - **Concurrency.** One mutex guards the LRU list and map; no I/O happens under it. Two readers that
   miss the same block both read it; the second insert is dropped (the contents are identical).
 
-The node does not set this option (it keeps the default 0).
+The node (`raftkv_node`) does not set this option yet, so the cache does not reach a cluster (the
+encoded-block search does); a node flag for it is left as a follow-up.
 
 ### 6.2 Range scans (`KVEngine::Scan`)
 
@@ -273,13 +274,15 @@ so treat small differences with care.
 | 2 | `Get` hit, hot 1% | 11,576 | 9,393 | 2,379 (3 tables) | 852 |
 | 2 | `Scan` 100 keys | — | 69,099 | 73,006 (3 tables) | 15,371 |
 
-What the numbers show (on this machine): searching the encoded block cuts every SSTable read by about
-13–19%. The cache removes the `pread`, CRC and decode for blocks it holds: hot reads become about 6×
-faster with 8 MiB, and with a cache that holds the whole data set (64 MiB) uniform reads are 6–8×
-faster. A cache smaller than the working set makes uniform reads about 9–10% slower than no cache
-(each miss now decodes the block and inserts it), and a full scan through a small cache churns it
-(full `Scan` of 200,000 keys: 116 ms without a cache, 136 ms with 8 MiB, 59 ms with 64 MiB, all with
-45 tables). Hence the default of 0: size the cache for the hot set.
+What the numbers show (on this machine): searching the encoded block makes reads that reach a data
+block (hits) about 17–19% faster; misses, which the Bloom filter mostly answers without reading a
+block, gain less (13% with 45 tables, 9% with 2). The cache removes the `pread`, CRC and decode for
+blocks it holds: with 8 MiB, hot reads become about 5.7× faster with 45 tables and about 3.9× with 2–3,
+and with a cache that holds the whole data set (64 MiB) uniform reads are 5.6× (45 tables) to 7.8×
+(2 tables) faster. A cache smaller than the working set makes uniform reads about 9–10% slower than no
+cache (each miss now decodes the block and inserts it), and a full scan through a small cache churns
+it (full `Scan` of 200,000 keys: 116 ms without a cache, 136 ms with 8 MiB, 59 ms with 64 MiB, all
+with 45 tables). Hence the default of 0: size the cache for the hot set.
 
 ## 7. Recovery (`Open` → `Recover`)
 
