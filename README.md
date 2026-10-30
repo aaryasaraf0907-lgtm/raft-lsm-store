@@ -112,7 +112,7 @@ Every flag of `raftkv_node` and `raftkv_cli` is described in
 ## Performance
 
 Measured with `scripts/bench_cluster.sh` on an Apple M1 Pro laptop: three nodes on the one machine,
-800 operations per run, 100-byte values, a Debug build. Selected rows; the full matrix is in
+800 operations per run, 100-byte values. Selected rows; the full matrix is in
 [`docs/benchmark-results.md`](docs/benchmark-results.md).
 
 | Configuration | Operation | Client threads | Ops/s | p50 latency |
