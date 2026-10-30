@@ -33,6 +33,28 @@ class ClientService final : public network::proto::ClientRpc::Service {
   using StatusProvider = std::function<void(network::proto::StatusResponse*)>;
   void SetStatusProvider(StatusProvider provider) { status_provider_ = std::move(provider); }
 
+  // Membership changes are handled by whoever owns the Raft node (NodeRuntime); without handlers
+  // the RPCs answer MEMBERSHIP_UNSUPPORTED.
+  using AddServerHandler = std::function<void(const network::proto::AddServerRequest&, network::proto::MembershipReply*)>;
+  using RemoveServerHandler =
+      std::function<void(const network::proto::RemoveServerRequest&, network::proto::MembershipReply*)>;
+  void SetMembershipHandlers(AddServerHandler add, RemoveServerHandler remove) {
+    add_server_ = std::move(add);
+    remove_server_ = std::move(remove);
+  }
+  grpc::Status AddServer(grpc::ServerContext* /*context*/, const network::proto::AddServerRequest* request,
+                         network::proto::MembershipReply* reply) override {
+    if (!add_server_) return Unsupported(reply);
+    add_server_(*request, reply);
+    return grpc::Status::OK;
+  }
+  grpc::Status RemoveServer(grpc::ServerContext* /*context*/, const network::proto::RemoveServerRequest* request,
+                            network::proto::MembershipReply* reply) override {
+    if (!remove_server_) return Unsupported(reply);
+    remove_server_(*request, reply);
+    return grpc::Status::OK;
+  }
+
  private:
  public:
   // Request size limits. They are enforced BEFORE anything is proposed: a committed entry that the
@@ -56,6 +78,13 @@ class ClientService final : public network::proto::ClientRpc::Service {
   KVStore* store_;
   KVStateMachine* state_machine_;
   StatusProvider status_provider_;
+  AddServerHandler add_server_;
+  RemoveServerHandler remove_server_;
+  static grpc::Status Unsupported(network::proto::MembershipReply* reply) {
+    reply->set_status(network::proto::MEMBERSHIP_UNSUPPORTED);
+    reply->set_error_message("membership changes are not available on this server");
+    return grpc::Status::OK;
+  }
 };
 
 }  // namespace raftkv

@@ -34,6 +34,9 @@ void Usage(FILE* out) {
       "  get KEY            read a value (linearizable)            prints the value\n"
       "  delete KEY         remove a key                           prints OK\n"
       "  status             role, term and log positions of every node\n"
+      "  add-node ID HOST:PORT   add node ID (started with raftkv_node --join) whose Raft\n"
+      "                          address is HOST:PORT; waits until it has caught up\n"
+      "  remove-node ID     remove node ID from the cluster (then stop it)\n"
       "  bench put|get COUNT [VALUE_BYTES] [THREADS]\n"
       "                     measure throughput and latency\n"
       "  repl               read commands from standard input (put/get/delete/status/quit)\n"
@@ -95,10 +98,13 @@ int PrintStatus(KvClient* client) {
       ++unreachable;
       continue;
     }
-    std::printf("node %u  %-9s term %llu  leader %u  commit %llu  applied %llu  log %llu  snapshot %llu\n",
+    std::string members;
+    for (uint32_t m : s.members()) members += (members.empty() ? "" : ",") + std::to_string(m);
+    std::printf("node %u  %-9s term %llu  leader %u  commit %llu  applied %llu  log %llu  snapshot %llu  members %s\n",
                 s.node_id(), s.role().c_str(), static_cast<unsigned long long>(s.term()), s.leader_id_hint(),
                 static_cast<unsigned long long>(s.commit_index()), static_cast<unsigned long long>(s.last_applied()),
-                static_cast<unsigned long long>(s.log_length()), static_cast<unsigned long long>(s.snapshot_index()));
+                static_cast<unsigned long long>(s.log_length()), static_cast<unsigned long long>(s.snapshot_index()),
+                members.empty() ? "(none)" : members.c_str());
   }
   return unreachable == static_cast<int>(client->node_ids().size()) ? 1 : 0;
 }
@@ -145,6 +151,20 @@ int Run(const Context& ctx, const std::vector<std::string>& words) {
     return 0;
   }
   if (cmd == "status" && words.size() == 1) return PrintStatus(ctx.client);
+  if ((cmd == "add-node" && words.size() == 3) || (cmd == "remove-node" && words.size() == 2)) {
+    char* end = nullptr;
+    const unsigned long id = std::strtoul(words[1].c_str(), &end, 10);
+    if (end == words[1].c_str() || *end != '\0' || id == 0) {
+      std::fputs("bad node id\n", stderr);
+      return 2;
+    }
+    const auto timeout = std::chrono::seconds(60);
+    KvResult r = cmd == "add-node" ? ctx.client->AddServer(static_cast<raftkv::NodeId>(id), words[2], timeout)
+                                   : ctx.client->RemoveServer(static_cast<raftkv::NodeId>(id), timeout);
+    if (r.status != KvStatus::kOk) return PrintFailure(r, cmd.c_str());
+    std::puts("OK");
+    return 0;
+  }
   std::fprintf(stderr, "bad command or arguments: %s (try --help)\n", cmd.c_str());
   return 2;
 }
@@ -180,7 +200,7 @@ int Repl(const Context& ctx) {
     if (!words.empty()) {
       if (words[0] == "quit" || words[0] == "exit") break;
       if (words[0] == "help") {
-        std::puts("put KEY VALUE | get KEY | delete KEY | status | quit");
+        std::puts("put KEY VALUE | get KEY | delete KEY | status | add-node ID HOST:PORT | remove-node ID | quit");
       } else {
         Run(ctx, words);
       }

@@ -50,6 +50,14 @@ class KvClient {
   // Asks one specific node about itself. False (and *error set) if it cannot be reached.
   bool NodeStatus(NodeId id, network::proto::StatusResponse* out, std::string* error);
 
+  // Membership changes, sent to the leader (leader hints are followed). Each keeps trying for
+  // `timeout`, which must cover the new node's catch-up for AddServer. kOk: committed.
+  // kOutcomeUnknown: not committed in time, it may still take effect. kInvalidArgument: bad id or
+  // address, or removing the last member. kUnavailable: see the message (for AddServer often: the
+  // new node is not running with --join, or not reachable at that address).
+  KvResult AddServer(NodeId id, const std::string& raft_address, std::chrono::milliseconds timeout);
+  KvResult RemoveServer(NodeId id, std::chrono::milliseconds timeout);
+
   // Points `id` at a new address (a node restarted on another port).
   void SetServer(NodeId id, const std::string& address);
 
@@ -59,6 +67,7 @@ class KvClient {
  private:
   using Stub = network::proto::ClientRpc::Stub;
   KvResult Write(bool is_put, const std::string& key, const std::string& value);
+  KvResult ChangeMembership(bool add, NodeId id, const std::string& raft_address, std::chrono::milliseconds timeout);
   void Rotate();
   void Prefer(NodeId hint);
   NodeId Current() const { return ids_[current_]; }
