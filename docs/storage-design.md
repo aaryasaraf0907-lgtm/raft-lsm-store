@@ -49,10 +49,42 @@ flowchart LR
 | `NNNNNN.sst.tmp.XXXXXX` | `SSTableBuilder` | a table being written (published by `link`, never by overwrite; `sstable-format.md` §12.2) |
 | `MANIFEST` | `StoreManifest` | the complete live state (section 5) |
 | `MANIFEST.tmp` | `StoreManifest` | a manifest being written; renamed over `MANIFEST` |
+| `LOCK` | `DirLock` | empty; held with `flock` for the engine's whole life (section 2.1). Never deleted |
 
 WAL sequence numbers and SSTable file numbers come from **one counter** (`next_seq_`, persisted as
 the manifest's `next_file_number`), so a number is never handed out twice (section 7, step 2). File names
 are parsed by `ParseName` in `kv_engine.cpp` (at most 18 digits).
+
+### 2.1 The directory lock (`DirLock`, `dir_lock.h`)
+
+`KVEngine::Open` takes an exclusive, non-blocking `flock` on `<dir>/LOCK` **before** it constructs the
+engine or reads, recovers or changes anything in the directory (recovery deletes orphan files and
+truncates WALs, which would damage a running engine). The lock is held by a `DirLock` member that is
+declared first and so destroyed last: after the flusher and compactor have been joined and the WALs and
+SSTables closed, another engine can take the directory. A failed `Open` releases it as its local
+objects unwind.
+
+- **Contention.** If another engine, in this process or another, holds the lock, `Open` returns
+  `kIOError` and `*out` is untouched; nothing in the directory has been created, deleted or modified
+  (apart from creating the empty `LOCK` file if it did not exist). `raftkv_node` reports this as
+  "cannot open the storage engine … if another raftkv_node is running on this data directory, stop it
+  first" and exits with status 1.
+- **Release.** Closing the descriptor releases the lock: at engine destruction, and also when the
+  process dies for any reason, `kill -9` included, so a crash never leaves a stale lock. (`flock` locks
+  belong to the open file description; the descriptor is `O_CLOEXEC`, so a child that `exec`s does not
+  inherit it. A child that only `fork`s shares the description and with it the lock until it exits.)
+- **The file.** `LOCK` is created on first use and never removed or replaced: deleting a lock file that
+  others may be opening lets one process lock the old inode and another the new one. It holds no data,
+  and recovery ignores it (it matches none of the name patterns above).
+- **Platforms.** `flock` is available on Linux and macOS, the supported platforms, and the lock tests are
+  part of the suites that CI runs on both. It is an advisory lock: it stops cooperating `KVEngine` instances, not a process that opens the
+  files by hand. On a network file system `flock` may be emulated or unsupported, so keep the data
+  directory on a local file system.
+- **Scope.** The lock protects the engine's directory (`<data-dir>/kv/` for a node). A second node
+  started on the same `--data-dir` fails when it opens the engine, which happens before the node
+  reads or writes the Raft log, so it cannot disturb the first one's state.
+- Tested by `DirLockTest.*` (`tests/storage/dir_lock_test.cpp`), including a child process that holds the
+  directory, is refused, and is killed with SIGKILL.
 
 ## 3. Write path
 
@@ -217,8 +249,9 @@ always re-validate from disk and cannot evict the blocks that reads use.
 - **Concurrency.** One mutex guards the LRU list and map; no I/O happens under it. Two readers that
   miss the same block both read it; the second insert is dropped (the contents are identical).
 
-The node (`raftkv_node`) does not set this option yet, so the cache does not reach a cluster (the
-encoded-block search does); a node flag for it is left as a follow-up.
+`raftkv_node --block-cache-bytes N` sets it for a cluster node (default 0 = no cache; plain decimal
+digits only; it applies to the LSM engine, and `--no-sstables` ignores it with a warning). The size
+reaches the engine unchanged, and `GetStats().block_cache_capacity` / `block_cache_usage` report it.
 
 ### 6.2 Range scans (`KVEngine::Scan`)
 
@@ -251,7 +284,7 @@ past `end` (the merge reads one entry ahead in every source).
 ### 6.3 Measured read performance
 
 `benchmarks/storage_read_bench.cpp` (built only with `-DRAFTKV_BUILD_BENCHMARKS=ON`; usage in the
-file). Workload: 200,000 keys of 16 bytes with 100-byte values inserted in shuffled order into an
+file; the benchmarks and their shared methodology are described in [`storage-benchmarks.md`](storage-benchmarks.md)). Workload: 200,000 keys of 16 bytes with 100-byte values inserted in shuffled order into an
 SSTable-mode engine (1 MiB memtables, unsynced WAL), fixed seed; then 200,000 `Get`s per run of present
 keys (uniform), absent keys inside the key range (uniform), and present keys from a hot 1%; 2,000
 `Scan`s of 100 keys from random starts; one full `Scan`. One warm-up run, then 5 runs; median and
@@ -284,8 +317,48 @@ cache (each miss now decodes the block and inserts it), and a full scan through 
 it (full `Scan` of 200,000 keys: 116 ms without a cache, 136 ms with 8 MiB, 59 ms with 64 MiB, all
 with 45 tables). Hence the default of 0: size the cache for the hot set.
 
+### 6.4 Write amplification: what is counted
+
+`KVEngine::GetStats()` carries cumulative byte counters since the engine was opened. They are measured
+where the engine hands data to the file system: a counter is increased when the write succeeded, with
+the real size of what was written, not an estimate. A write that failed part-way is not counted.
+
+| Counter | Counts |
+|---|---|
+| `user_bytes_written` | **logical** bytes: key + value of every acknowledged `Put`/`PutAt`, key only for `Delete`. The applied-index record of `PutAt`, rejected writes and installed checkpoint data are not user bytes |
+| `wal_bytes_written` | every WAL record handed to `write()` successfully: 8-byte header, type, key length, key, value. Includes the applied-index records of `PutAt` |
+| `flush_bytes_written` | whole SSTable files written by memtable flushes (data blocks, Bloom filter, index, footer) |
+| `compaction_bytes_written` | whole SSTable files written by compactions, including outputs later discarded as stale or because their manifest store failed |
+| `checkpoint_bytes_written` | the SSTable written by `InstallCheckpoint` |
+| `manifest_bytes_written` | the `MANIFEST` file after every successful store (the whole file is rewritten each time) |
+
+`storage_write_bench` reports ratios of these over the user bytes of a workload: **WAL** =
+wal/user, **flush** = flush/user, **compaction** = compaction/user, **LSM** = (flush + compaction)/user
+(the usual "write amplification" of an LSM tree: how many times the data is written to tables), and
+**total** = (WAL + flush + compaction + manifest + checkpoint)/user.
+
+What it excludes: data that is still in the active memtable when the workload ends (at most
+`memtable_bytes` of it has not been written to a table yet, so flush and LSM amplification are slightly
+understated for small data sets); file system metadata and journal writes; directory fsyncs; and
+device-level amplification (the flash translation layer). Overwrites and deletes inside one memtable
+collapse before the flush, which is why amplification is a property of a workload, not of the engine
+alone. The tiered compaction policy (section 8.1) is what produces the compaction share; the
+benchmarks measure it and do not change it. Tested exactly (WAL bytes to the byte, flush and
+checkpoint bytes against the files on disk) by `EngineStats.*` in `tests/storage/kv_engine_stats_test.cpp`.
+
+### 6.5 Measured write performance and write amplification
+
+`benchmarks/storage_write_bench.cpp`; how to build and run it, the workloads and the limitations are in
+[`storage-benchmarks.md`](storage-benchmarks.md), which also holds the results table (200,000 keys of
+16 + 100 bytes, 1 MiB memtables, unsynced WAL, 5 runs). In short, on that machine and with compaction
+trigger 4, the median LSM write amplification was 3.02 (fill, ascending keys), 3.72 (fill, random keys)
+and 3.02 (overwrites), against 1.09 with compaction off, and it varied between runs by up to about 1
+because it depends on when compactions happen to run.
+
 ## 7. Recovery (`Open` → `Recover`)
 
+0. **Lock** (`DirLock::Acquire`, section 2.1): before anything below. If the directory is locked,
+   `Open` fails with `kIOError` and none of the following happens.
 1. **Manifest and cleanup** (`LoadLsmState`):
    - load the manifest;
    - delete every directory entry whose name contains `.tmp` (unfinished writes, including
@@ -477,8 +550,11 @@ whichever dataset is on disk. Tested by
   need a WAL format change.
 - **Startup cleanup matches `.tmp` anywhere in a name** (`LoadLsmState`), so any file in the data
   directory whose name contains `.tmp` is deleted. The directory is assumed to belong to the engine.
-- **No data-directory lock.** Nothing stops two engines from opening the same directory; the
-  single-writer assumption behind `ManifestMayName` relies on that not happening.
+- **The directory lock is advisory** (section 2.1): it stops other `KVEngine` instances, not a process
+  that touches the files directly, and it needs a file system with working `flock` (a local one). A
+  refused `Open` reports plain `kIOError`, the same status as any other I/O failure; `raftkv_node`
+  adds a hint to its message, library callers cannot tell the two apart from the status alone. The
+  single-writer assumption behind `ManifestMayName` rests on this lock.
 - **`ManifestMayName` reads the manifest while holding `write_mu_`**, but only on a failure path.
 - **The checkpoint fail-stop is permanent** until reopen, and `AppliedIndex()` still returns the last
   in-memory value (it cannot report an error).
