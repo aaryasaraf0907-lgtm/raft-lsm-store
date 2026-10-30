@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "client_rpc.grpc.pb.h"
@@ -39,6 +40,14 @@ struct KvResult {
   int attempts = 0;
 };
 
+struct ScanResult {
+  KvStatus status = KvStatus::kUnavailable;
+  std::vector<std::pair<std::string, std::string>> items;
+  bool more = false;    // more keys may follow the last item: continue from its key + '\0'
+  std::string message;  // the last error, if any
+  int attempts = 0;
+};
+
 class KvClient {
  public:
   explicit KvClient(KvClientOptions options);
@@ -46,6 +55,9 @@ class KvClient {
   KvResult Put(const std::string& key, const std::string& value);
   KvResult Delete(const std::string& key);
   KvResult Get(const std::string& key);  // linearizable (the leader confirms with a majority)
+  // A linearizable range read of the live keys in [start, end) (empty end: no upper bound), at most
+  // `limit` keys (0: the server's maximum, 1000), fewer if the reply reaches about 1 MiB; see `more`.
+  ScanResult Scan(const std::string& start, const std::string& end, uint32_t limit);
 
   // Asks one specific node about itself. False (and *error set) if it cannot be reached.
   bool NodeStatus(NodeId id, network::proto::StatusResponse* out, std::string* error);

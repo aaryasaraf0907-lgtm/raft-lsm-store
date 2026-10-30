@@ -33,6 +33,9 @@ void Usage(FILE* out) {
       "  put KEY VALUE      store a value                          prints OK\n"
       "  get KEY            read a value (linearizable)            prints the value\n"
       "  delete KEY         remove a key                           prints OK\n"
+      "  scan [START [END [LIMIT]]]  the keys in [START, END) in order, linearizable;\n"
+      "                     - for an open end; at most LIMIT keys (default 100);\n"
+      "                     prints KEY<tab>VALUE lines\n"
       "  status             role, term and log positions of every node\n"
       "  add-node ID HOST:PORT   add node ID (started with raftkv_node --join) whose Raft\n"
       "                          address is HOST:PORT; waits until it has caught up\n"
@@ -123,6 +126,50 @@ int Run(const Context& ctx, const std::vector<std::string>& words) {
     std::puts("OK");
     return 0;
   }
+  if (cmd == "scan" && words.size() <= 4) {
+    std::string start, end;
+    if ((words.size() >= 2 && words[1] != "-" && !ctx.Bytes(words[1], &start)) ||
+        (words.size() >= 3 && words[2] != "-" && !ctx.Bytes(words[2], &end))) {
+      std::fputs("invalid hex\n", stderr);
+      return 2;
+    }
+    unsigned long limit = 100;
+    if (words.size() == 4) {
+      char* stop = nullptr;
+      limit = std::strtoul(words[3].c_str(), &stop, 10);
+      if (stop == words[3].c_str() || *stop != '\0' || limit == 0) {
+        std::fputs("LIMIT must be a positive number\n", stderr);
+        return 2;
+      }
+    }
+    // Page through the cluster's replies (at most 1000 keys each) until LIMIT keys are shown.
+    unsigned long shown = 0;
+    bool more = true;
+    while (more && shown < limit) {
+      raftkv::ScanResult r = ctx.client->Scan(start, end, static_cast<uint32_t>(std::min<unsigned long>(limit - shown, 1000)));
+      if (r.status != KvStatus::kOk) {
+        KvResult failure;
+        failure.status = r.status;
+        failure.message = r.message;
+        return PrintFailure(failure, "scan");
+      }
+      for (const auto& kv : r.items) {
+        if (ctx.hex) {
+          std::printf("%s\t%s\n", raftkv::HexEncode(kv.first).c_str(), raftkv::HexEncode(kv.second).c_str());
+        } else {
+          std::fwrite(kv.first.data(), 1, kv.first.size(), stdout);
+          std::fputc('\t', stdout);
+          std::fwrite(kv.second.data(), 1, kv.second.size(), stdout);
+          std::fputc('\n', stdout);
+        }
+        ++shown;
+      }
+      more = r.more && !r.items.empty();
+      if (more) start = r.items.back().first + std::string(1, '\0');  // the next possible key
+    }
+    if (more) std::fprintf(stderr, "(stopped after %lu keys; more follow)\n", shown);
+    return 0;
+  }
   if (cmd == "get" && words.size() == 2) {
     std::string k;
     if (!ctx.Bytes(words[1], &k)) {
@@ -200,7 +247,7 @@ int Repl(const Context& ctx) {
     if (!words.empty()) {
       if (words[0] == "quit" || words[0] == "exit") break;
       if (words[0] == "help") {
-        std::puts("put KEY VALUE | get KEY | delete KEY | status | add-node ID HOST:PORT | remove-node ID | quit");
+        std::puts("put KEY VALUE | get KEY | delete KEY | scan [START [END [LIMIT]]] | status | add-node ID HOST:PORT | remove-node ID | quit");
       } else {
         Run(ctx, words);
       }

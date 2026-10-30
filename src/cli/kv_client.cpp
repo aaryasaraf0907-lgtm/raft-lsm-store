@@ -353,4 +353,61 @@ KvResult KvClient::ChangeMembership(bool add, NodeId id, const std::string& raft
   return result;
 }
 
+ScanResult KvClient::Scan(const std::string& start, const std::string& end, uint32_t limit) {
+  const auto deadline = Clock::now() + options_.op_timeout;
+  ScanResult result;
+  result.message = "no response before the deadline";
+  size_t quiet_failures = 0;
+  while (Clock::now() < deadline) {
+    ++result.attempts;
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now());
+    const auto rpc_timeout = std::min(remaining, options_.rpc_timeout);
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + rpc_timeout);
+    network::proto::ScanRequest request;
+    request.set_start(start);
+    request.set_end(end);
+    request.set_limit(limit);
+    request.set_timeout_ms(ServerTimeoutMs(rpc_timeout));
+    network::proto::ScanResponse response;
+    const auto status = stubs_[Current()]->Scan(&context, request, &response);
+    if (!status.ok()) {
+      result.message = status.error_message().empty() ? "rpc failed" : status.error_message();
+      Rotate();
+      if (++quiet_failures % ids_.size() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      continue;
+    }
+    quiet_failures = 0;
+    switch (response.status()) {
+      case ClientStatus::CLIENT_STATUS_OK:
+        result.status = KvStatus::kOk;
+        result.items.clear();
+        for (const auto& kv : response.items()) result.items.emplace_back(kv.key(), kv.value());
+        result.more = response.more();
+        result.message.clear();
+        return result;
+      case ClientStatus::CLIENT_STATUS_INVALID_ARGUMENT:
+        result.status = KvStatus::kInvalidArgument;
+        result.message = response.error_message();
+        return result;
+      case ClientStatus::CLIENT_STATUS_NOT_LEADER:
+        result.message = "not the leader";
+        if (response.leader_id_hint() != 0) {
+          Prefer(response.leader_id_hint());
+        } else {
+          Rotate();
+          std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        }
+        break;
+      default:  // a read is safe to repeat: try again (elsewhere)
+        result.message = response.error_message();
+        Rotate();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        break;
+    }
+  }
+  result.status = KvStatus::kUnavailable;
+  return result;
+}
+
 }  // namespace raftkv
