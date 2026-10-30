@@ -488,7 +488,8 @@ These documents are not changed by this one; they are listed so readers know whi
 
 - `docs/sstable-format.md` Appendix A.3–A.4 recommends an **append-only** manifest log of edits.
   The implementation replaces the **whole** manifest atomically (section 5).
-- `docs/raft-design.md` §11 records the engine checkpoint and the persisted applied index as done.
+- `docs/raft-design.md` ("Limitations and future work") records the engine checkpoint and the
+  persisted applied index as done.
   Both exist: `Checkpoint` / `InstallCheckpoint` (section 9), and the applied index is an ordinary
   reserved key written with every `PutAt` / `DeleteAt` (section 3) as a second record after the data
   record. On replay after a restart, `KVStateMachine` skips the store writes for entries at or below

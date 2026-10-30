@@ -101,6 +101,28 @@ Be careful:
   directory, or a whole data directory: a node that returns without its Raft state is the unsupported
   case described under Known limitations.
 
+## Add, remove or replace a node
+
+Membership changes one server at a time while the cluster keeps serving (see
+`docs/raft-design.md`, section 9). With the script:
+```
+scripts/run_cluster.sh add 4      # starts node 4 with --join, then adds it once it has caught up
+scripts/run_cluster.sh remove 2   # removes node 2, then stops it
+scripts/run_cluster.sh status     # each node's line ends with its members
+```
+By hand, start the new node with `--join` and `--peers` listing the current members' Raft addresses
+and its own, then ask the cluster to add it:
+```
+raftkv_node --id 4 --join --peers 1=HOST:PORT,2=HOST:PORT,3=HOST:PORT,4=HOST:PORT \
+  --client-addr HOST:PORT --data-dir DIR
+raftkv_cli --servers 1=HOST:PORT,2=HOST:PORT,3=HOST:PORT add-node 4 RAFT_HOST:PORT
+raftkv_cli --servers ... remove-node 2
+```
+`add-node` waits until the new node has caught up with the log, then commits the change; if the node
+never catches up (not running, not started with `--join`, or unreachable at that address) nothing
+changes. To **replace a dead machine**, remove its id, then add the new machine. A new member must
+start with an empty data directory; a removed id can be added again once its old data is moved away.
+
 ## Measure
 
 ```
@@ -121,6 +143,7 @@ throughput and p50/p95/p99 latency. Numbers depend heavily on fsync: compare wit
 | `--peers 1=H:P,2=H:P,...` | Raft address of every node, this one included |
 | `--client-addr H:P` | where clients connect |
 | `--data-dir DIR` | Raft log and storage engine files |
+| `--join` | start as a new node that is not yet a member; it waits to be added (`add-node`) |
 | `--no-sync` | no fsync (testing only) |
 | `--memtable-bytes N`, `--compaction-trigger N` | flush size of a memtable (default 4 MiB) and how many SSTables trigger a merge (default 4; 0 = never) |
 | `--snapshot-threshold N`, `--snapshot-trailing N` | snapshot the data and drop the Raft log every N applied entries (default 10000; 0 = never) and how many log entries to keep below it (default 100) |
@@ -136,8 +159,8 @@ throughput and p50/p95/p99 latency. Numbers depend heavily on fsync: compare wit
   snapshots its data (a merged copy of every live key plus the client-session table) and drops the
   Raft log. A node that has no data, or is far behind, is sent the leader's snapshot in chunks. A
   snapshot is built in memory, so its size is bounded by the node's RAM.
-- The cluster membership is fixed when the nodes start. In particular a node must keep its disk: one
-  that is wiped and returns under the same id breaks Raft's assumption that persisted state survives,
-  and a leader that believes the node had caught up cannot bring it back. Replacing a machine needs a
-  membership change (remove the old id, add a new one), which is not implemented.
+- A member must keep its disk: one that is wiped and returns under the same id breaks Raft's assumption
+  that persisted state survives. Replace a machine with a membership change instead (above).
+- Membership changes one server at a time; a removed node is not told and must be stopped by hand
+  (`run_cluster.sh remove` does both).
 - Communication is unencrypted and unauthenticated: run it on a trusted network only.

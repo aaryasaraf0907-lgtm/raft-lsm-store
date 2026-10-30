@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <set>
 #include <string>
 #include <thread>
@@ -42,6 +43,19 @@ std::set<NodeId> Members(Cluster& c, NodeId id) {
   return out;
 }
 
+// Applies a membership change, retrying while the leader answers kInProgress: a new leader refuses
+// changes until it has committed an entry of its own term (Raft thesis 4.1), so a change asked for
+// right after an election may have to wait a moment. KvClient retries the same way.
+MembershipResult Change(const std::function<MembershipResponse()>& op) {
+  const auto deadline = std::chrono::steady_clock::now() + 10000ms;
+  MembershipResponse r = op();
+  while (r.result == MembershipResult::kInProgress && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(20ms);
+    r = op();
+  }
+  return r.result;
+}
+
 NodeId OtherThan(Cluster& c, std::set<NodeId> not_these) {
   for (NodeId id = 1; id <= static_cast<NodeId>(c.nodes.size()); ++id) {
     if (not_these.count(id) == 0) return id;
@@ -58,7 +72,7 @@ TEST(Membership, AnAddedServerCatchesUpAndBecomesAVoter) {
   for (int i = 0; i < 30; ++i) ASSERT_TRUE(Write(c, "before" + std::to_string(i)));
   const NodeId added = c.AddJoiningNode();
   EXPECT_FALSE(c.Node(added)->IsMember());
-  ASSERT_EQ(c.Node(leader)->AddServer(added, "", 10000ms).result, MembershipResult::kOk);
+  ASSERT_EQ(Change([&] { return c.Node(leader)->AddServer(added, "", 10000ms); }), MembershipResult::kOk);
   for (NodeId id = 1; id <= added; ++id) {
     ASSERT_TRUE(WaitFor([&] { return Members(c, id) == std::set<NodeId>{1, 2, 3, 4}; }, 5000ms)) << "node " << id;
   }
@@ -75,7 +89,7 @@ TEST(Membership, AfterAnAddTheMajorityIsCountedOverTheNewConfiguration) {
   const NodeId leader = WaitForLeader(c);
   ASSERT_NE(leader, 0u);
   const NodeId added = c.AddJoiningNode();
-  ASSERT_EQ(c.Node(leader)->AddServer(added, "", 10000ms).result, MembershipResult::kOk);
+  ASSERT_EQ(Change([&] { return c.Node(leader)->AddServer(added, "", 10000ms); }), MembershipResult::kOk);
   const NodeId a = OtherThan(c, {leader, added});
   c.net.Disconnect(a);
   c.net.Disconnect(added);
@@ -94,7 +108,7 @@ TEST(Membership, ARemovedFollowerNoLongerCountsAndDoesNotDisrupt) {
   ASSERT_TRUE(Write(c, "x"));
   const NodeId removed = OtherThan(c, {leader});
   const NodeId kept = OtherThan(c, {leader, removed});
-  ASSERT_EQ(c.Node(leader)->RemoveServer(removed, 5000ms).result, MembershipResult::kOk);
+  ASSERT_EQ(Change([&] { return c.Node(leader)->RemoveServer(removed, 5000ms); }), MembershipResult::kOk);
   EXPECT_EQ(Members(c, leader), (std::set<NodeId>{leader, kept}));
   const Term term = c.Node(leader)->CurrentTerm();
 
@@ -119,8 +133,8 @@ TEST(Membership, RemovingServersShrinksTheMajority) {
   ASSERT_NE(leader, 0u);
   const NodeId r1 = OtherThan(c, {leader});
   const NodeId r2 = OtherThan(c, {leader, r1});
-  ASSERT_EQ(c.Node(leader)->RemoveServer(r1, 5000ms).result, MembershipResult::kOk);
-  ASSERT_EQ(c.Node(leader)->RemoveServer(r2, 5000ms).result, MembershipResult::kOk);
+  ASSERT_EQ(Change([&] { return c.Node(leader)->RemoveServer(r1, 5000ms); }), MembershipResult::kOk);
+  ASSERT_EQ(Change([&] { return c.Node(leader)->RemoveServer(r2, 5000ms); }), MembershipResult::kOk);
   const NodeId down = OtherThan(c, {leader, r1, r2});
   c.net.Disconnect(down);
   EXPECT_EQ(c.Node(leader)->ProposeAndWait(Put("two-of-three"), 3000ms).result, CommitResult::kApplied)
@@ -132,7 +146,7 @@ TEST(Membership, TheLeaderCanRemoveItselfAndHandsOver) {
   const NodeId old_leader = WaitForLeader(c);
   ASSERT_NE(old_leader, 0u);
   ASSERT_TRUE(Write(c, "before"));
-  ASSERT_EQ(c.Node(old_leader)->RemoveServer(old_leader, 5000ms).result, MembershipResult::kOk);
+  ASSERT_EQ(Change([&] { return c.Node(old_leader)->RemoveServer(old_leader, 5000ms); }), MembershipResult::kOk);
   const NodeId new_leader = WaitForLeader(c, {old_leader});
   ASSERT_NE(new_leader, 0u) << "the remaining servers must elect a leader";
   EXPECT_FALSE(c.Node(old_leader)->IsMember());
@@ -149,13 +163,32 @@ TEST(Membership, AFailedServerIsReplacedByANewOne) {
   for (int i = 0; i < 20; ++i) ASSERT_TRUE(Write(c, "k" + std::to_string(i)));
   const NodeId failed = OtherThan(c, {leader});
   c.net.Disconnect(failed);
-  ASSERT_EQ(c.Node(leader)->RemoveServer(failed, 5000ms).result, MembershipResult::kOk);
+  ASSERT_EQ(Change([&] { return c.Node(leader)->RemoveServer(failed, 5000ms); }), MembershipResult::kOk);
   const NodeId fresh = c.AddJoiningNode();
-  ASSERT_EQ(c.Node(leader)->AddServer(fresh, "", 10000ms).result, MembershipResult::kOk);
+  ASSERT_EQ(Change([&] { return c.Node(leader)->AddServer(fresh, "", 10000ms); }), MembershipResult::kOk);
   const NodeId kept = OtherThan(c, {leader, failed, fresh});
   EXPECT_EQ(Members(c, leader), (std::set<NodeId>{leader, kept, fresh}));
   ASSERT_TRUE(Write(c, "after"));
   EXPECT_TRUE(WaitFor([&] { return Has(c, fresh, "k19") && Has(c, fresh, "after"); }, 5000ms));
+}
+
+// Raft thesis 4.1 (the erratum's fix): a new leader refuses membership changes until it has
+// committed an entry of its own term. Every message is delayed 50 ms, so the no-op a new leader
+// appends needs about 100 ms to commit; a change asked for in that window must be refused, and
+// accepted once an entry of the term has committed.
+TEST(Membership, ANewLeaderRefusesChangesUntilItHasCommittedAnEntryOfItsTerm) {
+  Cluster c(3);
+  FaultPlan plan;
+  plan.min_delay_ms = 50;
+  plan.max_delay_ms = 50;
+  c.net.SetFaults(plan);
+  const NodeId leader = WaitForLeader(c);
+  ASSERT_NE(leader, 0u);
+  EXPECT_EQ(c.Node(leader)->RemoveServer(OtherThan(c, {leader}), 1000ms).result, MembershipResult::kInProgress)
+      << "a leader that has not committed an entry of its term changed the configuration";
+  ASSERT_TRUE(Write(c, "x"));
+  const NodeId now = WaitForLeader(c);
+  EXPECT_EQ(Change([&] { return c.Node(now)->RemoveServer(OtherThan(c, {now}), 5000ms); }), MembershipResult::kOk);
 }
 
 TEST(Membership, OneChangeAtATimeAndAFailedCatchUpChangesNothing) {
@@ -195,7 +228,7 @@ TEST(Membership, TheConfigurationSurvivesSnapshotsAndAFullRestart) {
   for (int i = 0; i < 30; ++i) ASSERT_TRUE(Write(c, "a" + std::to_string(i)));
   ASSERT_TRUE(WaitFor([&] { return c.Node(leader)->SnapshotIndex() > 0; }, 5000ms));
   const NodeId added = c.AddJoiningNode();  // must catch up from a snapshot of the OLD configuration
-  ASSERT_EQ(c.Node(leader)->AddServer(added, "", 10000ms).result, MembershipResult::kOk);
+  ASSERT_EQ(Change([&] { return c.Node(leader)->AddServer(added, "", 10000ms); }), MembershipResult::kOk);
   for (int i = 0; i < 40; ++i) ASSERT_TRUE(Write(c, "b" + std::to_string(i)));
   for (NodeId id = 1; id <= added; ++id) {
     ASSERT_TRUE(WaitFor([&] { return c.Node(id)->SnapshotIndex() >= 60; }, 10000ms))
@@ -215,7 +248,7 @@ TEST(Membership, ConfigurationEntriesNeverReachTheStateMachine) {
   const NodeId leader = WaitForLeader(c);
   ASSERT_NE(leader, 0u);
   const NodeId added = c.AddJoiningNode();
-  ASSERT_EQ(c.Node(leader)->AddServer(added, "", 10000ms).result, MembershipResult::kOk);
+  ASSERT_EQ(Change([&] { return c.Node(leader)->AddServer(added, "", 10000ms); }), MembershipResult::kOk);
   ASSERT_TRUE(Write(c, "x"));
   for (NodeId id = 1; id <= added; ++id) {
     ASSERT_TRUE(WaitFor([&] { return Has(c, id, "x"); }, 5000ms));

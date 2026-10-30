@@ -340,7 +340,43 @@ discard their results. A node restarting from its own snapshot usually already h
 more) in its engine, so the dataset is replaced only if the engine is behind the snapshot. Snapshots are
 on by default in `raftkv_node` (every 10,000 applied entries), so the Raft log stays bounded.
 
-## 9. Failure scenarios and what happens
+## 9. Membership changes
+
+Servers are added and removed one at a time, the method of the Raft thesis (chapter 4), while the
+cluster keeps serving. Changing one server at a time is safe because any majority of the old
+configuration and any majority of the new one share at least one server, so the two can never
+elect different leaders or commit different entries; changing several at once would need joint
+consensus.
+
+- **The configuration travels through the log.** A `kConfig` entry carries the members and their
+  Raft addresses. Every server uses the **latest configuration in its log, committed or not**, for
+  every majority it counts: commits, elections, PreVote and ReadIndex. A follower whose log is
+  truncated falls back to the previous configuration. Configuration entries are never given to the
+  state machine.
+- **One change at a time**, and only once the leader has committed an entry of its own term. A new
+  leader may still hold an uncommitted configuration entry from an earlier term; changing again on
+  top of it could break the overlap of majorities (the bug in the original single-server algorithm,
+  corrected in the thesis's erratum).
+- **New servers catch up first.** `AddServer` replicates the log to the new server as a non-voting
+  learner, in rounds, until a round finishes within an election timeout; only then is the new
+  configuration appended. Adding an empty server as a voter at once could stall commits until it
+  caught up.
+- **Removing.** The leader stops replicating to a removed server as soon as the new configuration is
+  in its log. A leader that removes itself keeps leading until that entry commits (counted without
+  itself), then steps down. A server that is not a member never starts an election, and PreVote keeps a
+  removed server that never learned of its removal from disrupting the cluster: the members refuse it
+  while they hear from a leader.
+- **Snapshots carry the configuration.** Compaction drops the entries that carried it, so the snapshot
+  bytes are wrapped in a small envelope with the configuration at the snapshot point; the state
+  machine only ever sees what is inside. Snapshots written before membership changes existed have no
+  envelope and mean the initial configuration.
+- **Addresses.** A new member's Raft address is part of its configuration entry, and every node hands
+  new addresses to the gRPC transport as configurations arrive, so no node needs restarting.
+
+In practice: start the new node with `raftkv_node --join` (or `scripts/run_cluster.sh add ID`), then
+`raftkv_cli add-node ID HOST:PORT`; `remove-node ID` removes one. Each node's `status` lists its members.
+
+## 10. Failure scenarios and what happens
 
 | Scenario | Behavior | Test |
 |---|---|---|
@@ -355,8 +391,10 @@ on by default in `raftkv_node` (every 10,000 applied entries), so the Raft log s
 | Follower down while the leader compacts its log | It is sent the leader's snapshot, which replaces its engine's data | `NodeClusterTest.ALaggingFollowerCatchesUpFromASnapshotThatReplacesItsOldData` |
 | A node loses its engine's WAL or whole data directory | Rebuilt from its Raft log or snapshot | `NodeClusterTest.ANodeWhoseEngineLostItsWalRebuildsFromTheRaftLog`, `...EngineDirectoryIsGone...` |
 | Many concurrent clients | Writes share fsyncs, reads share confirmation rounds | `GroupCommit.*`, `ReadBatching.*` |
+| A machine dies and is replaced | Its id is removed and a new node is added; the new node catches up first | `Membership.AFailedServerIsReplacedByANewOne`, `NodeClusterTest.ANewNodeIsAddedOverGrpcAndAnOldOneRemoved` |
+| The leader removes itself | It leads until the change commits, then steps down; the others elect a leader | `Membership.TheLeaderCanRemoveItselfAndHandsOver` |
 
-## 10. How it is tested
+## 11. How it is tested
 
 - **Deterministic network.** `FakeNetwork` delivers messages from one worker thread and can disconnect and
   reconnect nodes, drop messages above a size limit, and simulate crash and restart of a node, so
@@ -366,6 +404,11 @@ on by default in `raftkv_node` (every 10,000 applied entries), so the Raft log s
   actual `FileRaftStorage` and `KVEngine` directories.
 - **Randomized chaos.** Seeded runs crash and partition nodes while a client writes; every acknowledged
   write must be on every node at the end, also after a full restart.
+- **Membership changes** (`membership_test.cpp`): majorities over the new configuration after an add
+  and after removals, a removed server that neither counts nor disrupts, catch-up, one change at a
+  time, and the configuration surviving snapshots and a full restart. One rule is not covered by a
+  test: a new leader waiting for an entry of its own term before a change (it needs a leader that has
+  been elected but cannot commit, which the simulated network cannot arrange deterministically).
 - **Fault injection.** `FakeNetwork` can also drop, duplicate, delay and reorder messages and cut single
   links, while checkers verify election safety, log agreement and that committed entries survive
   (`docs/fault-injection.md`).
@@ -380,11 +423,14 @@ on by default in `raftkv_node` (every 10,000 applied entries), so the Raft log s
   from snapshots, drop the kept log suffix). A rule that no test can fail on is not tested.
 - Raft tests must run serially: they are timer-based and fail spuriously under heavy parallel load.
 
-## 11. Limitations and future work
+## 12. Limitations and future work
 
-- **Membership changes** (adding and removing nodes) are not implemented; the cluster is fixed at start.
-  In particular a node must keep its disk: one that is wiped and rejoins under the same id breaks Raft's
-  assumption that persisted state survives, and replacing a machine needs a membership change.
+- **Membership changes are one server at a time** (no joint consensus), so replacing a machine is two
+  changes: remove its id, then add the new node. A member must keep its disk: a member that is wiped
+  and returns under the same id breaks Raft's assumption that persisted state survives. Remove it
+  first; the same id may then be added again with an empty data directory.
+- **A removed server is not told.** It stops receiving messages and stays idle (PreVote keeps it from
+  disrupting the others); stop it once its removal has committed.
 - **The leader's and the followers' fsyncs are not overlapped.** A write waits for the leader's fsync
   and then a follower's; a background persister thread would let them run in parallel (see group commit).
 - **No leader leases.** Reads still need a confirmation round (now shared by concurrent reads). Leases
@@ -399,9 +445,10 @@ on by default in `raftkv_node` (every 10,000 applied entries), so the Raft log s
 - A storage failure aborts the node by design.
 
 Done since the first version of this document: snapshots of the engine's data, the persisted applied
-index, `InstallSnapshot` and PreVote over gRPC, group commit for writes and batching for reads.
+index, `InstallSnapshot` and PreVote over gRPC, group commit for writes, batching for reads, client
+session expiry, and membership changes.
 
-## 12. Where the paper's rules live
+## 13. Where the paper's rules live
 
 | Raft paper (Figure 2) | Code |
 |---|---|
@@ -415,3 +462,4 @@ index, `InstallSnapshot` and PreVote over gRPC, group commit for writes and batc
 | InstallSnapshot RPC | `SendSnapshotChunkLocked`, `HandleInstallSnapshot`, `InstallSnapshotLocked` |
 | Log compaction | `CompactLocked` |
 | Read-only operations | `ReadIndex` |
+| Membership changes (thesis chapter 4) | `AddServer`, `RemoveServer`, `RecomputeConfigLocked`, `MajorityLocked` |

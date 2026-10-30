@@ -20,6 +20,9 @@ Built as a data structures and algorithms course project at VIT Pune. It runs on
   behind the compacted log is sent the leader's snapshot in chunks.
 - **Group commit**: concurrent proposals share one log write and one fsync, with an adaptive batching
   delay so that batching survives slow thread wake-ups.
+- **Membership changes**: nodes are added and removed one at a time while the cluster keeps serving
+  (Raft thesis, chapter 4); a new node catches up as a non-voting learner before it counts toward any
+  majority, and the configuration survives log compaction inside snapshots.
 
 **Storage (LSM tree)**
 - A concurrent **skip-list memtable** behind a checksummed **write-ahead log**.
@@ -106,49 +109,54 @@ scripts/run_cluster.sh restart 1
 scripts/run_cluster.sh stop
 scripts/run_cluster.sh clean
 ```
+Grow or shrink a running cluster (each node's `status` line ends with its members):
+```
+scripts/run_cluster.sh start 3
+scripts/run_cluster.sh add 4
+scripts/run_cluster.sh remove 2
+scripts/run_cluster.sh status
+```
 Every flag of `raftkv_node` and `raftkv_cli` is described in
 [`docs/running-a-cluster.md`](docs/running-a-cluster.md).
 
 ## Performance
 
 Measured with `scripts/bench_cluster.sh` on an Apple M1 Pro laptop: three nodes on the one machine,
-800 operations per run, 100-byte values. Selected rows; the full matrix is in
+800 operations per run, 100-byte values, a Debug build. Selected rows; the full matrix is in
 [`docs/benchmark-results.md`](docs/benchmark-results.md).
 
 | Configuration | Operation | Client threads | Ops/s | p50 latency |
 |---|---|---|---|---|
-| durable (fsync on) | put | 1 | 60.1 | 16.51 ms |
-| durable (fsync on) | put | 32 | 526.3 | 67.13 ms |
-| no fsync | put | 1 | 2,345.6 | 0.42 ms |
-| no fsync | put | 32 | 10,362.2 | 2.46 ms |
-| durable | get (linearizable) | 1 | 2,406.6 | 0.39 ms |
-| durable | get (linearizable) | 4 | 5,499.0 | 0.61 ms |
-| durable | get (linearizable) | 32 | 11,785.3 | 1.45 ms |
+| durable (fsync on) | put | 1 | 60 | 16.5 ms |
+| durable (fsync on) | put | 32 | 526 | 67.1 ms |
+| no fsync | put | 1 | 2,346 | 0.42 ms |
+| no fsync | put | 32 | 10,362 | 2.46 ms |
+| durable | get (linearizable) | 1 | 2,407 | 0.39 ms |
+| durable | get (linearizable) | 4 | 5,499 | 0.61 ms |
+| durable | get (linearizable) | 32 | 11,785 | 1.45 ms |
 
 These rows are copied from `docs/benchmark-results.md` (commit `0e6e0da`), not re-measured. Single runs
 on a laptop vary by 10-20%.
 
 What the numbers show:
-- **Durable writes are bounded by the disk.** With fsync off, writes scale from 2,345.6 to 10,362.2 ops/s
+- **Durable writes are bounded by the disk.** With fsync off, writes scale from 2,346 to 10,362 ops/s
   as clients are added, so the consensus and storage code paths are not the limit. With fsync on,
   one write waits for about two sequential `F_FULLFSYNC` flushes (the leader's and a follower's).
 - **These durable numbers understate a real deployment.** All three nodes share one SSD here, and
   `F_FULLFSYNC` flushes the whole drive cache, so the replicas' flushes queue behind each other. On
   separate machines they would run in parallel. That is our explanation of the numbers; it has not
   been measured on separate machines.
-- **Group commit is what makes concurrency help**: 32 concurrent writers reach about 9x the
-  throughput of one (526.3 against 60.1 ops/s).
-- **Concurrent linearizable reads share confirmation rounds.** A read still needs a majority to
-  acknowledge a message sent after the read's index was fixed, but reads that arrive together share one
-  round instead of each sending its own (`docs/raft-design.md` §5). In the durable configuration measured
-  above, linearizable reads reach 5,499.0 ops/s at 4 client threads and 11,785.3 ops/s at 32; this says
-  nothing about other configurations or client counts.
+- **Group commit is what makes concurrency help**: concurrent proposals share one log write and
+  fsync, so 32 durable writers get several times the throughput of one.
+- **Reads scale with clients.** Reads used to peak at four clients and then fall (3,287 ops/s and
+  8.5 ms p50 at 32 clients), because every read sent its own confirmation round. Concurrent reads now
+  share rounds (`docs/raft-design.md`, "Reads: ReadIndex"), and at 32 clients they reach 11,785 ops/s
+  at 1.45 ms p50: about 3.6x, measured before and after on the same machine.
 
 ## Testing
 
-423 registered test cases in the network-enabled configuration (`-DRAFTKV_BUILD_NETWORK=ON`; `ctest -N`
-lists 423, one of them disabled; the default core build lists 360), run on every pull request by CI
-on Linux and macOS:
+More than 400 test cases (one of them disabled by default), run on every pull request by CI on Linux
+and macOS:
 
 - **Unit and integration tests** for every component, including real three-node clusters over gRPC
   that kill and restart leaders while clients write, and then check that no acknowledged write was
@@ -168,9 +176,8 @@ on Linux and macOS:
 
 ## Limitations
 
-- **Fixed membership.** The set of nodes is fixed at start-up. A node must keep its disk: one that is
-  wiped and rejoins under the same id breaks Raft's assumption that persisted state survives, and
-  replacing a machine would need membership change, which is not implemented.
+- **Membership changes one server at a time** (no joint consensus), and a member must keep its disk:
+  to replace a machine, remove its id and add the new node (`run_cluster.sh remove`, then `add`).
 - **Snapshots are built in memory**, so a snapshot must fit in RAM.
 - **Range scans are storage-engine only.** `KVEngine::Scan` exists, but the client and gRPC API is
   `Put`, `Get` and `Delete`.
