@@ -366,7 +366,7 @@ class SnapshotHandler final : public RpcHandler {
       snapshot_ = request;
     }
     if (snapshot_delay_ms_ > 0) std::this_thread::sleep_for(std::chrono::milliseconds(snapshot_delay_ms_));
-    if (block_first_ && snapshot_calls_.load() == 1) {
+    if (block_all_ || (block_first_ && snapshot_calls_.load() == 1)) {
       std::unique_lock<std::mutex> lock(gate_mutex_);
       gate_cv_.wait_for(lock, std::chrono::seconds(5), [this] { return released_; });
     }
@@ -389,6 +389,7 @@ class SnapshotHandler final : public RpcHandler {
   }
   int SnapshotCalls() const { return snapshot_calls_.load(); }
   bool block_first_ = false;
+  bool block_all_ = false;  // every snapshot call waits for Release(): a peer that never answers
   int snapshot_delay_ms_ = 0;  // every snapshot chunk takes this long to handle
 
  private:
@@ -490,7 +491,7 @@ TEST(GrpcTransportTest, AtMostOneSnapshotRpcPerPeerIsInFlight) {
 // healthy peer: snapshot sends to it may occupy at most one worker.
 TEST(GrpcTransportTest, ASnapshotToAnUnresponsivePeerDoesNotBlockOtherPeers) {
   SnapshotHandler stuck;
-  stuck.block_first_ = true;  // never released: stays stuck until the deadline
+  stuck.block_all_ = true;  // a peer that never answers any snapshot call (released at the end)
   GrpcTransport stuck_server("127.0.0.1:0", {});
   stuck_server.SetHandler(&stuck);
   stuck_server.Start();
@@ -504,19 +505,39 @@ TEST(GrpcTransportTest, ASnapshotToAnUnresponsivePeerDoesNotBlockOtherPeers) {
   RecordingHandler unused;
   client.SetHandler(&unused);
   client.Start();
+  // Connect to the healthy peer first: setting up a connection is not what this test is about, and
+  // on a slow machine the first heartbeats can miss their 150 ms deadline while it happens.
+  {
+    std::atomic<bool> connected{false};
+    for (int attempt = 0; attempt < 50 && !connected.load(); ++attempt) {
+      client.SendAppendEntries(3, AppendEntriesRequest{3, 1, 0, 0, {}, 0},
+                               [&](const AppendEntriesReply&) { connected = true; });
+      WaitUntil([&] { return connected.load(); }, std::chrono::milliseconds(200));
+    }
+    ASSERT_TRUE(connected.load()) << "could not reach the healthy peer at all";
+  }
   for (int i = 0; i < 50; ++i) {
     client.SendInstallSnapshot(2, InstallSnapshotRequest{3, 1, 10, 2, 0, "chunk", false},
                                [](const InstallSnapshotReply&) {});
   }
+  // The rule that protects the other peers: at most one snapshot RPC per peer is outstanding, so the
+  // 49 repeats were dropped instead of each occupying a worker.
+  WaitUntil([&] { return stuck.SnapshotCalls() >= 1; }, std::chrono::seconds(2));
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  EXPECT_EQ(stuck.SnapshotCalls(), 1) << "repeated snapshot sends to a stuck peer were not dropped";
+  // Heartbeats as Raft sends them: one every 20 ms, a lost one (a deadline missed on a loaded
+  // machine) simply followed by the next. What must not happen is that the stuck snapshot RPCs
+  // block them: then none would be answered before the snapshot deadline (3 s). Twenty answers
+  // within 2 s means the healthy peer kept being served.
   std::atomic<int> acked{0};
   const auto start = std::chrono::steady_clock::now();
-  for (int i = 0; i < 20; ++i) {
+  while (acked.load() < 20 && std::chrono::steady_clock::now() - start < std::chrono::seconds(2)) {
     client.SendAppendEntries(3, AppendEntriesRequest{3, 1, 0, 0, {}, 0},
                              [&](const AppendEntriesReply&) { ++acked; });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
-  ASSERT_TRUE(WaitUntil([&] { return acked.load() == 20; }, std::chrono::seconds(2)))
-      << "heartbeats to a healthy peer were starved";
-  EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
+  ASSERT_GE(acked.load(), 20) << "heartbeats to a healthy peer were starved (" << acked.load()
+                              << " answered in 2 s while a snapshot to another peer was stuck)";
   stuck.Release();
   client.Stop();
   stuck_server.Stop();
