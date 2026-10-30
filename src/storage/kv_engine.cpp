@@ -1,6 +1,7 @@
 #include "storage/kv_engine.h"
 
 #include "storage/compaction.h"
+#include "storage/merging_iterator.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -9,7 +10,6 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
-#include <queue>
 #include <set>
 #include <system_error>
 
@@ -188,7 +188,7 @@ Status KVEngine::LoadLsmState() {
   for (const auto& p : doomed) std::filesystem::remove(p, ec);
   for (const SSTableMeta& f : manifest_.files) {
     std::unique_ptr<SSTable> t;
-    s = SSTable::Open(Path(SstFileName(f.file_number)), f.file_number, &t);
+    s = SSTable::Open(Path(SstFileName(f.file_number)), f.file_number, &t, block_cache_);
     if (s == Status::kIOError) return Status::kCorruption;  // a live file is missing or unreadable
     if (s != Status::kOk) return s;
     if (t->meta().min_seq != f.min_seq || t->meta().max_seq != f.max_seq) return Status::kCorruption;
@@ -415,48 +415,55 @@ Status KVEngine::Checkpoint(std::string* data, uint64_t* applied_index) {
   sources.push_back(std::make_unique<VectorIterator>(std::move(active_copy)));
   for (const auto& m : view->frozen) sources.push_back(std::make_unique<MemTable::Iterator>(m->NewIterator()));
   for (const auto& t : view->sstables) sources.push_back(t->NewIterator());
-  // Only SSTable iterators can fail (a damaged block); a memtable cannot.
-  auto status_of = [&](size_t i) {
-    auto* sst = dynamic_cast<SSTable::Iterator*>(sources[i].get());
-    return sst != nullptr ? sst->status() : Status::kOk;
-  };
-  for (size_t i = 0; i < sources.size(); ++i) {
-    if (!sources[i]->Valid() && status_of(i) != Status::kOk) return status_of(i);
-  }
-  auto later = [&](size_t x, size_t y) {  // true if x should come out AFTER y
-    const std::string& kx = sources[x]->Current().key;
-    const std::string& ky = sources[y]->Current().key;
-    return kx != ky ? kx > ky : x > y;  // equal keys: the newer source (lower index) first
-  };
-  std::priority_queue<size_t, std::vector<size_t>, decltype(later)> heap(later);
-  for (size_t i = 0; i < sources.size(); ++i) {
-    if (sources[i]->Valid()) heap.push(i);
-  }
+  MergingIterator merged(std::move(sources));  // newest version of each key, tombstones included
   uint64_t count = 0;
   std::string body;
-  while (!heap.empty()) {
-    const size_t top = heap.top();
-    heap.pop();
-    const Entry newest = sources[top]->Current();
-    auto advance = [&](size_t i) {
-      sources[i]->Next();
-      if (sources[i]->Valid()) heap.push(i);
-      return status_of(i);
-    };
-    Status s = advance(top);
-    while (s == Status::kOk && !heap.empty() && sources[heap.top()]->Current().key == newest.key) {
-      const size_t older = heap.top();
-      heap.pop();
-      s = advance(older);  // an older version of the same key: discard
-    }
-    if (s != Status::kOk) return s;
+  for (; merged.Valid(); merged.Next()) {
+    const Entry& newest = merged.Current();
     if (!newest.tombstone && !HasReservedKeyPrefix(newest.key)) {
       AppendCheckpointEntry(&body, newest.key, newest.value);
       ++count;
     }
   }
+  if (merged.status() != Status::kOk) return merged.status();  // a damaged SSTable block
   *data = CheckpointHeader(count) + body;
   *applied_index = index;
+  return Status::kOk;
+}
+
+// Range read over the read view, like Get: no engine lock is held. The view (copied under
+// view_mu_) holds every memtable and SSTable that existed when the scan began, so every write that
+// completed before Scan was called is in it; frozen memtables and SSTables never change, and files
+// that a flush, compaction or checkpoint install deletes meanwhile stay readable through the open
+// SSTables the view holds. Only the active memtable can change during the scan (writes the scan
+// may or may not see). Hence: per-key, the newest version in the view when that key is reached;
+// NOT a point-in-time snapshot across keys.
+Status KVEngine::Scan(const std::string& start, const std::string& end, size_t limit,
+                      std::vector<std::pair<std::string, std::string>>* out) {
+  out->clear();
+  if (fail_stopped_) return Status::kIOError;  // as Get: the in-memory data may not be what a restart finds
+  if (!end.empty() && start >= end) return Status::kOk;
+  std::shared_ptr<const View> view;
+  {
+    std::lock_guard<std::mutex> guard(view_mu_);
+    view = view_;
+  }
+  std::vector<std::unique_ptr<KVIterator>> sources;  // newest first, each positioned at `start`
+  sources.push_back(std::make_unique<MemTable::Iterator>(view->active->NewIterator(start)));
+  for (const auto& m : view->frozen) sources.push_back(std::make_unique<MemTable::Iterator>(m->NewIterator(start)));
+  for (const auto& t : view->sstables) sources.push_back(t->NewIterator(start));
+  MergingIterator merged(std::move(sources));
+  for (; merged.Valid(); merged.Next()) {
+    const Entry& e = merged.Current();
+    if (!end.empty() && e.key >= end) break;
+    if (e.tombstone || HasReservedKeyPrefix(e.key)) continue;  // a deleted key, or engine bookkeeping
+    out->emplace_back(e.key, e.value);
+    if (limit != 0 && out->size() == limit) break;
+  }
+  if (merged.status() != Status::kOk) {  // a damaged block is an error, never a shorter result
+    out->clear();
+    return merged.status();
+  }
   return Status::kOk;
 }
 
@@ -497,7 +504,7 @@ Status KVEngine::InstallCheckpoint(const std::string& data, uint64_t applied_ind
   VectorIterator source(std::move(entries));
   Status s = WriteSSTable(Path(SstFileName(number)), meta, bo, &source);
   std::unique_ptr<SSTable> opened;
-  if (s == Status::kOk) s = SSTable::Open(Path(SstFileName(number)), number, &opened);
+  if (s == Status::kOk) s = SSTable::Open(Path(SstFileName(number)), number, &opened, block_cache_);
   if (s != Status::kOk) {
     std::filesystem::remove(Path(SstFileName(number)), ec);
     return s;
@@ -657,7 +664,7 @@ void KVEngine::FlushLoop() {
       if (kept_seq == f.seq) {
         // A manifest that may survive names this file, so it must not be deleted. It was written
         // from this same (immutable) memtable: reuse it.
-        s = SSTable::Open(Path(SstFileName(f.seq)), f.seq, &opened);
+        s = SSTable::Open(Path(SstFileName(f.seq)), f.seq, &opened, block_cache_);
       } else {
         std::error_code ec;
         std::filesystem::remove(Path(SstFileName(f.seq)), ec);  // an orphan of an earlier failed attempt
@@ -665,7 +672,7 @@ void KVEngine::FlushLoop() {
         SSTableBuilderOptions bo;
         bo.bits_per_key = options_.bloom_bits_per_key;
         s = WriteSSTable(Path(SstFileName(f.seq)), meta, bo, &it);
-        if (s == Status::kOk) s = SSTable::Open(Path(SstFileName(f.seq)), f.seq, &opened);
+        if (s == Status::kOk) s = SSTable::Open(Path(SstFileName(f.seq)), f.seq, &opened, block_cache_);
       }
       if (s == Status::kOk) table = std::shared_ptr<SSTable>(std::move(opened));
       if (s == Status::kOk && CrashPoint("flush:after_sst")) return;
@@ -785,7 +792,7 @@ void KVEngine::CompactLoop() {
     std::shared_ptr<SSTable> output;
     if (s == Status::kOk) {
       std::unique_ptr<SSTable> opened;
-      s = SSTable::Open(out_path, out_number, &opened);
+      s = SSTable::Open(out_path, out_number, &opened, block_cache_);
       if (s == Status::kOk) output = std::shared_ptr<SSTable>(std::move(opened));
     }
 

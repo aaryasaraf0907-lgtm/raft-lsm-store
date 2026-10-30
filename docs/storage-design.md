@@ -180,11 +180,109 @@ returns `kNotFound`. In an SSTable, the Bloom filter can only answer "absent"; o
 locates the one candidate block (`sstable-format.md` §11.2). A damaged block is reported as
 `kCorruption` (or `kIOError`), **never** as "not found".
 
+Without a block cache, `SSTable::Get` searches the candidate block **in its encoded form**
+(`ParseBlock` in `sstable.cpp`): it validates every record of the block exactly as a full decode
+would (§10.2 of `sstable-format.md`, including the records after the key), but builds no `Entry`
+objects and copies only the matching value, after the whole block has passed. Damage anywhere in the
+block is therefore still reported (`SSTableTest.GetValidatesTheWholeBlockEvenAfterFindingTheKey`).
+The `pread` and the CRC check remain on every read.
+
 A reader keeps every `SSTable` in its view open (`shared_ptr`), so compaction can delete input files
 while a reader still uses them. A `View` is replaced, never modified, so a reader never sees a
 half-applied flush or compaction (tested by `LsmTest.ReadersNeverSeeTheStateGoBackwardsWhileFlushingAndCompacting`).
 
-After the checkpoint fail-stop (section 11) every `Get` started afterwards returns `kIOError`.
+After the checkpoint fail-stop (section 11) every `Get` and `Scan` started afterwards returns
+`kIOError`.
+
+### 6.1 Block cache (`Options::block_cache_bytes`, default 0 = off)
+
+With a non-zero capacity the engine creates one `BlockCache` (`block_cache.h`), an LRU of **decoded,
+validated** data blocks shared by all its SSTables. `Get` and the iterators `Scan` uses read through
+it; the full-table scans of compaction and `Checkpoint` (`SSTable::NewIterator()`) never do, so they
+always re-validate from disk and cannot evict the blocks that reads use.
+
+- **Identity.** A block is cached under (table id, block index). The id is taken from a process-wide
+  counter when an `SSTable` object is opened, not from the file number, so tables of other
+  directories, a reopened table and a table installed by a checkpoint never share entries. An SSTable
+  file never changes after it is published, and one `SSTable` object reads one file, so a cached
+  block can never go stale. `~SSTable` erases its blocks.
+- **Validation.** Only a block that passed the full §10.2 validation is inserted; a failed read is
+  never cached and fails again on the next read. A hit serves that validated copy without touching the
+  disk, so damage that appears on disk after a block was cached is found when the block is next read
+  from disk (after eviction, by a reopened engine, by compaction or by a checkpoint).
+- **Memory.** Each block is charged its key and value bytes plus a fixed overhead per entry and per
+  block; least recently used blocks are evicted until the total is within the capacity. Blocks are
+  handed out as `shared_ptr`, so an evicted block stays valid for a reader or iterator still holding
+  it; memory in use can exceed the capacity by those blocks.
+- **Concurrency.** One mutex guards the LRU list and map; no I/O happens under it. Two readers that
+  miss the same block both read it; the second insert is dropped (the contents are identical).
+
+The node (`raftkv_node`) does not set this option yet, so the cache does not reach a cluster (the
+encoded-block search does); a node flag for it is left as a follow-up.
+
+### 6.2 Range scans (`KVEngine::Scan`)
+
+`Scan(start, end, limit, &out)` returns the live keys in `[start, end)` in key order with their newest
+values: an empty `end` means no upper bound, `limit == 0` means no limit, `start >= end` (with a
+non-empty `end`) gives an empty result. Deleted keys and the engine's reserved keys are never returned
+and do not count against `limit`. On an error `out` is empty and the status is returned. It works in
+both modes and is not part of `KVStore` or of the client/gRPC API.
+
+It takes the view as `Get` does and builds one source per layer, newest first, each positioned at
+`start`: the active memtable and every frozen memtable (`MemTable::NewIterator(start)`) and every SSTable
+(`SSTable::NewIterator(start)`, i.e. `Iterator::Seek`). A `MergingIterator` (`merging_iterator.h`)
+merges them by key; for equal keys the newest source wins and older versions are skipped, so a
+tombstone hides older values and a newer value hides an older tombstone. `Checkpoint` uses the same
+merge over every layer.
+
+**Consistency: per key, not a snapshot.** No engine lock is held. The view holds every memtable and
+SSTable that existed when the scan began, so every write that completed before `Scan` was called is
+reflected (unless it was overwritten since). Frozen memtables and SSTables never change; a flush
+swaps a frozen memtable for its SSTable in one new view, and files that a compaction or a checkpoint
+install deletes stay readable through the open `SSTable`s that the old view holds (the disk space is
+freed when the scan ends). Only the active memtable can change while the scan runs: a concurrent write
+may or may not be seen, and different keys may reflect different moments. A value is never torn
+(memtable versions are immutable). Tested by `ScanTest.ConcurrentWritesFlushesAndCompactionsNeverHideCompletedWrites`
+and, against a `std::map`, by `EngineModelTest.GetAndScanAgreeWithAStdMap`.
+
+**Errors.** A damaged block that the scan reads fails the whole scan, even when it is the block just
+past `end` (the merge reads one entry ahead in every source).
+
+### 6.3 Measured read performance
+
+`benchmarks/storage_read_bench.cpp` (built only with `-DRAFTKV_BUILD_BENCHMARKS=ON`; usage in the
+file). Workload: 200,000 keys of 16 bytes with 100-byte values inserted in shuffled order into an
+SSTable-mode engine (1 MiB memtables, unsynced WAL), fixed seed; then 200,000 `Get`s per run of present
+keys (uniform), absent keys inside the key range (uniform), and present keys from a hot 1%; 2,000
+`Scan`s of 100 keys from random starts; one full `Scan`. One warm-up run, then 5 runs; median and
+range in nanoseconds per operation. `--trigger 0` (no compaction) leaves 45 SSTables; `--trigger 4`
+leaves 2 or 3 depending on compaction timing.
+
+Measured 2026-10-30 on an Intel Core i5-13450HX (16 threads), 7.6 GiB visible to WSL2, Ubuntu 26.04.1
+under WSL2 (kernel 6.18.54.1), g++ 15.2.0, CMake `Release` (`-O3 -DNDEBUG`), data in the page cache.
+"Before" is the same benchmark built against `b9a40fa` (the scans did not exist yet). Single machine,
+so treat small differences with care.
+
+| SSTables | Workload | Before | Encoded-block search | + cache 8 MiB | + cache 64 MiB |
+|---|---|---|---|---|---|
+| 45 | `Get` hit, uniform | 14,273 | 11,859 | 13,024 | 2,122 |
+| 45 | `Get` miss | 6,005 | 5,196 | 5,625 | 2,064 |
+| 45 | `Get` hit, hot 1% | 16,635 | 13,730 | 2,395 | 2,292 |
+| 45 | `Scan` 100 keys | — | 600,829 | 489,133 | 58,481 |
+| 2 | `Get` hit, uniform | 11,714 | 9,492 | 10,341 (3 tables) | 1,224 |
+| 2 | `Get` miss | 510 | 465 | 545 (3 tables) | 316 |
+| 2 | `Get` hit, hot 1% | 11,576 | 9,393 | 2,379 (3 tables) | 852 |
+| 2 | `Scan` 100 keys | — | 69,099 | 73,006 (3 tables) | 15,371 |
+
+What the numbers show (on this machine): searching the encoded block makes reads that reach a data
+block (hits) about 17–19% faster; misses, which the Bloom filter mostly answers without reading a
+block, gain less (13% with 45 tables, 9% with 2). The cache removes the `pread`, CRC and decode for
+blocks it holds: with 8 MiB, hot reads become about 5.7× faster with 45 tables and about 3.9× with 2–3,
+and with a cache that holds the whole data set (64 MiB) uniform reads are 5.6× (45 tables) to 7.8×
+(2 tables) faster. A cache smaller than the working set makes uniform reads about 9–10% slower than no
+cache (each miss now decodes the block and inserts it), and a full scan through a small cache churns
+it (full `Scan` of 200,000 keys: 116 ms without a cache, 136 ms with 8 MiB, 59 ms with 64 MiB, all
+with 45 tables). Hence the default of 0: size the cache for the hot set.
 
 ## 7. Recovery (`Open` → `Recover`)
 
@@ -363,11 +461,13 @@ whichever dataset is on disk. Tested by
 
 - **Compaction sizing uses entry counts**, not bytes (`kv_engine.cpp`, `CompactLoop`), so tables with
   very different value sizes are weighed by count.
-- **Point reads decode the whole candidate block** into a vector of entries before searching it
-  (`SSTable::Get`, `SSTable::ReadBlock`). The v1 block format has no record-offset table, so a true
-  binary search inside a block would need a format change.
-- **No block cache, no range scan.** Every block read goes to the file (`pread`). There is no
-  `Seek` on `SSTable::Iterator` and no engine `Scan`.
+- **A point read scans its candidate block linearly.** The v1 block format has no record-offset
+  table, so a binary search inside a block would need a format change. Without a cache, every read
+  still pays a `pread` and a CRC of the whole block.
+- **The block cache is off by default** and has one mutex; it has not been measured under many
+  concurrent readers. Scans read through it, so a large scan can evict the hot set.
+- **`Scan` is not a point-in-time snapshot** (section 6.2), returns everything at once (no streaming
+  iterator), and is not exposed through the client or gRPC API.
 - **Kept files are cleaned up late.** After an ambiguous manifest store, a kept compaction output is
   deleted at the next successful compaction or restart, and a kept checkpoint table at restart.
 - **A damaged length field in the middle of a strict-mode WAL** is treated as a torn tail and the
