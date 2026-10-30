@@ -25,3 +25,11 @@ if(RAFTKV_BUILD_NETWORK)
   add_subdirectory(src/node)
 endif()
 add_subdirectory(tests)
+
+# Read-path micro-benchmark (benchmarks/storage_read_bench.cpp). Off by default; use a Release build.
+option(RAFTKV_BUILD_BENCHMARKS "Build the storage read benchmark" OFF)
+if(RAFTKV_BUILD_BENCHMARKS)
+  add_executable(storage_read_bench benchmarks/storage_read_bench.cpp)
+  target_link_libraries(storage_read_bench raftkv_storage)
+  set_target_properties(storage_read_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/benchmarks)
+endif()
