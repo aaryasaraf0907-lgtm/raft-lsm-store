@@ -507,5 +507,134 @@ TEST(ClientServiceTest, ARequestFromAForgottenSessionIsReportedAsExpiredNotAppli
   EXPECT_EQ(machine.SessionsExpired(), 1u);
 }
 
+
+// ---- range scans ----
+
+TEST(ClientServiceTest, ScanWithoutAProviderIsRejected) {
+  TestStore store;
+  KVStateMachine machine(&store);
+  TestRaftNode node;
+  ClientService service(&node, &store, &machine);
+  network::proto::ScanRequest req;
+  req.set_timeout_ms(1000);
+  network::proto::ScanResponse resp;
+  ASSERT_TRUE(service.Scan(nullptr, &req, &resp).ok());
+  EXPECT_EQ(resp.status(), network::proto::CLIENT_STATUS_INVALID_ARGUMENT);
+}
+
+namespace {
+struct MapScan {
+  std::map<std::string, std::string> data;
+  int calls = 0;
+  Status status = Status::kOk;
+  ClientService::ScanProvider Provider() {
+    return [this](const std::string& start, const std::string& end, size_t limit,
+                  std::vector<std::pair<std::string, std::string>>* out) {
+      ++calls;
+      out->clear();
+      if (status != Status::kOk) return status;
+      for (auto it = data.lower_bound(start); it != data.end() && (end.empty() || it->first < end); ++it) {
+        if (out->size() == limit) break;
+        out->emplace_back(it->first, it->second);
+      }
+      return Status::kOk;
+    };
+  }
+};
+}  // namespace
+
+TEST(ClientServiceTest, ScanIsLinearizableAndHonoursRangeLimitAndMore) {
+  TestStore store;
+  KVStateMachine machine(&store);
+  TestRaftNode node;
+  ClientService service(&node, &store, &machine);
+  MapScan scan;
+  for (char c = 'a'; c <= 'j'; ++c) scan.data[std::string(1, c)] = std::string("v") + c;
+  service.SetScanProvider(scan.Provider());
+
+  network::proto::ScanRequest req;
+  req.set_start("b");
+  req.set_end("f");
+  req.set_limit(2);
+  req.set_timeout_ms(1000);
+  network::proto::ScanResponse resp;
+  ASSERT_TRUE(service.Scan(nullptr, &req, &resp).ok());
+  ASSERT_EQ(resp.status(), network::proto::CLIENT_STATUS_OK);
+  ASSERT_EQ(resp.items_size(), 2);
+  EXPECT_EQ(resp.items(0).key(), "b");
+  EXPECT_EQ(resp.items(1).key(), "c");
+  EXPECT_EQ(resp.items(1).value(), "vc");
+  EXPECT_TRUE(resp.more()) << "d and e are still in [b, f)";
+  EXPECT_EQ(node.read_index_calls, 1) << "a scan must confirm leadership like Get";
+
+  req.set_limit(0);  // the server's maximum
+  resp.Clear();
+  ASSERT_TRUE(service.Scan(nullptr, &req, &resp).ok());
+  ASSERT_EQ(resp.items_size(), 4);
+  EXPECT_EQ(resp.items(3).key(), "e") << "end is exclusive";
+  EXPECT_FALSE(resp.more());
+}
+
+TEST(ClientServiceTest, AScanOnANodeThatIsNotTheLeaderReadsNothing) {
+  TestStore store;
+  KVStateMachine machine(&store);
+  TestRaftNode node;
+  node.next_response = CommitResponse{CommitResult::kNotLeader, 0, 3};
+  ClientService service(&node, &store, &machine);
+  MapScan scan;
+  scan.data["a"] = "1";
+  service.SetScanProvider(scan.Provider());
+  network::proto::ScanRequest req;
+  req.set_timeout_ms(1000);
+  network::proto::ScanResponse resp;
+  ASSERT_TRUE(service.Scan(nullptr, &req, &resp).ok());
+  EXPECT_EQ(resp.status(), network::proto::CLIENT_STATUS_NOT_LEADER);
+  EXPECT_EQ(resp.leader_id_hint(), 3u);
+  EXPECT_EQ(resp.items_size(), 0);
+  EXPECT_EQ(scan.calls, 0) << "a node that could not confirm leadership must not read its store";
+}
+
+TEST(ClientServiceTest, AScanReplyStopsAtAboutOneMegabyteButHasAtLeastOneKey) {
+  TestStore store;
+  KVStateMachine machine(&store);
+  TestRaftNode node;
+  ClientService service(&node, &store, &machine);
+  MapScan scan;
+  for (int i = 0; i < 5; ++i) scan.data["k" + std::to_string(i)] = std::string(400 * 1024, 'x');
+  service.SetScanProvider(scan.Provider());
+  network::proto::ScanRequest req;
+  req.set_timeout_ms(1000);
+  network::proto::ScanResponse resp;
+  ASSERT_TRUE(service.Scan(nullptr, &req, &resp).ok());
+  ASSERT_EQ(resp.status(), network::proto::CLIENT_STATUS_OK);
+  EXPECT_EQ(resp.items_size(), 2) << "two 400 KiB values fit in about 1 MiB, a third does not";
+  EXPECT_TRUE(resp.more());
+
+  scan.data.clear();
+  scan.data["big"] = std::string(1024 * 1024, 'y');  // one value at the maximum size
+  scan.data["next"] = "z";
+  resp.Clear();
+  ASSERT_TRUE(service.Scan(nullptr, &req, &resp).ok());
+  EXPECT_EQ(resp.items_size(), 1) << "a reply always carries at least one key";
+  EXPECT_TRUE(resp.more());
+}
+
+TEST(ClientServiceTest, AStorageFailureDuringAScanIsAnErrorNotAShortResult) {
+  TestStore store;
+  KVStateMachine machine(&store);
+  TestRaftNode node;
+  ClientService service(&node, &store, &machine);
+  MapScan scan;
+  scan.data["a"] = "1";
+  scan.status = Status::kCorruption;
+  service.SetScanProvider(scan.Provider());
+  network::proto::ScanRequest req;
+  req.set_timeout_ms(1000);
+  network::proto::ScanResponse resp;
+  ASSERT_TRUE(service.Scan(nullptr, &req, &resp).ok());
+  EXPECT_EQ(resp.status(), network::proto::CLIENT_STATUS_INTERNAL_ERROR);
+  EXPECT_EQ(resp.items_size(), 0);
+}
+
 }  // namespace
 }  // namespace raftkv

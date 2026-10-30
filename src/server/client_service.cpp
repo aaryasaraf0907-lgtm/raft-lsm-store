@@ -111,6 +111,57 @@ void ClientService::SetCommitResponse(
   response->set_leader_id_hint(commit.leader_hint);
 }
 
+void ClientService::SetCommitResponse(
+    const CommitResponse& commit, network::proto::ScanResponse* response) {
+  response->set_status(ToClientStatus(commit.result));
+  response->set_error_message(CommitError(commit.result));
+  response->set_leader_id_hint(commit.leader_hint);
+}
+
+grpc::Status ClientService::Scan(grpc::ServerContext*, const network::proto::ScanRequest* request,
+                                 network::proto::ScanResponse* response) {
+  if (!scan_provider_) {
+    response->set_status(network::proto::CLIENT_STATUS_INVALID_ARGUMENT);
+    response->set_error_message("range scans are not available on this server");
+    return grpc::Status::OK;
+  }
+  if (!IsValidTimeout(request->timeout_ms())) {
+    response->set_status(network::proto::CLIENT_STATUS_INVALID_ARGUMENT);
+    response->set_error_message("timeout_ms must be between 1 and 30000");
+    return grpc::Status::OK;
+  }
+  if (request->start().size() > 4096 || request->end().size() > 4096) {
+    response->set_status(network::proto::CLIENT_STATUS_INVALID_ARGUMENT);
+    response->set_error_message("start and end must be at most 4096 bytes");
+    return grpc::Status::OK;
+  }
+  // Linearizable, exactly like Get: the leader confirms with a majority that it still leads and
+  // waits until it has applied everything committed so far, then reads its own engine.
+  const CommitResponse commit = node_->ReadIndex(std::chrono::milliseconds(request->timeout_ms()));
+  SetCommitResponse(commit, response);
+  if (commit.result != CommitResult::kApplied) return grpc::Status::OK;
+  const size_t limit = (request->limit() == 0 || request->limit() > kMaxScanKeys) ? kMaxScanKeys : request->limit();
+  std::vector<std::pair<std::string, std::string>> found;
+  const Status s = scan_provider_(request->start(), request->end(), limit + 1, &found);  // +1: is there more?
+  if (s != Status::kOk) {
+    response->set_status(network::proto::CLIENT_STATUS_INTERNAL_ERROR);
+    response->set_error_message("local storage scan failed");
+    return grpc::Status::OK;
+  }
+  size_t bytes = 0;
+  for (size_t i = 0; i < found.size() && i < limit; ++i) {
+    if (i > 0 && bytes + found[i].first.size() + found[i].second.size() > kMaxScanBytes) break;  // always one
+    bytes += found[i].first.size() + found[i].second.size();
+    network::proto::KeyValue* kv = response->add_items();
+    kv->set_key(std::move(found[i].first));
+    kv->set_value(std::move(found[i].second));
+  }
+  response->set_more(found.size() > static_cast<size_t>(response->items_size()));
+  response->set_status(network::proto::CLIENT_STATUS_OK);
+  response->clear_error_message();
+  return grpc::Status::OK;
+}
+
 grpc::Status ClientService::NodeStatus(grpc::ServerContext*, const network::proto::StatusRequest*,
                                        network::proto::StatusResponse* response) {
   if (!status_provider_) {

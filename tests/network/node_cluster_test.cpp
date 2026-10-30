@@ -1,5 +1,6 @@
 // Whole nodes (durable Raft log, storage engine, state machine, both gRPC servers) in one process,
 // driven through the real client library: the same wiring raftkv_node uses.
+#include <cstdio>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -588,6 +589,46 @@ TEST(NodeClusterTest, ANewNodeIsAddedOverGrpcAndAnOldOneRemoved) {
   ASSERT_EQ(c.client().Put("after", "x").status, KvStatus::kOk);
   EXPECT_TRUE(WaitFor([&] { return EngineHas(node4.get(), "after", "x"); }, 10s));
   node4->Stop();
+}
+
+// Range scans through the client API on a real cluster: linearizable like Get (so a scan sees every
+// acknowledged write), deleted keys and the engine's bookkeeping keys never appear, limits and
+// `more` work, and a scan is still answered after the leader crashes.
+TEST(NodeClusterTest, RangeScansAreServedByTheClusterAndSurviveALeaderCrash) {
+  NodeCluster c(3);
+  for (int i = 0; i < 30; ++i) {
+    char key[8];
+    std::snprintf(key, sizeof(key), "k%02d", i);
+    ASSERT_EQ(c.client().Put(key, "v" + std::to_string(i)).status, KvStatus::kOk);
+  }
+  ASSERT_EQ(c.client().Delete("k05").status, KvStatus::kOk);
+
+  ScanResult r = c.client().Scan("k10", "k20", 0);
+  ASSERT_EQ(r.status, KvStatus::kOk) << r.message;
+  ASSERT_EQ(r.items.size(), 10u);
+  EXPECT_EQ(r.items.front().first, "k10");
+  EXPECT_EQ(r.items.back().first, "k19");
+  EXPECT_EQ(r.items.front().second, "v10");
+  EXPECT_FALSE(r.more);
+
+  r = c.client().Scan("", "", 0);
+  ASSERT_EQ(r.status, KvStatus::kOk) << r.message;
+  ASSERT_EQ(r.items.size(), 29u) << "30 keys, one deleted, and no engine bookkeeping keys";
+  for (size_t i = 1; i < r.items.size(); ++i) EXPECT_LT(r.items[i - 1].first, r.items[i].first);
+  for (const auto& kv : r.items) EXPECT_NE(kv.first, "k05");
+
+  r = c.client().Scan("", "", 5);
+  ASSERT_EQ(r.status, KvStatus::kOk);
+  EXPECT_EQ(r.items.size(), 5u);
+  EXPECT_TRUE(r.more);
+
+  const int leader = c.Leader();
+  ASSERT_NE(leader, 0);
+  c.Crash(leader);
+  r = c.client().Scan("k25", "", 0);
+  ASSERT_EQ(r.status, KvStatus::kOk) << r.message;
+  ASSERT_EQ(r.items.size(), 5u);
+  EXPECT_EQ(r.items.back().first, "k29");
 }
 
 }  // namespace raftkv
