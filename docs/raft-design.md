@@ -164,6 +164,26 @@ sequenceDiagram
   term. Older entries commit indirectly.
 - **Everything is written to disk before it is acknowledged or counted.**
 
+### Group commit
+
+Every log write is followed by an fsync, and on a laptop SSD an `F_FULLFSYNC` takes several
+milliseconds, so one fsync per proposal would cap throughput at a few hundred writes per second no
+matter how many clients there are. Concurrent proposals are therefore batched:
+
+- A proposer queues its command and, if no batch is being written, becomes the **batcher**: it takes
+  everything queued, appends it to the log with **one** write and **one** fsync, then wakes the others.
+  While one batch is being written the next one accumulates, so batches grow with the load.
+- Every storage write still happens under the node lock, exactly as before; only the number of fsyncs
+  per entry changes. A background persister thread would also let the leader's fsync overlap the
+  followers', but it interleaves with follower truncation, snapshots and step-down, so it was not done.
+- **Adaptive delay.** Proposers that just finished a batch are about to propose again. If the next batcher
+  wrote at once it would catch only the stragglers, and the group would fall apart into tiny batches
+  (it did, on a laptop: 161 writes for 320 proposals). So a batcher waits up to 2 ms for as many proposals
+  as there are proposers inside `Propose`/`ProposeAndWait`. The rule corrects itself: when batches shrink,
+  more proposers pile up inside and the wait grows. A lone client never waits.
+- Measured: 320 concurrent proposals take about 12 log writes (`GroupCommit.*` tests, under CPU
+  pressure); on the 3-node laptop benchmark 32 durable writers reach about 5x the throughput of one.
+
 `ProposeAndWait(command, timeout)` returns one of: `kApplied` (committed **and** the apply callback has
 returned for it), `kNotLeader` (with a leader hint), `kLost` (another leader overwrote the entry, so it
 never committed and a retry is safe), `kTimeout` (unknown: it may still commit), or `kStopped`.
@@ -180,7 +200,7 @@ flowchart TD
   B -->|"no"| W["wait"]
   W --> B
   B -->|"yes"| C["fix read index = commit index"]
-  C --> D["send a fresh heartbeat round"]
+  C --> D["join or start a confirmation round (shared by concurrent reads)"]
   D --> E{"majority acknowledged a message sent AFTER the read index was fixed?"}
   E -->|"no"| W2["wait, or time out"]
   W2 --> E
@@ -203,6 +223,28 @@ Any reply in the leader's own term counts as an acknowledgment, even a rejection
 node as leader at that moment. If the node is partitioned away it cannot collect a majority and the read
 times out instead of returning stale data. The default implementation of `RaftNode::ReadIndex` falls back
 to a no-op through the log, so a test double that does not override it keeps working.
+
+### Batching concurrent reads
+
+Originally every read started its own heartbeat round, so 32 concurrent readers sent 32 rounds, doubled
+the replies, and every reply woke every waiting read; on the laptop benchmark read throughput peaked at
+4 clients and then fell. Rule 2 above says what a read needs: a majority acknowledging *some* message sent
+after its read index was fixed. It does not need a round of its own. So:
+
+- Every broadcast is a round: heartbeats and write batches as well as reads. At most one round is in
+  flight for reads.
+- A read that arrives while a round is in flight cannot use that round: its messages were sent before
+  the read's index was fixed. It asks for the next round instead, and **one** new round for all such
+  reads starts as soon as the in-flight round is acknowledged by a majority (or with the next heartbeat,
+  if it never is, for example when messages are lost).
+- The condition a read waits for is unchanged; only the number of rounds sent changes.
+
+Measured: 640 concurrent reads send 92-208 messages instead of 1,280. The tests (`ReadBatching.*`) also
+cover a read that misses the in-flight round (it must not wait for a heartbeat), a follower down, lost
+messages, and a randomized run of concurrent reads and writes through message delays, losses,
+duplicates and leader crashes whose whole history is checked by the linearizability checker. Breaking
+the rule (letting a read use the older in-flight round) is caught by
+`ReadIndex.IsolatedLeaderCannotConfirmALeaderRead`.
 
 ## 6. Persistence and crash recovery
 
@@ -230,6 +272,18 @@ replaying the log, which is safe because applying is deterministic and deduplica
   entries to keep, again by rename. The rename of `raft.log` is the commit point. A crash before it leaves
   the old log, which still points at the old snapshot (kept until the switch); a crash after it leaves
   the new pair. Leftover files from a crashed attempt are deleted on `Load`.
+
+### Replay after a restart, and the engine's applied index
+
+A restarting node replays its log through the state machine. The storage engine records, together
+with the data and in the same write, the index of the last entry it applied (a reserved key; see
+`docs/storage-design.md`). On replay, entries at or below that index still update the client session
+table, which has to be rebuilt, but their store writes are skipped. The index is written after the data
+it covers, so after a crash it can lag the data by one operation (re-applying that one is harmless) but
+never run ahead of it. The engine's own write-ahead log is **not** fsynced: the Raft log is the durable
+copy, and an engine that lost its unsynced tail, its whole directory, or the middle of its WAL is rebuilt
+from the Raft log or a snapshot (`ReplaySkipTest.*`, `NodeClusterTest.ANodeWhose*`,
+`NodeClusterTest.ADamagedEngineWalDoesNotStopANodeFromStarting`).
 
 ## 7. Exactly-once client requests
 
@@ -278,6 +332,14 @@ The follower checks the offset of every chunk and answers with the offset it exp
 lost and reordered chunks are repaired by retransmission. It keeps its own log entries after the snapshot
 only if it holds the snapshot's last entry with the same term.
 
+**With the real engine.** A snapshot is the engine's checkpoint (every live key, newest version, merged
+from all memtables and SSTables, plus the applied index) together with the client session table.
+Installing one replaces the engine's whole dataset with a single SSTable through one manifest edit, so a
+crash leaves the old dataset or the new one, never a mix, and flushes or compactions that were running
+discard their results. A node restarting from its own snapshot usually already holds that state (and
+more) in its engine, so the dataset is replaced only if the engine is behind the snapshot. Snapshots are
+on by default in `raftkv_node` (every 10,000 applied entries), so the Raft log stays bounded.
+
 ## 9. Failure scenarios and what happens
 
 | Scenario | Behavior | Test |
@@ -290,6 +352,9 @@ only if it holds the snapshot's last entry with the same term.
 | Crash in the middle of a snapshot | Old log and snapshot stay valid, leftovers are removed | `FileRaftStorageSnapshot.LeftoversFromACrashedSnapshot...` |
 | Whole cluster restarts | State comes back from log and snapshot; no write is lost or doubled | `ReplicatedKV.WholeClusterRestart...`, `RaftSnapshot.ChaosWithSnapshotsLosesNothing` |
 | Large writes | Messages stay bounded; a lagging follower still catches up | `append_bytes_test.cpp` |
+| Follower down while the leader compacts its log | It is sent the leader's snapshot, which replaces its engine's data | `NodeClusterTest.ALaggingFollowerCatchesUpFromASnapshotThatReplacesItsOldData` |
+| A node loses its engine's WAL or whole data directory | Rebuilt from its Raft log or snapshot | `NodeClusterTest.ANodeWhoseEngineLostItsWalRebuildsFromTheRaftLog`, `...EngineDirectoryIsGone...` |
+| Many concurrent clients | Writes share fsyncs, reads share confirmation rounds | `GroupCommit.*`, `ReadBatching.*` |
 
 ## 10. How it is tested
 
@@ -301,8 +366,15 @@ only if it holds the snapshot's last entry with the same term.
   actual `FileRaftStorage` and `KVEngine` directories.
 - **Randomized chaos.** Seeded runs crash and partition nodes while a client writes; every acknowledged
   write must be on every node at the end, also after a full restart.
+- **Fault injection.** `FakeNetwork` can also drop, duplicate, delay and reorder messages and cut single
+  links, while checkers verify election safety, log agreement and that committed entries survive
+  (`docs/fault-injection.md`).
+- **Linearizability checking.** `src/checker/linearizability.h` decides whether a recorded history of
+  concurrent operations could have come from a single copy of the store; writes whose outcome is unknown
+  may or may not have happened. It checks the randomized read/write runs above.
 - **Sanitizers.** Raft and storage changes run under AddressSanitizer plus UndefinedBehaviorSanitizer
-  and ThreadSanitizer; timing-sensitive tests are repeated.
+  and ThreadSanitizer, and CI runs both on every pull request (with macOS and Linux builds);
+  timing-sensitive tests are repeated.
 - **Mutation checks.** For each safety rule we deliberately break the code and confirm a test fails
   (for example: skip the majority check in `ReadIndex`, count old acknowledgments, drop the session table
   from snapshots, drop the kept log suffix). A rule that no test can fail on is not tested.
@@ -310,23 +382,19 @@ only if it holds the snapshot's last entry with the same term.
 
 ## 11. Limitations and future work
 
-- **State machine snapshot of the data.** The mechanism is complete and tested with an in-memory state
-  machine, and the session table has a serialization. A real `KVEngine` snapshot needs an engine
-  checkpoint (flushed SSTables plus the manifest), which depends on the flush and SSTable work.
-- **Applied index in the engine.** Replay re-applies the whole log suffix into the engine. This is
-  correct because Put and Delete are idempotent and deduplicated, but wasteful. The planned fix persists
-  the applied index with each flush and skips store writes at or below it, while still updating the
-  session table.
-- **Real transport.** `InstallSnapshot` and PreVote are implemented against the `Transport` interface and
-  tested on the in-process network; the gRPC transport still has to implement them. Until it does, it
-  reports no PreVote support and plain elections are used.
 - **Membership changes** (adding and removing nodes) are not implemented; the cluster is fixed at start.
+  In particular a node must keep its disk: one that is wiped and rejoins under the same id breaks Raft's
+  assumption that persisted state survives, and replacing a machine needs a membership change.
+- **The leader's and the followers' fsyncs are not overlapped.** A write waits for the leader's fsync
+  and then a follower's; a background persister thread would let them run in parallel (see group commit).
+- **No leader leases.** Reads still need a confirmation round (now shared by concurrent reads). Leases
+  would remove it at the cost of depending on bounded clock drift.
+- **Snapshots are built in memory**, so a snapshot must fit in RAM; streaming them would remove that.
 - **Session table** grows by one small entry per client and never expires idle clients.
-- **No leader leases.** Every read does a heartbeat round. That is simpler and safe under clock drift, at
-  the cost of one round trip per read.
-- **No pipelining or batching** across clients; throughput is bounded by one in-flight round per follower
-  chain.
 - A storage failure aborts the node by design.
+
+Done since the first version of this document: snapshots of the engine's data, the persisted applied
+index, `InstallSnapshot` and PreVote over gRPC, group commit for writes and batching for reads.
 
 ## 12. Where the paper's rules live
 
