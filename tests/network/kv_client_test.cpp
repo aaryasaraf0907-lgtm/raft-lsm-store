@@ -238,4 +238,44 @@ TEST(KvClientTest, HexHelpersRoundTripBinaryData) {
   EXPECT_TRUE(HexDecode("ABCDEF", &back)); // upper case accepted
 }
 
+
+TEST(KvClientTest, AnExpiredSessionOnAFreshRequestIsRetriedTransparentlyUnderANewSession) {
+  ScriptedServer server({Step{ClientStatus::CLIENT_STATUS_OK}, Step{ClientStatus::CLIENT_STATUS_SESSION_EXPIRED},
+                         Step{ClientStatus::CLIENT_STATUS_OK}});
+  KvClient client(Options({{1, server.Address()}}));
+  ASSERT_EQ(client.Put("a", "1").status, KvStatus::kOk);
+  KvResult r = client.Put("b", "2");
+  EXPECT_EQ(r.status, KvStatus::kOk) << r.message;
+  auto writes = server.Writes();
+  ASSERT_EQ(writes.size(), 3u);
+  EXPECT_EQ(writes[1].client_id, 77u);
+  EXPECT_EQ(writes[1].seq, 2u);
+  EXPECT_NE(writes[2].client_id, 77u) << "the retry must use a new session";
+  EXPECT_EQ(writes[2].seq, 1u) << "a new session numbers its requests from 1";
+}
+
+// If an earlier attempt of the same request may have been applied, retrying under a new session
+// could apply it twice; the client must say "unknown" instead.
+TEST(KvClientTest, AnExpiredSessionAfterAnUncertainAttemptReportsTheOutcomeUnknown) {
+  ScriptedServer server({Step{ClientStatus::CLIENT_STATUS_OUTCOME_UNKNOWN},
+                         Step{ClientStatus::CLIENT_STATUS_SESSION_EXPIRED}, Step{ClientStatus::CLIENT_STATUS_OK}});
+  KvClient client(Options({{1, server.Address()}}));
+  KvResult r = client.Put("a", "1");
+  EXPECT_EQ(r.status, KvStatus::kOutcomeUnknown);
+  auto writes = server.Writes();
+  ASSERT_EQ(writes.size(), 2u) << "it must not retry this request";
+  ASSERT_EQ(client.Put("b", "2").status, KvStatus::kOk);
+  writes = server.Writes();
+  ASSERT_EQ(writes.size(), 3u);
+  EXPECT_NE(writes[2].client_id, 77u) << "later requests use the new session";
+  EXPECT_EQ(writes[2].seq, 1u);
+}
+
+TEST(KvClientTest, ARefusalThatAppliedNothingBeforeAnExpiredSessionStillRetriesTransparently) {
+  ScriptedServer server({Step{ClientStatus::CLIENT_STATUS_NOT_LEADER}, Step{ClientStatus::CLIENT_STATUS_SESSION_EXPIRED},
+                         Step{ClientStatus::CLIENT_STATUS_OK}});
+  KvClient client(Options({{1, server.Address()}}));
+  EXPECT_EQ(client.Put("a", "1").status, KvStatus::kOk) << "NOT_LEADER means nothing was applied";
+}
+
 }  // namespace raftkv

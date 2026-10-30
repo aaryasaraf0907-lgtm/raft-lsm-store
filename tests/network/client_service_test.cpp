@@ -483,5 +483,29 @@ TEST(ClientServiceTest, NodeStatusReportsWhatTheProviderFillsIn) {
   EXPECT_EQ(response.commit_index(), 40u);
 }
 
+TEST(ClientServiceTest, ARequestFromAForgottenSessionIsReportedAsExpiredNotApplied) {
+  TestStore store;
+  KVStateMachine machine(&store);
+  machine.SetSessionLimits(SessionLimits{2, 1000000});
+  TestRaftNode node;
+  node.SetApplyCallback(machine.AsCallback());
+  ClientService service(&node, &store, &machine);
+  network::proto::WriteResponse write;
+  auto put = [&](uint64_t client, uint64_t seq, const std::string& key) {
+    auto req = PutRequest();
+    req.set_client_id(client);
+    req.set_seq(seq);
+    req.set_key(key);
+    EXPECT_TRUE(service.Put(nullptr, &req, &write).ok());
+    return write.status();
+  };
+  ASSERT_EQ(put(1, 1, "a"), network::proto::CLIENT_STATUS_OK);
+  ASSERT_EQ(put(1, 2, "b"), network::proto::CLIENT_STATUS_OK);
+  ASSERT_EQ(put(2, 1, "c"), network::proto::CLIENT_STATUS_OK);
+  ASSERT_EQ(put(3, 1, "d"), network::proto::CLIENT_STATUS_OK);  // client 1's session is forgotten
+  EXPECT_EQ(put(1, 2, "b"), network::proto::CLIENT_STATUS_SESSION_EXPIRED) << "a retry of request 2 must not report success";
+  EXPECT_EQ(machine.SessionsExpired(), 1u);
+}
+
 }  // namespace
 }  // namespace raftkv
