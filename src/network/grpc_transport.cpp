@@ -22,7 +22,6 @@
 namespace raftkv {
 namespace {
 
-constexpr auto kRpcDeadline = std::chrono::milliseconds(150);
 // A snapshot chunk is up to ~1 MiB and the receiver may fsync a whole snapshot when the last one
 // arrives, so it needs far longer than a heartbeat.
 constexpr auto kSnapshotRpcDeadline = std::chrono::milliseconds(3000);
@@ -47,8 +46,9 @@ class GrpcTransport::Impl
     : public std::enable_shared_from_this<GrpcTransport::Impl> {
  public:
   Impl(std::string listen_address,
-       std::map<NodeId, std::string> peer_addresses)
-      : listen_address_(std::move(listen_address)) {
+       std::map<NodeId, std::string> peer_addresses,
+       std::chrono::milliseconds rpc_deadline)
+      : listen_address_(std::move(listen_address)), rpc_deadline_(rpc_deadline) {
     for (const auto& peer : peer_addresses) {
       auto channel = MakeChannel(peer.second);
       peer_stubs_.emplace(
@@ -206,7 +206,7 @@ class GrpcTransport::Impl
   void SendRequestVote(
       NodeId to, const RequestVoteRequest& request,
       std::function<void(const RequestVoteReply&)> on_reply) {
-    const auto deadline = std::chrono::system_clock::now() + kRpcDeadline;
+    const auto deadline = std::chrono::system_clock::now() + rpc_deadline_;
     const auto stub = FindStub(to);
     if (!stub) {
       return;
@@ -231,7 +231,7 @@ class GrpcTransport::Impl
   void SendAppendEntries(
       NodeId to, const AppendEntriesRequest& request,
       std::function<void(const AppendEntriesReply&)> on_reply) {
-    const auto deadline = std::chrono::system_clock::now() + kRpcDeadline;
+    const auto deadline = std::chrono::system_clock::now() + rpc_deadline_;
     const auto stub = FindStub(to);
     if (!stub) {
       return;
@@ -256,7 +256,7 @@ class GrpcTransport::Impl
   void SendPreVote(
       NodeId to, const PreVoteRequest& request,
       std::function<void(const PreVoteReply&)> on_reply) {
-    const auto deadline = std::chrono::system_clock::now() + kRpcDeadline;
+    const auto deadline = std::chrono::system_clock::now() + rpc_deadline_;
     const auto stub = FindStub(to);
     if (!stub) {
       return;
@@ -480,6 +480,7 @@ class GrpcTransport::Impl
   }
 
   std::string listen_address_;
+  const std::chrono::milliseconds rpc_deadline_;
   std::map<NodeId, std::shared_ptr<network::proto::RaftRpc::Stub>>
       peer_stubs_;
   Service service_{this};
@@ -502,9 +503,10 @@ class GrpcTransport::Impl
 
 GrpcTransport::GrpcTransport(
     std::string listen_address,
-    std::map<NodeId, std::string> peer_addresses)
+    std::map<NodeId, std::string> peer_addresses,
+    std::chrono::milliseconds rpc_deadline)
     : impl_(std::make_shared<Impl>(std::move(listen_address),
-                                   std::move(peer_addresses))) {}
+                                   std::move(peer_addresses), rpc_deadline)) {}
 
 GrpcTransport::~GrpcTransport() { Stop(); }
 
