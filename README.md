@@ -23,6 +23,9 @@ Built as a data structures and algorithms course project at VIT Pune. It runs on
 - **Membership changes**: nodes are added and removed one at a time while the cluster keeps serving
   (Raft thesis, chapter 4); a new node catches up as a non-voting learner before it counts toward any
   majority, and the configuration survives log compaction inside snapshots.
+- **Range scans**: `raftkv_cli scan START END` returns the keys in a range in order. A scan is
+  linearizable like `get` (it goes through ReadIndex) and is paged: at most 1,000 keys or about 1 MiB
+  per reply, and the CLI continues where a reply stopped.
 
 **Storage (LSM tree)**
 - A concurrent **skip-list memtable** behind a checksummed **write-ahead log**.
@@ -183,8 +186,6 @@ and macOS:
 - **Membership changes one server at a time** (no joint consensus), and a member must keep its disk:
   to replace a machine, remove its id and add the new node (`run_cluster.sh remove`, then `add`).
 - **Snapshots are built in memory**, so a snapshot must fit in RAM.
-- **Range scans are storage-engine only.** `KVEngine::Scan` exists, but the client and gRPC API is
-  `Put`, `Get` and `Delete`.
 - **macOS and Linux only.** Windows users can use WSL2.
 - **One known open issue**: a cluster-level linearizability test is disabled because it occasionally
   stalls inside a gRPC call for longer than the call's deadline; the cause has not been found yet.
