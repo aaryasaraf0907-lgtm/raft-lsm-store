@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -29,16 +30,21 @@ class SlowSyncStorage : public RaftStorage {
   bool SaveHardState(Term term, NodeId voted_for) override { return inner_.SaveHardState(term, voted_for); }
   bool AppendEntries(const std::vector<LogEntry>& entries) override {  // write + fsync
     const bool ok = inner_.AppendEntries(entries);
-    std::this_thread::sleep_for(std::chrono::milliseconds(sync_ms_.load()));
+    SimulatedSync(sync_ms_.load());
     return ok;
   }
   bool AppendEntriesNoSync(const std::vector<LogEntry>& entries) override { return inner_.AppendEntries(entries); }
   std::function<bool()> PrepareSync() override {
     const int ms = sync_ms_.load();
-    return [ms] {
-      std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    return [this, ms] {
+      SimulatedSync(ms);
       return true;
     };
+  }
+  // How long the simulated fsyncs really took on this machine (sleeps overshoot on a loaded one).
+  std::vector<double> SyncDurationsMs() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return durations_ms_;
   }
   bool TruncateSuffix(LogIndex from_index) override { return inner_.TruncateSuffix(from_index); }
   using RaftStorage::SaveSnapshot;
@@ -48,8 +54,19 @@ class SlowSyncStorage : public RaftStorage {
   }
 
  private:
+  void SimulatedSync(int ms) {
+    if (ms <= 0) return;
+    const auto start = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    const double took = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    std::lock_guard<std::mutex> lk(mu_);
+    durations_ms_.push_back(took);
+  }
+
   FileRaftStorage inner_;
   std::atomic<int> sync_ms_;
+  std::mutex mu_;
+  std::vector<double> durations_ms_;
 };
 
 struct SlowDisks {
@@ -72,14 +89,17 @@ NodeId WaitForLeader(Cluster& c) {
 
 }  // namespace
 
-// Every fsync takes 150 ms. Two nodes, so a commit needs both copies on disk. Before, a write waited
-// for the leader's fsync and THEN the follower's: about 300 ms. With the leader's fsync running while
-// the follower writes its own, about 150 ms. (Two nodes, not three: the simulated network delivers
-// on one thread, so with two followers their simulated disk writes would run one after the other,
+// Two nodes, so a commit needs both copies on disk, and every fsync is simulated as a 300 ms sleep.
+// Before, a write waited for the leader's fsync and THEN the follower's: about two fsyncs. With the
+// leader's fsync running while the follower writes its own: about one. The test compares write
+// latency with how long the simulated fsyncs REALLY took on this machine, so a slow machine (where
+// sleeps overshoot and wake-ups are late) stretches both sides alike: about 1x means overlapped,
+// about 2x means sequential, and the limit is 1.6x. (Two nodes, not three: the simulated network
+// delivers on one thread, so two followers' simulated disk writes would run one after the other,
 // which a real network does not do.)
 TEST(FsyncOverlap, AWriteWaitsForOneFsyncNotTwo) {
   SlowDisks disks;
-  Cluster c(2, false, nullptr, disks.Factory(150));
+  Cluster c(2, false, nullptr, disks.Factory(300));
   const NodeId leader = WaitForLeader(c);
   ASSERT_NE(leader, 0u);
   ASSERT_EQ(c.Node(leader)->ProposeAndWait(Put("warm-up"), 5000ms).result, CommitResult::kApplied);
@@ -89,9 +109,18 @@ TEST(FsyncOverlap, AWriteWaitsForOneFsyncNotTwo) {
     ASSERT_EQ(c.Node(leader)->ProposeAndWait(Put("k" + std::to_string(i)), 5000ms).result, CommitResult::kApplied);
     ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
   }
+  std::vector<double> syncs;
+  for (NodeId id = 1; id <= 2; ++id) {
+    const auto d = disks.by_id[id]->SyncDurationsMs();
+    syncs.insert(syncs.end(), d.begin(), d.end());
+  }
+  ASSERT_FALSE(syncs.empty());
   std::sort(ms.begin(), ms.end());
-  std::printf("[ fsync overlap ] median write latency %.0f ms with 150 ms fsyncs (sequential would be ~300)\n", ms[3]);
-  EXPECT_LT(ms[3], 230.0) << "the leader's fsync did not overlap the follower's";
+  std::sort(syncs.begin(), syncs.end());
+  const double write = ms[3], sync = syncs[syncs.size() / 2];
+  std::printf("[ fsync overlap ] median write %.0f ms, median simulated fsync %.0f ms: %.2fx (sequential ~2x)\n",
+              write, sync, write / sync);
+  EXPECT_LT(write, 1.6 * sync) << "the leader's fsync did not overlap the follower's";
 }
 
 // The safety rule. With one follower cut off, the leader and the other follower are exactly a
