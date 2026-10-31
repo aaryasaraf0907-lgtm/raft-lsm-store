@@ -72,11 +72,15 @@ class ThrowsOnceHandler final : public RpcHandler {
   std::atomic<int> vote_calls_{0};
 };
 
+// For tests that are not about deadlines: each sends one call and waits for its reply, so with the
+// 150 ms default a loaded CI machine could make that only call miss its deadline and be dropped.
+constexpr std::chrono::milliseconds kNotAboutDeadlines{2000};
+
 TEST(GrpcTransportTest, SendsBothRpcTypesBetweenLocalTransports) {
   RecordingHandler handler_a;
   RecordingHandler handler_b;
-  GrpcTransport transport_a("127.0.0.1:0", {});
-  GrpcTransport transport_b("127.0.0.1:0", {});
+  GrpcTransport transport_a("127.0.0.1:0", {}, kNotAboutDeadlines);
+  GrpcTransport transport_b("127.0.0.1:0", {}, kNotAboutDeadlines);
   transport_a.SetHandler(&handler_a);
   transport_b.SetHandler(&handler_b);
   transport_a.Start();
@@ -199,7 +203,7 @@ TEST(GrpcTransportTest, CallbackExceptionDoesNotStopWorkerPool) {
 
 TEST(GrpcTransportTest, StopCanBeCalledFromReplyCallback) {
   RecordingHandler handler;
-  GrpcTransport transport("127.0.0.1:0", {});
+  GrpcTransport transport("127.0.0.1:0", {}, kNotAboutDeadlines);
   transport.SetHandler(&handler);
   transport.Start();
   ASSERT_NE(transport.ListeningPort(), 0);
@@ -247,7 +251,7 @@ TEST(GrpcTransportTest, StopCanBeCalledFromReplyCallback) {
 
 TEST(GrpcTransportTest, NonStandardHandlerExceptionDoesNotEscapeService) {
   ThrowsOnceHandler handler;
-  GrpcTransport transport("127.0.0.1:0", {});
+  GrpcTransport transport("127.0.0.1:0", {}, kNotAboutDeadlines);
   transport.SetHandler(&handler);
   transport.Start();
   ASSERT_NE(transport.ListeningPort(), 0);
@@ -282,7 +286,7 @@ TEST(GrpcTransportTest, NonStandardHandlerExceptionDoesNotEscapeService) {
 
 TEST(GrpcTransportTest, CallbackStopReturnsWhenExternalStopIsInProgress) {
   RecordingHandler handler;
-  GrpcTransport transport("127.0.0.1:0", {});
+  GrpcTransport transport("127.0.0.1:0", {}, kNotAboutDeadlines);
   transport.SetHandler(&handler);
   transport.Start();
   ASSERT_NE(transport.ListeningPort(), 0);

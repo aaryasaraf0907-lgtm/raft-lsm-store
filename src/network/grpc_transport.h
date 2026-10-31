@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
@@ -11,8 +12,14 @@ namespace raftkv {
 
 class GrpcTransport final : public Transport {
  public:
+  // `rpc_deadline` bounds every AppendEntries, RequestVote and PreVote call (snapshot chunks have
+  // their own, longer deadline). A call that misses it is dropped without a callback; Raft simply
+  // resends. Tests that are about something else than deadlines pass a generous one, so that a
+  // slow machine cannot make them lose their only call.
+  static constexpr std::chrono::milliseconds kDefaultRpcDeadline{150};
   GrpcTransport(std::string listen_address,
-                std::map<NodeId, std::string> peer_addresses);
+                std::map<NodeId, std::string> peer_addresses,
+                std::chrono::milliseconds rpc_deadline = kDefaultRpcDeadline);
   ~GrpcTransport() override;
 
   GrpcTransport(const GrpcTransport&) = delete;
