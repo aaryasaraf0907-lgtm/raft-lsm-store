@@ -527,16 +527,17 @@ TEST(GrpcTransportTest, ASnapshotToAnUnresponsivePeerDoesNotBlockOtherPeers) {
   EXPECT_EQ(stuck.SnapshotCalls(), 1) << "repeated snapshot sends to a stuck peer were not dropped";
   // Heartbeats as Raft sends them: one every 20 ms, a lost one (a deadline missed on a loaded
   // machine) simply followed by the next. What must not happen is that the stuck snapshot RPCs
-  // block them: then none would be answered before the snapshot deadline (3 s). Twenty answers
-  // within 2 s means the healthy peer kept being served.
+  // block them: then NONE would be answered before the snapshot deadline (3 s). So the line is
+  // between some answers and none: a slow CI machine may miss most 150 ms deadlines (a macOS runner
+  // once answered 18 of about 100), but a starved transport answers zero.
   std::atomic<int> acked{0};
   const auto start = std::chrono::steady_clock::now();
-  while (acked.load() < 20 && std::chrono::steady_clock::now() - start < std::chrono::seconds(2)) {
+  while (acked.load() < 5 && std::chrono::steady_clock::now() - start < std::chrono::seconds(2)) {
     client.SendAppendEntries(3, AppendEntriesRequest{3, 1, 0, 0, {}, 0},
                              [&](const AppendEntriesReply&) { ++acked; });
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
-  ASSERT_GE(acked.load(), 20) << "heartbeats to a healthy peer were starved (" << acked.load()
+  ASSERT_GE(acked.load(), 5) << "heartbeats to a healthy peer were starved (" << acked.load()
                               << " answered in 2 s while a snapshot to another peer was stuck)";
   stuck.Release();
   client.Stop();
