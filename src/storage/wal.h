@@ -9,6 +9,7 @@
 // the file there, so later appends never sit behind garbage.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -48,6 +49,10 @@ class WAL {
   Status AppendDelete(const std::string& key, bool sync = true);
   Status Sync();  // flush earlier sync=false appends
 
+  // If set, every record that was handed to write() successfully (header and payload) adds its size
+  // to *counter. For the engine's write-amplification statistics; `counter` must outlive this WAL.
+  void set_byte_counter(std::atomic<uint64_t>* counter) { byte_counter_ = counter; }
+
   // Calls `apply` for each valid record in order (a delete arrives as an Entry
   // with tombstone=true). A missing file is an empty log. Repairs a torn tail.
   //
@@ -66,6 +71,7 @@ class WAL {
   Status Append(uint8_t type, const std::string& key, const std::string& value, bool sync);
   int fd_;
   WriteFunction write_function_;
+  std::atomic<uint64_t>* byte_counter_ = nullptr;
   bool failed_ = false;  // set after any failed write/fsync; the log may end in a partial record
 };
 

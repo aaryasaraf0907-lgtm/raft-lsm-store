@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "storage/block_cache.h"
+#include "storage/dir_lock.h"
 #include "storage/iterator.h"
 #include "storage/checkpoint.h"
 #include "storage/kv_store.h"
@@ -103,10 +104,22 @@ class KVEngine : public CheckpointableStore {
     // The engine stopped for good because InstallCheckpoint could not tell which dataset is durable
     // (see InstallCheckpoint): reads, writes and checkpoints all fail; reopen the directory.
     bool fail_stopped = false;
+    // Write-amplification counters (docs/storage-design.md 6.4): cumulative bytes since this engine
+    // was opened, counted where the engine hands data to the file system. Not reset by compaction.
+    uint64_t user_bytes_written = 0;  // key + value bytes of acknowledged Put/PutAt; key bytes of Delete
+    uint64_t wal_bytes_written = 0;   // WAL records (header + payload), applied-index records included
+    uint64_t flush_bytes_written = 0;       // SSTables written by memtable flushes (whole files)
+    uint64_t compaction_bytes_written = 0;  // SSTables written by compactions (whole files)
+    uint64_t checkpoint_bytes_written = 0;  // the SSTable written by InstallCheckpoint
+    uint64_t manifest_bytes_written = 0;    // MANIFEST files stored (the whole file is rewritten)
+    size_t block_cache_capacity = 0;  // Options::block_cache_bytes in effect (0 = no cache)
+    size_t block_cache_usage = 0;     // bytes currently charged to the cache
   };
 
-  // kOk; kIOError (cannot create dir / open WAL); kCorruption (a WAL is damaged
-  // before its last record, so recovery would silently lose data).
+  // kOk; kIOError (cannot create dir / open WAL, or another engine holds the directory's LOCK: see
+  // dir_lock.h); kCorruption (a WAL is damaged before its last record, so recovery would silently
+  // lose data). The lock is taken before any recovery step and kept until the engine is destroyed;
+  // a failed Open releases it.
   static Status Open(const Options& options, std::unique_ptr<KVEngine>* out);
   ~KVEngine() override;  // frozen memtables not yet flushed stay in their WALs
 
@@ -178,9 +191,21 @@ class KVEngine : public CheckpointableStore {
   void FlushLoop();
   void CompactLoop();
   bool SyncDir() const;
+  // StoreManifest, plus the size of the stored file added to the manifest byte counter.
+  Status StoreManifestCounted(const ManifestState& state, const std::function<bool()>& fail_after_rename = nullptr);
+  // Adds the size of the file just written to *counter (a missing file adds nothing).
+  void CountFileBytes(const std::string& path, std::atomic<uint64_t>* counter) const;
   std::string Path(const std::string& name) const;
 
+  // Holds the data directory's LOCK for the engine's whole life. Declared first so that it is
+  // destroyed LAST (members go in reverse order): the WALs, SSTables and threads are gone before
+  // another engine can take the directory.
+  std::unique_ptr<DirLock> lock_;
   const Options options_;
+  // Write-amplification counters (see Stats). Declared before the WAL and the threads that update
+  // them, so they outlive both.
+  std::atomic<uint64_t> user_bytes_{0}, wal_bytes_{0}, flush_bytes_{0}, compaction_bytes_{0},
+      checkpoint_bytes_{0}, manifest_bytes_{0};
   const std::shared_ptr<BlockCache> block_cache_;  // null when disabled; shared by every SSTable
   uint64_t recovered_records_ = 0;  // set before any thread starts
   std::atomic<uint64_t> applied_index_{0};  // written under write_mu_, read anywhere

@@ -61,6 +61,7 @@ The design documents go into detail:
 | [`docs/running-a-cluster.md`](docs/running-a-cluster.md) | the node and CLI, all flags, and operational limits |
 | [`docs/fault-injection.md`](docs/fault-injection.md) | the fault-injection harness used to test Raft |
 | [`docs/benchmark-results.md`](docs/benchmark-results.md) | the full benchmark matrix |
+| [`docs/storage-benchmarks.md`](docs/storage-benchmarks.md) | the storage benchmarks (reads, fills, overwrites, write amplification): how to run them, methodology, limits, results |
 
 ## Building
 

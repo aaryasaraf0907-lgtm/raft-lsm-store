@@ -30,12 +30,16 @@ if(RAFTKV_BUILD_NETWORK)
     network/client_service_test.cpp
     network/raft_over_grpc_test.cpp
     network/node_cluster_test.cpp
-    network/kv_client_test.cpp)
+    network/kv_client_test.cpp
+    network/node_options_test.cpp)
   target_link_libraries(network_proto_tests
     raftkv_client_service
     raftkv_node_runtime
     raftkv_kv_client
     raftkv_raft
     GTest::gtest_main)
+  # The raftkv_node program, so that node_options_test.cpp can check its command line.
+  add_dependencies(network_proto_tests raftkv_node)
+  target_compile_definitions(network_proto_tests PRIVATE RAFTKV_NODE_BIN="$<TARGET_FILE:raftkv_node>")
   gtest_discover_tests(network_proto_tests DISCOVERY_MODE PRE_TEST)
 endif()

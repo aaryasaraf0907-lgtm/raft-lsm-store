@@ -146,6 +146,7 @@ throughput and p50/p95/p99 latency. Numbers depend heavily on fsync: compare wit
 | `--join` | start as a new node that is not yet a member; it waits to be added (`add-node`) |
 | `--no-sync` | no fsync (testing only) |
 | `--memtable-bytes N`, `--compaction-trigger N` | flush size of a memtable (default 4 MiB) and how many SSTables trigger a merge (default 4; 0 = never) |
+| `--block-cache-bytes N` | bytes of decoded SSTable blocks the storage engine keeps in memory for reads (default 0 = no cache, nothing is allocated). Plain decimal digits only (no sign, unit or fraction); invalid values make the node exit with status 2. Ignored, with a warning, under `--no-sstables`. Example: `--block-cache-bytes 67108864` for 64 MiB |
 | `--snapshot-threshold N`, `--snapshot-trailing N` | snapshot the data and drop the Raft log every N applied entries (default 10000; 0 = never) and how many log entries to keep below it (default 100) |
 | `--sync-engine-wal` | also fsync the engine's own WAL on every write. By default it is not: the Raft log is durable and the engine is rebuilt from it after a crash |
 | `--no-sstables` | use the old WAL + memtable engine instead of the LSM engine (the default) |
@@ -159,6 +160,13 @@ throughput and p50/p95/p99 latency. Numbers depend heavily on fsync: compare wit
   snapshots its data (a merged copy of every live key plus the client-session table) and drops the
   Raft log. A node that has no data, or is far behind, is sent the leader's snapshot in chunks. A
   snapshot is built in memory, so its size is bounded by the node's RAM.
+- **One node per data directory.** The storage engine holds an exclusive lock (`flock` on
+  `<data-dir>/kv/LOCK`) while it runs. Starting a second `raftkv_node` on the same `--data-dir` fails at
+  start-up with "cannot open the storage engine … if another raftkv_node is running on this data
+  directory, stop it first" (exit status 1) and leaves the running node untouched. The lock is released
+  when the node stops or dies, even by `kill -9`, so a crashed node can simply be started again; the empty
+  `LOCK` file stays. Keep the data directory on a local file system (`flock` is advisory and may not work
+  on a network file system).
 - A member must keep its disk: one that is wiped and returns under the same id breaks Raft's assumption
   that persisted state survives. Replace a machine with a membership change instead (above).
 - Membership changes one server at a time; a removed node is not told and must be stopped by hand

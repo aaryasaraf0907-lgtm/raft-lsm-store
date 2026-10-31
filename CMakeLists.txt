@@ -26,10 +26,15 @@ if(RAFTKV_BUILD_NETWORK)
 endif()
 add_subdirectory(tests)
 
-# Read-path micro-benchmark (benchmarks/storage_read_bench.cpp). Off by default; use a Release build.
-option(RAFTKV_BUILD_BENCHMARKS "Build the storage read benchmark" OFF)
+# Storage benchmarks (benchmarks/): off by default, not run by ctest or CI; use a Release build.
+#   storage_read_bench   point reads and scans (and the optional block cache)
+#   storage_write_bench  fill, overwrite and write amplification
+option(RAFTKV_BUILD_BENCHMARKS "Build the storage benchmarks" OFF)
 if(RAFTKV_BUILD_BENCHMARKS)
-  add_executable(storage_read_bench benchmarks/storage_read_bench.cpp)
-  target_link_libraries(storage_read_bench raftkv_storage)
-  set_target_properties(storage_read_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/benchmarks)
+  foreach(bench storage_read_bench storage_write_bench)
+    add_executable(${bench} benchmarks/${bench}.cpp)
+    target_link_libraries(${bench} raftkv_storage)
+    target_compile_definitions(${bench} PRIVATE RAFTKV_BENCH_BUILD_TYPE="$<CONFIG>")
+    set_target_properties(${bench} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/benchmarks)
+  endforeach()
 endif()

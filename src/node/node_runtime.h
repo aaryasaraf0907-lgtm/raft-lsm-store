@@ -39,6 +39,9 @@ struct NodeOptions {
   bool use_sstables = true;
   size_t memtable_bytes = 4 * 1024 * 1024;  // the engine freezes and flushes a memtable at this size
   size_t compaction_trigger = 4;            // merge SSTables when this many are live (0 = never)
+  // Bytes of decoded SSTable blocks the engine keeps in memory (KVEngine::Options::block_cache_bytes,
+  // LSM engine only). 0 = no cache, which is the default: nothing is allocated unless asked for.
+  size_t block_cache_bytes = 0;
   // Raft snapshots (LSM engine only): after this many applied entries the node snapshots its data
   // and drops the Raft log, keeping `snapshot_trailing_entries` of it for followers that are only
   // a little behind. 0 = never snapshot. The node can always RECEIVE a snapshot from the leader.

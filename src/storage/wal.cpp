@@ -127,6 +127,7 @@ Status WAL::Append(uint8_t type, const std::string& key, const std::string& valu
     failed_ = true;
     return Status::kIOError;
   }
+  if (byte_counter_ != nullptr) byte_counter_->fetch_add(record.size(), std::memory_order_relaxed);
   return Status::kOk;
 }
 

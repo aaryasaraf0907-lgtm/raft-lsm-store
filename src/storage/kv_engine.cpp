@@ -116,8 +116,14 @@ Status KVEngine::Open(const Options& options, std::unique_ptr<KVEngine>* out) {
   std::filesystem::create_directories(options.dir, ec);
   if (ec || !std::filesystem::is_directory(options.dir, ec)) return Status::kIOError;
 
+  // Exclusive ownership of the directory comes before anything that reads or changes it: recovery
+  // deletes orphan files and truncates WALs, which would corrupt a running engine's files.
+  std::unique_ptr<DirLock> lock;
+  Status s = DirLock::Acquire(options.dir, &lock);
+  if (s != Status::kOk) return s;
   std::unique_ptr<KVEngine> engine(new KVEngine(options));
-  Status s = engine->Recover();
+  engine->lock_ = std::move(lock);  // released last, after the threads and files are gone
+  s = engine->Recover();
   if (s != Status::kOk) return s;
   engine->PublishView();
   {
@@ -275,9 +281,23 @@ Status KVEngine::Recover() {
     }
   }
   Status s = WAL::Open(Path(WalFileName(active_seq_)), &wal_);
+  if (s == Status::kOk) wal_->set_byte_counter(&wal_bytes_);
   if (s != Status::kOk) return s;
   if (!SyncDir()) return Status::kIOError;
   return Status::kOk;
+}
+
+Status KVEngine::StoreManifestCounted(const ManifestState& state,
+                                      const std::function<bool()>& fail_after_rename) {
+  const Status s = StoreManifest(options_.dir, state, fail_after_rename);
+  if (s == Status::kOk) CountFileBytes(Path("MANIFEST"), &manifest_bytes_);
+  return s;
+}
+
+void KVEngine::CountFileBytes(const std::string& path, std::atomic<uint64_t>* counter) const {
+  std::error_code ec;
+  const uintmax_t size = std::filesystem::file_size(path, ec);
+  if (!ec) counter->fetch_add(size, std::memory_order_relaxed);
 }
 
 KVEngine::~KVEngine() {
@@ -311,6 +331,16 @@ KVEngine::Stats KVEngine::GetStats() const {
   s.compactions_done = compactions_done_;
   s.compaction_failures = compaction_failures_;
   s.fail_stopped = fail_stopped_;
+  s.user_bytes_written = user_bytes_.load();
+  s.wal_bytes_written = wal_bytes_.load();
+  s.flush_bytes_written = flush_bytes_.load();
+  s.compaction_bytes_written = compaction_bytes_.load();
+  s.checkpoint_bytes_written = checkpoint_bytes_.load();
+  s.manifest_bytes_written = manifest_bytes_.load();
+  if (block_cache_) {
+    s.block_cache_capacity = block_cache_->capacity();
+    s.block_cache_usage = block_cache_->usage();
+  }
   return s;
 }
 
@@ -363,6 +393,7 @@ Status KVEngine::Write(bool tombstone, const std::string& key, const std::string
     active_->Put(AppliedIndexKey(), index_bytes);
     applied_index_.store(raft_index);
   }
+  user_bytes_.fetch_add(key.size() + (tombstone ? 0 : value.size()), std::memory_order_relaxed);
   return Status::kOk;
 }
 
@@ -503,6 +534,7 @@ Status KVEngine::InstallCheckpoint(const std::string& data, uint64_t applied_ind
   std::filesystem::remove(Path(SstFileName(number)), ec);
   VectorIterator source(std::move(entries));
   Status s = WriteSSTable(Path(SstFileName(number)), meta, bo, &source);
+  if (s == Status::kOk) CountFileBytes(Path(SstFileName(number)), &checkpoint_bytes_);
   std::unique_ptr<SSTable> opened;
   if (s == Status::kOk) s = SSTable::Open(Path(SstFileName(number)), number, &opened, block_cache_);
   if (s != Status::kOk) {
@@ -527,7 +559,7 @@ Status KVEngine::InstallCheckpoint(const std::string& data, uint64_t applied_ind
   const auto fail_after_rename = [this] {
     return options_.test_crash_hook && options_.test_crash_hook("install:fail_after_manifest_rename");
   };
-  s = StoreManifest(options_.dir, next, fail_after_rename);
+  s = StoreManifestCounted(next, fail_after_rename);
   if (s != Status::kOk) {
     new_wal.reset();
     std::filesystem::remove(Path(WalFileName(wal_seq)), ec);  // empty, and manifests never list WALs
@@ -542,7 +574,7 @@ Status KVEngine::InstallCheckpoint(const std::string& data, uint64_t applied_ind
     if (ManifestMayName(options_.dir, number)) {
       ManifestState current = manifest_;
       current.next_file_number = std::max(current.next_file_number, next_seq_);
-      if (StoreManifest(options_.dir, current, fail_after_rename) != Status::kOk) {
+      if (StoreManifestCounted(current, fail_after_rename) != Status::kOk) {
         fail_stopped_ = true;  // reads refuse from now on (Get)
         dead_ = true;  // fail-stop: writes, flushes, compactions and installs all refuse from now on
         cv_.notify_all();  // writers waiting for room and the background threads see it at once
@@ -564,6 +596,7 @@ Status KVEngine::InstallCheckpoint(const std::string& data, uint64_t applied_ind
   frozen_.clear();
   active_ = std::make_shared<MemTable>(options_.memtable_bytes);
   active_seq_ = wal_seq;
+  new_wal->set_byte_counter(&wal_bytes_);
   wal_ = std::move(new_wal);
   applied_index_.store(applied_index);
   ++epoch_;
@@ -588,6 +621,7 @@ Status KVEngine::Freeze() {
   active_ = std::make_shared<MemTable>(options_.memtable_bytes);
   active_seq_ = new_seq;
   ++next_seq_;
+  new_wal->set_byte_counter(&wal_bytes_);
   wal_ = std::move(new_wal);
   PublishView();
   cv_.notify_all();
@@ -672,6 +706,7 @@ void KVEngine::FlushLoop() {
         SSTableBuilderOptions bo;
         bo.bits_per_key = options_.bloom_bits_per_key;
         s = WriteSSTable(Path(SstFileName(f.seq)), meta, bo, &it);
+        if (s == Status::kOk) CountFileBytes(Path(SstFileName(f.seq)), &flush_bytes_);
         if (s == Status::kOk) s = SSTable::Open(Path(SstFileName(f.seq)), f.seq, &opened, block_cache_);
       }
       if (s == Status::kOk) table = std::shared_ptr<SSTable>(std::move(opened));
@@ -704,7 +739,7 @@ void KVEngine::FlushLoop() {
       next.next_file_number = std::max(next.next_file_number, next_seq_);
       // Tests only: test_crash_hook point "flush:fail_after_manifest_rename" makes this store fail
       // inside StoreManifest after its rename, as if the directory fsync had failed.
-      s = StoreManifest(options_.dir, next, [this] {
+      s = StoreManifestCounted(next, [this] {
         return options_.test_crash_hook && options_.test_crash_hook("flush:fail_after_manifest_rename");
       });
       if (s == Status::kOk) {
@@ -788,6 +823,7 @@ void KVEngine::CompactLoop() {
     CompactionResult result;
     const std::string out_path = Path(SstFileName(out_number));
     Status s = Compact(raw, live, out_path, out_number, co, &result);
+    if (s == Status::kOk) CountFileBytes(out_path, &compaction_bytes_);
     if (s == Status::kOk && CrashPoint("compact:after_output")) return;
     std::shared_ptr<SSTable> output;
     if (s == Status::kOk) {
@@ -823,7 +859,7 @@ void KVEngine::CompactLoop() {
       next.next_file_number = std::max(next.next_file_number, next_seq_);
       // Tests only: test_crash_hook point "compact:fail_after_manifest_rename" makes this store fail
       // inside StoreManifest after its rename, as if the directory fsync had failed (see above).
-      s = StoreManifest(options_.dir, next, [this] {
+      s = StoreManifestCounted(next, [this] {
         return options_.test_crash_hook && options_.test_crash_hook("compact:fail_after_manifest_rename");
       });
       if (s == Status::kOk) {
