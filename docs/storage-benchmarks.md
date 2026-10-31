@@ -78,77 +78,127 @@ source file.
 Measured 2026-10-31 on an Intel Core i5-13450HX (16 hardware threads), 7.6 GiB visible to WSL2, Ubuntu
 26.04.1 under WSL2 (kernel 6.18.54.1), g++ 15.2.0, CMake `Release` (`-O3 -DNDEBUG`), data directory under
 `/tmp` (the WSL2 virtual disk). Settings: 200,000 keys, 16 + 100 bytes, memtable 1 MiB, WAL not fsynced,
-no block cache, 2x overwrites. Each invocation runs 5 measured runs after a warm-up and was repeated in 3
-rounds, so every cell is the **median of the 3 round medians** (15 runs); the ranges are the minimum and
-maximum over all 15 runs. `tables` and `compactions` are the number of live SSTables at the end and of
-compactions in the phase.
+no block cache, 2x overwrites.
 
-These are measurements of the compaction policy with tables weighed by their **file size in bytes**
-(`SSTable::file_bytes()`), the policy as it is now. Compaction sizes were entry counts until this was
-changed, so the second table compares the two. Both were built from the same compiler and flags
-(`main` before the change, and the change), and run **interleaved in one session**: in each round both
-builds ran at each trigger, and the order alternated between rounds (before first, after first, before
-first). Sessions are not comparable with each other on this machine. This one replaces the table of
-2026-10-30, which measured the entry-count policy only; today's "before" columns reproduce it within the
-run-to-run spread (LSM amplification, 2026-10-30 against today's before, trigger 2: 4.25, 4.46, 3.60 against
-3.86, 4.70, 3.64; trigger 4: 3.02, 3.72, 3.02 against 3.04, 3.47, 3.14; trigger 8: identical, 3.45, 3.09,
-2.80), but not the throughput: with compaction on, both builds wrote 0.4-0.7 million Puts/s today against
-0.8-0.95 million then, while with compaction off the two sessions are close (0.80-0.84 million today, 0.82-0.95 million then). The cause was
-not investigated.
+Compaction chose by **entry count** until it was changed to weigh tables by their **file size in bytes**
+(`SSTable::file_bytes()`), so every comparison below is of the build before the change (`main` at the
+time) with the build after it, built from the same compiler and flags and **run interleaved in one session**
+(both builds back to back at each trigger and workload, the order alternating between rounds), because
+sessions are not comparable with each other on this machine. One *invocation* is one run of the benchmark
+program: a warm-up and 5 runs (3 runs in the second batch), reported as that invocation's median. The fill
+workloads at triggers 2, 4 and 8 have 9 invocations per build (3 of 5 runs and 6 of 3 runs); the overwrite
+workloads and trigger 0 have 3 of 5 runs, because overwrite was not repeated in the second batch. Every
+cell is the median over invocations, and the ranges are the minimum and maximum over all runs.
 
-| trigger | workload | Puts/s median [min-max] | logical MB/s | WAL | flush | compaction | LSM | total | tables | compactions |
+Results with the byte-sized policy (the policy as it is now); `tables` and `compactions` are the number of
+live SSTables at the end and of compactions in the phase:
+
+| trigger | workload | invocations | Puts/s median [min-max] | logical MB/s | WAL | flush | compaction | LSM | total | tables | compactions |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | fill-seq | 3 | 841,115 [700,082-964,294] | 97.6 | 1.11 | 1.09 | 0.00 | 1.09 | 2.20 | 45 | 0 |
+| 0 | fill-random | 3 | 808,607 [306,977-830,983] | 93.8 | 1.11 | 1.09 | 0.00 | 1.09 | 2.20 | 45 | 0 |
+| 0 | overwrite | 3 | 802,116 [672,516-826,362] | 93.0 | 1.11 | 1.09 | 0.00 | 1.09 | 2.21 | 136 | 0 |
+| 2 | fill-seq | 9 | 942,883 [124,827-967,208] | 109.4 | 1.11 | 1.09 | 3.55 | 4.63 | 5.74 | 1 | 15 |
+| 2 | fill-random | 9 | 808,805 [206,355-853,833] | 93.8 | 1.11 | 1.09 | 3.45 | 4.54 | 5.65 | 1 | 15 |
+| 2 | overwrite | 3 | 502,075 [365,662-724,022] | 58.2 | 1.11 | 1.09 | 2.54 | 3.63 | 4.74 | 1 | 11 |
+| 4 | fill-seq | 9 | 927,966 [355,121-966,716] | 107.6 | 1.11 | 1.09 | 1.91 | 2.99 | 4.10 | 3 | 11 |
+| 4 | fill-random | 9 | 814,385 [376,444-848,396] | 94.5 | 1.11 | 1.09 | 2.00 | 3.09 | 4.20 | 3 | 12 |
+| 4 | overwrite | 3 | 481,006 [106,113-632,481] | 55.8 | 1.11 | 1.09 | 2.15 | 3.24 | 4.36 | 2 | 14 |
+| 8 | fill-seq | 9 | 925,642 [360,386-958,754] | 107.4 | 1.11 | 1.09 | 1.93 | 3.02 | 4.13 | 2 | 9 |
+| 8 | fill-random | 9 | 758,017 [356,379-854,550] | 87.9 | 1.11 | 1.09 | 1.93 | 3.02 | 4.13 | 2 | 9 |
+| 8 | overwrite | 3 | 495,936 [384,368-501,813] | 57.5 | 1.11 | 1.09 | 1.72 | 2.81 | 3.92 | 2 | 13 |
+
+Before and after the change, same session. "Pairs" compares every invocation of one build with every
+invocation of the other (9 x 9 = 81 pairs for the fill workloads, 3 x 3 = 9 for overwrite) and counts how
+often the build after the change had the higher and the lower LSM write amplification:
+
+| trigger | workload | invocations | LSM before [min-max] | LSM after [min-max] | change | pairs after higher / lower | compactions before | after | tables before | after |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 0 | fill-seq | 841,115 [700,082-964,294] | 97.6 | 1.11 | 1.09 | 0.00 | 1.09 | 2.20 | 45 | 0 |
-| 0 | fill-random | 808,607 [306,977-830,983] | 93.8 | 1.11 | 1.09 | 0.00 | 1.09 | 2.20 | 45 | 0 |
-| 0 | overwrite | 802,116 [672,516-826,362] | 93.0 | 1.11 | 1.09 | 0.00 | 1.09 | 2.21 | 136 | 0 |
-| 2 | fill-seq | 567,373 [124,827-574,038] | 65.8 | 1.11 | 1.09 | 3.59 | 4.68 | 5.79 | 1 | 15 |
-| 2 | fill-random | 503,029 [206,355-775,055] | 58.4 | 1.11 | 1.09 | 3.47 | 4.56 | 5.67 | 1 | 16 |
-| 2 | overwrite | 502,075 [365,662-724,022] | 58.2 | 1.11 | 1.09 | 2.54 | 3.63 | 4.74 | 1 | 11 |
-| 4 | fill-seq | 541,624 [355,121-639,858] | 62.8 | 1.11 | 1.09 | 1.91 | 2.99 | 4.10 | 3 | 10 |
-| 4 | fill-random | 492,682 [376,444-706,094] | 57.2 | 1.11 | 1.09 | 2.05 | 3.14 | 4.25 | 3 | 12 |
-| 4 | overwrite | 481,006 [106,113-632,481] | 55.8 | 1.11 | 1.09 | 2.15 | 3.24 | 4.36 | 2 | 14 |
-| 8 | fill-seq | 567,172 [360,386-570,724] | 65.8 | 1.11 | 1.09 | 1.93 | 3.02 | 4.13 | 2 | 9 |
-| 8 | fill-random | 494,755 [356,379-503,819] | 57.4 | 1.11 | 1.09 | 1.93 | 3.02 | 4.13 | 2 | 9 |
-| 8 | overwrite | 495,936 [384,368-501,813] | 57.5 | 1.11 | 1.09 | 1.72 | 2.81 | 3.92 | 2 | 13 |
-
-Before and after the change of the compaction size from entry counts to bytes (same session):
-
-| trigger | workload | LSM before [min-max] | LSM after [min-max] | change | compactions before | after | tables before | after |
-|---|---|---|---|---|---|---|---|---|
-| 2 | fill-seq | 3.86 [3.81-4.61] | 4.68 [3.76-4.80] | +0.82 | 18 | 15 | 1 | 1 |
-| 2 | fill-random | 4.70 [4.08-4.97] | 4.56 [3.98-4.75] | -0.14 | 19 | 16 | 1 | 1 |
-| 2 | overwrite | 3.64 [3.57-3.93] | 3.63 [3.58-3.68] | -0.01 | 11 | 11 | 1 | 1 |
-| 4 | fill-seq | 3.04 [2.92-3.72] | 2.99 [2.92-3.14] | -0.05 | 16 | 10 | 2 | 3 |
-| 4 | fill-random | 3.47 [3.09-3.86] | 3.14 [3.09-4.05] | -0.33 | 17 | 12 | 2 | 3 |
-| 4 | overwrite | 3.14 [2.92-3.48] | 3.24 [2.95-3.63] | +0.10 | 17 | 14 | 2 | 2 |
-| 8 | fill-seq | 3.45 [3.45-3.45] | 3.02 [3.02-3.02] | -0.43 | 15 | 9 | 1 | 2 |
-| 8 | fill-random | 3.09 [3.09-3.09] | 3.02 [3.02-3.02] | -0.07 | 10 | 9 | 2 | 2 |
-| 8 | overwrite | 2.80 [2.79-2.85] | 2.81 [2.79-2.81] | +0.01 | 13 | 13 | 2 | 2 |
+| 2 | fill-seq | 9 | 4.25 [3.81-4.66] | 4.63 [3.76-4.80] | +0.38 | 63 / 16 of 81 | 18 | 15 | 1 | 1 |
+| 2 | fill-random | 9 | 4.68 [3.96-4.99] | 4.54 [3.96-4.78] | -0.14 | 28 / 51 of 81 | 20 | 15 | 1 | 1 |
+| 2 | overwrite | 3 | 3.64 [3.57-3.93] | 3.63 [3.58-3.68] | -0.01 | 2 / 5 of 9 | 11 | 11 | 1 | 1 |
+| 4 | fill-seq | 9 | 3.04 [2.92-3.93] | 2.99 [2.92-3.14] | -0.05 | 9 / 72 of 81 | 16 | 11 | 2 | 3 |
+| 4 | fill-random | 9 | 3.52 [3.09-3.88] | 3.09 [2.90-4.05] | -0.43 | 0 / 81 of 81 | 16 | 12 | 2 | 3 |
+| 4 | overwrite | 3 | 3.14 [2.92-3.48] | 3.24 [2.95-3.63] | +0.10 | 7 / 2 of 9 | 17 | 14 | 2 | 2 |
+| 8 | fill-seq | 9 | 3.45 [3.28-3.45] | 3.02 [3.02-3.02] | -0.43 | 0 / 81 of 81 | 15 | 9 | 1 | 2 |
+| 8 | fill-random | 9 | 3.09 [3.09-3.45] | 3.02 [3.02-3.02] | -0.07 | 0 / 81 of 81 | 10 | 9 | 2 | 2 |
+| 8 | overwrite | 3 | 2.80 [2.79-2.85] | 2.81 [2.79-2.81] | +0.01 | 9 / 0 of 9 | 13 | 13 | 2 | 2 |
 
 Reading them:
 
 - **With compaction off** (trigger 0) every byte is written once to the WAL (1.11x: 13 bytes of header on
   every 116-byte pair) and once to a table (1.09x: the table adds a 9-byte record header, the Bloom filter
   and the index), and the overwrite workload leaves 136 tables because overwrites inside a 1 MiB memtable
-  barely collapse. The two builds are identical here (the policy is not involved): 45, 45 and 136 tables,
-  the same amplification.
+  barely collapse. The policy is not involved here, and the two builds are identical: 45, 45 and 136
+  tables, the same amplification.
 - **Switching compaction on** adds about 1.7-3.6 further writes of the data to tables, depending on the
-  trigger and on the workload: a lower trigger merges more often and writes more (trigger 2: LSM 3.6-4.7
+  trigger and on the workload: a lower trigger merges more often and writes more (trigger 2: LSM 3.6-4.6
   against 2.8-3.0 at trigger 8), at the price of far fewer tables to read. The tiered policy also merges
   tables whose key ranges do not overlap (an ascending fill still costs 3.0 at trigger 4), which is a
   property of the policy, not of this benchmark.
-- **Bytes against entry counts** did not change the amplification across the board. Overwrites are
-  unchanged (within 0.1). The fill workloads at triggers 4 and 8 compact fewer times (16 to 10 and 17 to 12
-  at trigger 4; 15 to 9 and 10 to 9 at trigger 8) and write a little less (LSM -0.05 to -0.43), and at
-  trigger 2 the ascending fill writes more (3.86 to 4.68: higher in each of the three rounds, though the
-  minimum-maximum ranges over all runs overlap), while the random fill is within the spread. Why a few tables are weighed differently by bytes was not investigated.
-  For uniform 116-byte records the two measures are close, so the benchmark is a poor discriminator
-  between them; `LsmTest.CompactionWeighsTablesByBytes*` (in `tests/storage/kv_engine_lsm_test.cpp`) are the tests that
-  pin the difference down.
-- **Throughput** is not a result of this change: the write path is not touched by it, and the round
-  medians of one build on one workload differ by up to a factor of three (for example 184, 571 and 567
-  thousand Puts/s), so no difference between the builds can be claimed. The benchmark does not record stalls, so whether the writer was held up by flushing
-  and compaction, which run on other threads, is not known; with `--sync` the disk would dominate instead.
+- **Bytes against entry counts changed the amplification in both directions.** Lower with the byte-sized
+  policy, in every pair: the random fill at trigger 4 (3.52 to 3.09) and both fills at trigger 8 (3.45 to
+  3.02 and 3.09 to 3.02). Higher: the **ascending fill at trigger 2, 4.25 to 4.63 (+9%)**, in 63 of 81
+  pairs (and lower in 16); the overwrite workload at trigger 4 by 0.10. Within the noise: the other
+  cells. The number of compactions went down in all fill configurations (for example 16 to 11 and 16 to 12
+  at trigger 4, 15 to 9 at trigger 8), i.e. fewer but larger merges. The effect is therefore not a plain
+  improvement, and at trigger 2 with an ascending fill it is a regression.
+- **Throughput** is not a result of this change: the write path is not touched by it, and one build on one
+  workload swings between invocations by more than a factor of two (the ascending fill at trigger 2:
+  184 to 958 thousand Puts/s), so no difference between the builds can be claimed. The benchmark does not
+  record stalls, so whether the writer was held up by flushing and compaction, which run on other threads,
+  is not known; with `--sync` the disk would dominate instead.
+- **Against the table of 2026-10-30**, which measured the entry-count policy only and which this replaces:
+  today's "before" columns reproduce its LSM amplification within the run-to-run spread (trigger 2: 4.25,
+  4.46, 3.60 then against 4.25, 4.68, 3.64 now; trigger 4: 3.02, 3.72, 3.02 against 3.04, 3.52, 3.14;
+  trigger 8: identical, 3.45, 3.09, 2.80). The throughput reproduces for the fill workloads (medians of
+  0.76-0.94 million Puts/s now, 0.81-0.95 then) and for trigger 0 (0.80-0.84 against 0.82-0.95), but not
+  for the overwrite workload, which was measured only in the first batch (0.48-0.50 million against
+  0.82-0.84 then); within the session the speed also varied between batches. The cause was not
+  investigated.
+
+### Why the two policies differ: a tie in entry counts is not a tie in bytes
+
+To find out what changed, a scratch build (not part of the repository) logged, at every compaction
+decision, the entry count and file size of every live table together with the run that each of the two
+measures would have chosen from that same state. Four engines (a warm-up and 3 runs) per cell, 9 cells
+(three workloads, three triggers) for each policy: 1,290 decisions, in which a disagreement is possible only
+when three or more tables are live.
+
+- **File sizes are proportional to entry counts, with a fixed cost per file.** The flushed tables hold 4,395
+  entries and 559,805 bytes (127.37 bytes per entry). A table merged from two of them holds 8,790 entries
+  and 1,119,462 bytes, which is **148 bytes less** than the 1,119,610 of its two inputs, from three 296
+  less, from four 445 less, from five 593 less: about 148 bytes saved per extra input (100 of them the
+  footer; the other 48 were not decomposed).
+- **The two measures disagreed in 211 of the 1,290 decisions, and all 211 are exact ties in entry
+  counts.** Entry counts of the tables a policy compares are multiples of the flush size, so "the newest
+  run is no larger than the table before it" is often an equality, and `<=` resolves it in favour of the
+  short run. In bytes the merged table is smaller than the sum of its inputs, so the same comparison fails
+  by about 148 bytes, the short run is rejected, and the policy goes on to a longer one. Example, state
+  `13185, 8790, 4395` entries (`1,679,119`, `1,119,462`, `559,805` bytes): by entries 8790 + 4395 = 13185 is
+  not more than 13185, so the two newest tables are merged; by bytes 1,119,462 + 559,805 = 1,679,267
+  exceeds 1,679,119, so all three are merged.
+- **In every disagreement the byte-sized policy merges more tables, never fewer (211 of 211), and in all 71
+  disagreements of its own runs it merged all the live tables.** Over the same four engines it rewrote
+  between 0.75 and 1.13 times as many entries as the entry-count policy, depending on trigger and
+  workload (trigger 2: fill-seq 1.13x, fill-random 0.94x, overwrite 0.94x; trigger 4: 1.03x, 0.75x, 1.00x;
+  trigger 8: 0.82x, 0.96x, 0.99x), and made fewer compactions (561 against 729). These ratios have the same
+  sign as the measured change in write amplification in seven of the nine cells; in the other two, trigger 4
+  fill-seq (1.03x rewritten, measured -0.05) and trigger 8 overwrite (0.99x, measured +0.01), both are
+  within noise. In the fill workloads
+  34-41% of what the byte-sized policy rewrote came from tie decisions that the entry-count policy would
+  have decided differently; in the overwrite workloads 8-11%, which is why they hardly change.
+- **So it is not a defect of `file_bytes()` or of the selection rule,** which is unchanged: the size is the
+  real size of the file. It is a consequence of weighing tables by a measure that is not exactly additive
+  under merging, in a benchmark whose flushed tables are all the same size, which is what makes the entry
+  counts tie. Whether the extra merging pays off depends on the trigger and on timing (it made merges fewer
+  and larger), and the sign of the net effect could not be derived: an idealized replay of the policy on
+  these sizes did not reproduce the measured directions, so the arrival times of flushes relative to
+  compactions matter. How often exact ties occur in a workload with varying record sizes was not measured.
+- A common remedy is a tolerance in the comparison (treat tables within some factor of each other as the
+  same size, as size-tiered policies usually do). It would remove the sensitivity, but it is a new
+  threshold and a different policy, so it was not made; `LsmTest.CompactionBreaksATieInEntryCounts...`
+  documents the current behaviour.
 
 Read results (hits, misses, hot keys, scans, with and without the block cache) are in
 [`storage-design.md`](storage-design.md) section 6.3.

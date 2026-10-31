@@ -719,6 +719,52 @@ TEST_F(LsmTest, CompactionWeighsTablesByBytesSoAnOldTableOfFewLargeValuesIsNotRe
   EXPECT_EQ(Manifest().files.size(), 2u);
 }
 
+// A tie in entry counts is not a tie in bytes. Three tables of 900, 600 and 300 entries: the two newer
+// ones together hold exactly as many entries as the old one, so the entry-count policy took "the
+// newest run is no larger than the table before it" and merged only those two. As files, the two newer
+// tables are larger than the old one (each file carries its own footer, filter and index, and one more
+// partial block), so by bytes the run is NOT as small as the old table and everything is merged. This
+// is what happens whenever a table was itself made by merging tables of equal size, as in a fill with
+// uniform records, and the byte-sized policy then merges a longer run than the entry-count one did.
+// The precondition is asserted from the files that were written, not assumed.
+TEST_F(LsmTest, CompactionBreaksATieInEntryCountsByTheFilesOverheadAndMergesTheOldTableToo) {
+  std::vector<Entry> t2 = {Entry{"a0007", "", true}};  // deletes a key of table 1
+  for (const Entry& e : Rows("b", 599, "v")) t2.push_back(e);
+  BuildTables({Rows("a", 900, "v"), t2, Rows("c", 300, "v")});  // 900, 600, 300 entries
+  auto bytes = [&](uint64_t n) { return fs::file_size(dir_ + "/" + KVEngine::SstFileName(n)); };
+  {
+    std::vector<std::unique_ptr<SSTable>> t(4);
+    for (uint64_t n = 1; n <= 3; ++n) {
+      ASSERT_EQ(SSTable::Open(dir_ + "/" + KVEngine::SstFileName(n), n, &t[n]), Status::kOk);
+    }
+    ASSERT_EQ(t[2]->entry_count() + t[3]->entry_count(), t[1]->entry_count()) << "an exact tie in entry counts";
+  }
+  ASSERT_GT(bytes(2) + bytes(3), bytes(1)) << "but not in bytes: the two files together are larger";
+
+  ASSERT_EQ(Open(Opts(3)), Status::kOk);  // three live tables reach the trigger
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compactions_done >= 1; }));
+  WaitUntilCompactionIdle(3);
+  EXPECT_EQ(engine_->GetStats().compactions_done, 1u);
+
+  const ManifestState m = Manifest();
+  ASSERT_EQ(m.files.size(), 1u) << "the old table was merged too (by entry counts only tables 2 and 3 would be)";
+  EXPECT_EQ(m.files[0].min_seq, 1u);
+  EXPECT_EQ(m.files[0].max_seq, 3u);
+  EXPECT_EQ(TableGet(m.files[0].file_number, "a0007"), SSTable::GetResult::kAbsent)
+      << "the run started at the oldest table, so the tombstone is dropped with the value it deleted";
+
+  auto check = [&](const char* when) {
+    EXPECT_EQ(Get("a0007"), "<absent>") << when;
+    EXPECT_EQ(Get("a0008"), "v") << when;
+    EXPECT_EQ(Get("b0598"), "v") << when;
+    EXPECT_EQ(Get("c0299"), "v") << when;
+  };
+  check("after compaction");
+  ASSERT_EQ(Open(Opts(3)), Status::kOk);
+  check("after a restart");
+  EXPECT_EQ(Manifest().files.size(), 1u);
+}
+
 // Tables of similar size: no run of newer tables is as small as the table before it, so the policy
 // merges everything. That run starts at the oldest table, so the tombstone and every older version
 // of its key are dropped (C7).
