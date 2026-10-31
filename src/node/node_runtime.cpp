@@ -140,6 +140,13 @@ void NodeRuntime::Start() {
   }
 
   service_ = std::make_unique<ClientService>(node_.get(), engine_.get(), machine_.get());
+  {
+    KVEngine* engine = engine_.get();
+    service_->SetScanProvider([engine](const std::string& start, const std::string& end, size_t limit,
+                                       std::vector<std::pair<std::string, std::string>>* out) {
+      return engine->Scan(start, end, limit, out);
+    });
+  }
   RaftNodeImpl* node = node_.get();
   auto deadline_of = [](uint32_t timeout_ms) {
     return std::chrono::milliseconds(timeout_ms == 0 ? 30000 : std::min<uint32_t>(timeout_ms, 600000));

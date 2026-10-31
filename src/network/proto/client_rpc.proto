@@ -38,6 +38,27 @@ message GetRequest {
   uint32 timeout_ms = 2;
 }
 
+// A linearizable range read: the live keys in [start, end) in key order, with their values.
+message ScanRequest {
+  bytes start = 1;        // inclusive; empty = from the first key
+  bytes end = 2;          // exclusive; empty = no upper bound
+  uint32 limit = 3;       // at most this many keys; 0 or more than 1000 = 1000
+  uint32 timeout_ms = 4;
+}
+message KeyValue {
+  bytes key = 1;
+  bytes value = 2;
+}
+message ScanResponse {
+  ClientStatus status = 1;
+  string error_message = 2;
+  uint32 leader_id_hint = 3;
+  repeated KeyValue items = 4;
+  // More keys may exist in [start, end) after the last item (the limit, or about 1 MiB of data, was
+  // reached). Continue from the last key followed by a zero byte.
+  bool more = 5;
+}
+
 message WriteResponse {
   ClientStatus status = 1;
   string error_message = 2;
@@ -97,6 +118,7 @@ service ClientRpc {
   rpc NodeStatus(StatusRequest) returns (StatusResponse);
   rpc Put(PutRequest) returns (WriteResponse);
   rpc Get(GetRequest) returns (GetResponse);
+  rpc Scan(ScanRequest) returns (ScanResponse);
   rpc Delete(DeleteRequest) returns (WriteResponse);
   rpc AddServer(AddServerRequest) returns (MembershipReply);
   rpc RemoveServer(RemoveServerRequest) returns (MembershipReply);

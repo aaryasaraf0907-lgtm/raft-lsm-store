@@ -33,6 +33,16 @@ class ClientService final : public network::proto::ClientRpc::Service {
   using StatusProvider = std::function<void(network::proto::StatusResponse*)>;
   void SetStatusProvider(StatusProvider provider) { status_provider_ = std::move(provider); }
 
+  // Range reads come from the storage engine (KVEngine::Scan), which the KVStore interface does not
+  // have; the owner (NodeRuntime) provides them. Without a provider Scan answers INVALID_ARGUMENT.
+  using ScanProvider = std::function<Status(const std::string& start, const std::string& end, size_t limit,
+                                            std::vector<std::pair<std::string, std::string>>* out)>;
+  void SetScanProvider(ScanProvider provider) { scan_provider_ = std::move(provider); }
+  grpc::Status Scan(grpc::ServerContext* context, const network::proto::ScanRequest* request,
+                    network::proto::ScanResponse* response) override;
+  static constexpr uint32_t kMaxScanKeys = 1000;
+  static constexpr size_t kMaxScanBytes = 1 << 20;  // a reply stops after about this much key+value data
+
   // Membership changes are handled by whoever owns the Raft node (NodeRuntime); without handlers
   // the RPCs answer MEMBERSHIP_UNSUPPORTED.
   using AddServerHandler = std::function<void(const network::proto::AddServerRequest&, network::proto::MembershipReply*)>;
@@ -73,11 +83,14 @@ class ClientService final : public network::proto::ClientRpc::Service {
                          network::proto::WriteResponse* response);
   static void SetCommitResponse(const CommitResponse& commit,
                                 network::proto::GetResponse* response);
+  static void SetCommitResponse(const CommitResponse& commit,
+                                network::proto::ScanResponse* response);
 
   RaftNode* node_;
   KVStore* store_;
   KVStateMachine* state_machine_;
   StatusProvider status_provider_;
+  ScanProvider scan_provider_;
   AddServerHandler add_server_;
   RemoveServerHandler remove_server_;
   static grpc::Status Unsupported(network::proto::MembershipReply* reply) {
