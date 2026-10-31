@@ -351,10 +351,13 @@ checkpoint bytes against the files on disk) by `EngineStats.*` in `tests/storage
 
 `benchmarks/storage_write_bench.cpp`; how to build and run it, the workloads and the limitations are in
 [`storage-benchmarks.md`](storage-benchmarks.md), which also holds the results table (200,000 keys of
-16 + 100 bytes, 1 MiB memtables, unsynced WAL, 5 runs). In short, on that machine and with compaction
-trigger 4, the median LSM write amplification was 3.02 (fill, ascending keys), 3.72 (fill, random keys)
-and 3.02 (overwrites), against 1.09 with compaction off, and it varied between runs by up to about 1
-because it depends on when compactions happen to run.
+16 + 100 bytes, 1 MiB memtables, unsynced WAL; repeated invocations of 3-5 runs). In short, on that machine
+and with compaction trigger 4, the median LSM write amplification was 2.99 (fill, ascending keys), 3.09
+(fill, random keys) and 3.24 (overwrites), against 1.09 with compaction off, and it varied between runs by
+up to about 1 because it depends on when compactions happen to run. The same document compares these with
+the figures from before compaction sizes changed from entry counts to bytes: the change lowered write
+amplification in some configurations (trigger 4 and 8 fills, by up to 0.43) and raised it in others (the
+ascending fill at trigger 2, 4.25 to 4.63), for the reason given in section 8.1.
 
 ## 7. Recovery (`Open` → `Recover`)
 
@@ -399,8 +402,21 @@ manifest store; compaction: after the output and after the manifest store; ambig
 `CompactLoop` (one background thread, started only if `compaction_trigger > 0`) waits until at least
 `max(2, compaction_trigger)` SSTables are live (default 4; `0` = never). It then merges the **smallest
 run of the newest tables** whose combined size is no larger than the table just older than the run,
-or all tables if no such run exists (`NewestRunToCompact`). Table "size" is currently the SSTable's
-**entry count** (`entry_count()`, at least 1), not its byte size (section 12).
+or all tables if no such run exists (`NewestRunToCompact`). Table "size" is the SSTable's **size in
+bytes**: the whole file, read once when the table is opened (`SSTable::file_bytes()`: data blocks, Bloom
+filter, index and footer). It was the entry count until this was changed; the selection rule itself is
+unchanged. A table of a few large values therefore weighs what it costs to read and rewrite, not what it
+has entries (tested by `LsmTest.CompactionWeighsTablesByBytes*`).
+
+**Ties.** Each file carries a fixed cost (measured: a merged table is about 148 bytes smaller per extra
+input; 100 of them are the footer, the other 48 were not decomposed), so a table made by merging several
+is a little smaller than the sum of its inputs. When the inputs are all the same size, as the tables a fill with uniform records flushes are, entry
+counts compare *equal* ("the newest run is exactly as large as the table before it", which `<=` accepts),
+whereas bytes compare *unequal*, the short run is rejected, and the policy merges a longer one, often all
+the tables. Over the benchmark workloads every one of the 211 decisions in which the two measures differed
+was such a tie, and the byte-sized policy always merged more tables, in fewer, larger compactions. The
+effect on write amplification goes both ways (section 6.5, `storage-benchmarks.md`);
+`LsmTest.CompactionBreaksATieInEntryCountsByTheFilesOverheadAndMergesTheOldTableToo` pins the behaviour.
 
 The run is always contiguous, as `ValidateCompaction` requires (rule C5; it checks all of C1–C7,
 `sstable-format.md` §13.2), and by this policy it always ends at the newest table. Each compaction
@@ -533,8 +549,13 @@ whichever dataset is on disk. Tested by
 
 ## 12. Known limitations (confirmed in the current code)
 
-- **Compaction sizing uses entry counts**, not bytes (`kv_engine.cpp`, `CompactLoop`), so tables with
-  very different value sizes are weighed by count.
+- **Compaction weighs a table by its file size**, which counts everything in the file: overwritten and
+  deleted entries that compaction has not yet removed, and the filter, index and 100-byte footer. A table
+  full of dead data weighs as much as one full of live data, and very small tables look alike because of
+  the fixed overhead. The comparison has no tolerance, so tables that are *nearly* equal in size are
+  decided by the last few bytes (section 8.1, "Ties"): a tolerance would remove that sensitivity but is a
+  new threshold, and was not added. There is no target size or level structure, only the tiered rule of
+  section 8.1.
 - **A point read scans its candidate block linearly.** The v1 block format has no record-offset
   table, so a binary search inside a block would need a format change. Without a cache, every read
   still pays a `pread` and a CRC of the whole block.

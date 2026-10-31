@@ -627,6 +627,144 @@ TEST_F(LsmTest, CompactionMergesTheSmallNewerTablesAndLeavesTheLargeOldOneAlone)
   EXPECT_EQ(Manifest().files.size(), 2u);
 }
 
+// Tables are weighed by their size in BYTES, not by how many entries they hold. Each of the next two
+// tests is built so that the two measures give opposite answers; the table sizes they rely on are
+// asserted first, from the files that were actually written.
+//
+// An old table of 300 tiny entries against three newer tables of only 5-6 entries but 2000-byte
+// values. By entry count the newer tables look tiny (16 against 300) and only they would be merged.
+// By bytes they are bigger than the old table, no short run of them is as small as the table before
+// it, so everything is merged, and because the run starts at the oldest table the tombstone and the
+// value it deletes are dropped (C7).
+TEST_F(LsmTest, CompactionWeighsTablesByBytesSoAnOldTableOfTinyEntriesIsMergedWithTheBulkierNewerOnes) {
+  const std::string big(2000, 'v');
+  std::vector<Entry> t2 = {Entry{"a0007", "", true}};  // deletes a key of table 1
+  for (const Entry& e : Rows("b", 5, big)) t2.push_back(e);
+  BuildTables({Rows("a", 300, "x"), t2, Rows("c", 5, big), Rows("d", 5, big)});
+  auto bytes = [&](uint64_t n) { return fs::file_size(dir_ + "/" + KVEngine::SstFileName(n)); };
+  ASSERT_GT(bytes(4) + bytes(3), bytes(2)) << "no run of two newer tables is as small as table 2";
+  ASSERT_GT(bytes(4) + bytes(3) + bytes(2), bytes(1)) << "no run of three newer tables is as small as table 1";
+  // (By entry count the run 2..4 has 16 entries against table 1's 300, which the old policy took
+  // as "merge only the newer three".)
+
+  ASSERT_EQ(Open(Opts(4)), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compactions_done >= 1; }));
+  WaitUntilCompactionIdle(4);
+  EXPECT_EQ(engine_->GetStats().compactions_done, 1u);
+
+  const ManifestState m = Manifest();
+  ASSERT_EQ(m.files.size(), 1u) << "everything was merged, table 1 included";
+  EXPECT_EQ(m.files[0].min_seq, 1u);
+  EXPECT_EQ(m.files[0].max_seq, 4u);
+  EXPECT_EQ(Files(".sst").size(), 1u);
+  EXPECT_EQ(TableGet(m.files[0].file_number, "a0007"), SSTable::GetResult::kAbsent)
+      << "the run starts at the oldest table, so the tombstone is dropped with the value it deleted";
+
+  auto check = [&](const char* when) {
+    EXPECT_EQ(Get("a0007"), "<absent>") << when;
+    EXPECT_EQ(Get("a0008"), "x") << when;
+    EXPECT_EQ(Get("b0004"), big) << when;
+    EXPECT_EQ(Get("c0000"), big) << when;
+    EXPECT_EQ(Get("d0004"), big) << when;
+  };
+  check("after compaction");
+  ASSERT_EQ(Open(Opts(4)), Status::kOk);
+  check("after a restart");
+  EXPECT_EQ(Manifest().files.size(), 1u);
+}
+
+// The reverse. An old table of five 2000-byte values against three newer tables of about 100 tiny
+// entries each. By entry count (5 against 101, 100, 100) no run of newer tables is as small as the
+// table before it, so everything would be merged and the old table rewritten for nothing. By bytes
+// the three newer tables together are smaller than the old one, so only they are merged: the old
+// table is not rewritten, and the tombstone in the run must survive because the run does not start
+// at the oldest table.
+TEST_F(LsmTest, CompactionWeighsTablesByBytesSoAnOldTableOfFewLargeValuesIsNotRewrittenForManySmallEntries) {
+  const std::string big(2000, 'v');
+  std::vector<Entry> t2 = {Entry{"a0002", "", true}};  // deletes a key of table 1
+  for (const Entry& e : Rows("b", 100, "1")) t2.push_back(e);
+  BuildTables({Rows("a", 5, big), t2, Rows("c", 100, "2"), Rows("d", 100, "3")});
+  auto bytes = [&](uint64_t n) { return fs::file_size(dir_ + "/" + KVEngine::SstFileName(n)); };
+  ASSERT_GT(bytes(4) + bytes(3), bytes(2)) << "no run of two newer tables is as small as table 2";
+  ASSERT_LE(bytes(4) + bytes(3) + bytes(2), bytes(1)) << "the three newer tables together fit under table 1";
+  const std::string table1 = dir_ + "/" + KVEngine::SstFileName(1);
+  const std::string table1_bytes = FileBytes(table1);
+
+  ASSERT_EQ(Open(Opts(4)), Status::kOk);
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compactions_done >= 1; }));
+  WaitUntilCompactionIdle(4);
+  EXPECT_EQ(engine_->GetStats().compactions_done, 1u);
+
+  const ManifestState m = Manifest();
+  ASSERT_EQ(m.files.size(), 2u) << "only the three newer tables were merged";
+  EXPECT_EQ(m.files[0].file_number, 1u);
+  EXPECT_EQ(m.files[0].max_seq, 1u);
+  EXPECT_EQ(m.files[1].min_seq, 2u);
+  EXPECT_EQ(m.files[1].max_seq, 4u);
+  EXPECT_EQ(FileBytes(table1), table1_bytes) << "the old table must not be rewritten";
+  EXPECT_EQ(Files(".sst").size(), 2u);
+  EXPECT_EQ(TableGet(m.files[1].file_number, "a0002"), SSTable::GetResult::kDeleted)
+      << "the tombstone must be kept: the run does not start at the oldest table";
+
+  auto check = [&](const char* when) {
+    EXPECT_EQ(Get("a0002"), "<absent>") << when;
+    EXPECT_EQ(Get("a0001"), big) << when;
+    EXPECT_EQ(Get("b0050"), "1") << when;
+    EXPECT_EQ(Get("c0099"), "2") << when;
+    EXPECT_EQ(Get("d0000"), "3") << when;
+  };
+  check("after compaction");
+  ASSERT_EQ(Open(Opts(4)), Status::kOk);
+  check("after a restart");
+  EXPECT_EQ(Manifest().files.size(), 2u);
+}
+
+// A tie in entry counts is not a tie in bytes. Three tables of 900, 600 and 300 entries: the two newer
+// ones together hold exactly as many entries as the old one, so the entry-count policy took "the
+// newest run is no larger than the table before it" and merged only those two. As files, the two newer
+// tables are larger than the old one (each file carries its own footer, filter and index, and one more
+// partial block), so by bytes the run is NOT as small as the old table and everything is merged. This
+// is what happens whenever a table was itself made by merging tables of equal size, as in a fill with
+// uniform records, and the byte-sized policy then merges a longer run than the entry-count one did.
+// The precondition is asserted from the files that were written, not assumed.
+TEST_F(LsmTest, CompactionBreaksATieInEntryCountsByTheFilesOverheadAndMergesTheOldTableToo) {
+  std::vector<Entry> t2 = {Entry{"a0007", "", true}};  // deletes a key of table 1
+  for (const Entry& e : Rows("b", 599, "v")) t2.push_back(e);
+  BuildTables({Rows("a", 900, "v"), t2, Rows("c", 300, "v")});  // 900, 600, 300 entries
+  auto bytes = [&](uint64_t n) { return fs::file_size(dir_ + "/" + KVEngine::SstFileName(n)); };
+  {
+    std::vector<std::unique_ptr<SSTable>> t(4);
+    for (uint64_t n = 1; n <= 3; ++n) {
+      ASSERT_EQ(SSTable::Open(dir_ + "/" + KVEngine::SstFileName(n), n, &t[n]), Status::kOk);
+    }
+    ASSERT_EQ(t[2]->entry_count() + t[3]->entry_count(), t[1]->entry_count()) << "an exact tie in entry counts";
+  }
+  ASSERT_GT(bytes(2) + bytes(3), bytes(1)) << "but not in bytes: the two files together are larger";
+
+  ASSERT_EQ(Open(Opts(3)), Status::kOk);  // three live tables reach the trigger
+  ASSERT_TRUE(WaitFor([&] { return engine_->GetStats().compactions_done >= 1; }));
+  WaitUntilCompactionIdle(3);
+  EXPECT_EQ(engine_->GetStats().compactions_done, 1u);
+
+  const ManifestState m = Manifest();
+  ASSERT_EQ(m.files.size(), 1u) << "the old table was merged too (by entry counts only tables 2 and 3 would be)";
+  EXPECT_EQ(m.files[0].min_seq, 1u);
+  EXPECT_EQ(m.files[0].max_seq, 3u);
+  EXPECT_EQ(TableGet(m.files[0].file_number, "a0007"), SSTable::GetResult::kAbsent)
+      << "the run started at the oldest table, so the tombstone is dropped with the value it deleted";
+
+  auto check = [&](const char* when) {
+    EXPECT_EQ(Get("a0007"), "<absent>") << when;
+    EXPECT_EQ(Get("a0008"), "v") << when;
+    EXPECT_EQ(Get("b0598"), "v") << when;
+    EXPECT_EQ(Get("c0299"), "v") << when;
+  };
+  check("after compaction");
+  ASSERT_EQ(Open(Opts(3)), Status::kOk);
+  check("after a restart");
+  EXPECT_EQ(Manifest().files.size(), 1u);
+}
+
 // Tables of similar size: no run of newer tables is as small as the table before it, so the policy
 // merges everything. That run starts at the oldest table, so the tombstone and every older version
 // of its key are dropped (C7).

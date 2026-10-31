@@ -251,6 +251,46 @@ TEST_F(SSTableTest, ManyEntriesRoundTripAcrossBlocks) {
   }
 }
 
+TEST_F(SSTableTest, FileBytesIsTheSizeOfTheWholeFile) {
+  // The compaction policy weighs tables by it: data blocks, filter, index and footer, all counted.
+  struct Case {
+    const char* what;
+    std::vector<Entry> entries;
+  };
+  const std::vector<Case> cases = {
+      {"an empty table", {}},
+      {"one entry", {{"k", "v", false}}},
+      {"one tombstone", {{"k", "", true}}},
+      {"many entries over many blocks", ManyEntries(3000)},
+      {"one record larger than a block", {{"big", std::string(200000, 'v'), false}}},
+  };
+  uint64_t previous = 0;
+  for (const Case& c : cases) {
+    std::filesystem::remove(path_);
+    ASSERT_EQ(Write(c.entries), Status::kOk) << c.what;
+    const uint64_t on_disk = std::filesystem::file_size(path_);
+    {
+      auto t = OpenOk();
+      ASSERT_NE(t, nullptr) << c.what;
+      EXPECT_EQ(t->file_bytes(), on_disk) << c.what;
+      EXPECT_EQ(t->file_bytes(), ReadAll().size()) << c.what;
+      EXPECT_GE(t->file_bytes(), raftkv::SSTableFormat::kFooterBytes) << c.what << ": at least the footer";
+    }
+    auto reopened = OpenOk();  // the value comes from the file, not from how it was written
+    ASSERT_NE(reopened, nullptr) << c.what;
+    EXPECT_EQ(reopened->file_bytes(), on_disk) << c.what;
+    previous = on_disk;
+  }
+  EXPECT_GT(previous, 200000u);
+  // More data, more bytes: a table of 3000 entries is larger than one of 10.
+  std::filesystem::remove(path_);
+  ASSERT_EQ(Write(ManyEntries(10)), Status::kOk);
+  const uint64_t small = OpenOk()->file_bytes();
+  std::filesystem::remove(path_);
+  ASSERT_EQ(Write(ManyEntries(3000)), Status::kOk);
+  EXPECT_GT(OpenOk()->file_bytes(), small);
+}
+
 TEST_F(SSTableTest, EmptyValueIsNotATombstone) {
   ASSERT_EQ(Write({{"deleted", "", true}, {"empty", "", false}, {"full", "x", false}}), Status::kOk);
   auto t = OpenOk();
