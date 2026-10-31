@@ -1,23 +1,44 @@
 // raftkv_node --block-cache-bytes: strict parsing, the default, and that the configured size
 // reaches the storage engine.
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <signal.h>
+#include <spawn.h>
 #include <stdlib.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <memory>
 #include <string>
+#include <vector>
 
+#include "../test_deadline.h"
 #include "node/node_runtime.h"
 #include "node/option_parsing.h"
 #include "storage/kv_engine.h"
 
+extern char** environ;
+
 namespace raftkv {
 namespace {
+
+using namespace std::chrono_literals;
+using testutil::RunWithDeadline;
+
+// A refused Start returns at once; a Start that succeeds opens the engine and two gRPC servers.
+constexpr std::chrono::milliseconds kRefusalDeadline = 2000ms;
+constexpr std::chrono::milliseconds kStartDeadline = 30000ms;
+// raftkv_node refusing its command line, or printing its help, exits immediately; the limit is for a
+// node that wrongly starts (and would otherwise run until a signal that never comes).
+constexpr std::chrono::milliseconds kProgramDeadline = 30000ms;
 
 struct TempDir {
   std::string path;
@@ -170,70 +191,119 @@ TEST_F(NodeBlockCacheTest, ASecondNodeOnTheSameDataDirectoryCannotStartAndTheFir
   ASSERT_NE(engine, nullptr);
   ASSERT_EQ(engine->Put("a", "1"), Status::kOk);
 
-  NodeRuntime second(Options());
-  try {
-    second.Start();
-    ADD_FAILURE() << "a second node started on a data directory that is in use";
-  } catch (const std::runtime_error& e) {
-    EXPECT_NE(std::string(e.what()).find("storage engine"), std::string::npos) << e.what();
-    EXPECT_NE(std::string(e.what()).find("another raftkv_node"), std::string::npos) << e.what();
-  }
+  // Start() on its own thread with a deadline: it must be refused at once, never wait for the lock.
+  // The result is the exception text, "" if Start succeeded.
+  auto start_node = [](NodeOptions options, std::chrono::milliseconds limit) {
+    return RunWithDeadline<std::string>(limit, [options] {
+      NodeRuntime node(options);
+      try {
+        node.Start();
+        return std::string();
+      } catch (const std::runtime_error& e) {
+        return std::string(e.what());
+      }
+    });
+  };
+  const auto refused = start_node(Options(), kRefusalDeadline);
+  ASSERT_TRUE(refused.has_value()) << "Start() did not return within " << kRefusalDeadline.count()
+                                   << " ms: the directory lock must not block";
+  EXPECT_FALSE(refused->empty()) << "a second node started on a data directory that is in use";
+  EXPECT_NE(refused->find("storage engine"), std::string::npos) << *refused;
+  EXPECT_NE(refused->find("another raftkv_node"), std::string::npos) << *refused;
   std::string v;
   ASSERT_EQ(engine->Get("a", &v), Status::kOk);
   EXPECT_EQ(v, "1");
 
   node_.reset();  // the first node stops: its lock is released
-  NodeRuntime third(Options());
-  EXPECT_NO_THROW(third.Start());
+  const auto third = start_node(Options(), kStartDeadline);
+  ASSERT_TRUE(third.has_value()) << "Start() did not return within " << kStartDeadline.count() << " ms";
+  EXPECT_EQ(*third, "") << "the directory should be free again";
 }
 
 // ---- The raftkv_node program ----------------------------------------------------------------------
 
 #ifdef RAFTKV_NODE_BIN
-// Runs raftkv_node with `args`, discarding its output; returns the exit status (or -1).
-int RunNode(const std::string& args, std::string* stderr_text = nullptr) {
+struct ProgramResult {
+  bool timed_out = false;  // killed after kProgramDeadline
+  int code = -1;           // the exit status, -1 if it did not exit normally
+  std::string out, err;    // what it wrote to stdout and to stderr
+};
+
+std::string ReadFile(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(in), {});
+}
+
+// Runs raftkv_node with `args` (no shell: every element is one argument, as given), stdin from
+// /dev/null and stdout/stderr captured. A node that has not exited after kProgramDeadline is killed
+// and reaped, so a node that wrongly starts cannot hang the test run.
+ProgramResult RunNode(const std::vector<std::string>& args) {
   TempDir scratch;
-  const std::string err = scratch.path + "/stderr";
-  const std::string cmd = std::string(RAFTKV_NODE_BIN) + " " + args + " >/dev/null 2>" + err;
-  const int rc = std::system(cmd.c_str());
-  if (stderr_text != nullptr) {
-    FILE* f = std::fopen(err.c_str(), "r");
-    char buf[512];
-    size_t n = f != nullptr ? std::fread(buf, 1, sizeof(buf) - 1, f) : 0;
-    buf[n] = '\0';
-    if (f != nullptr) std::fclose(f);
-    *stderr_text = buf;
+  const std::string out_path = scratch.path + "/stdout", err_path = scratch.path + "/stderr";
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
+  posix_spawn_file_actions_addopen(&actions, 1, out_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  posix_spawn_file_actions_addopen(&actions, 2, err_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  std::vector<std::string> storage = {RAFTKV_NODE_BIN};
+  storage.insert(storage.end(), args.begin(), args.end());
+  std::vector<char*> argv;
+  for (std::string& a : storage) argv.push_back(&a[0]);
+  argv.push_back(nullptr);
+
+  ProgramResult r;
+  pid_t pid = -1;
+  const int rc = ::posix_spawn(&pid, RAFTKV_NODE_BIN, &actions, nullptr, argv.data(), environ);
+  posix_spawn_file_actions_destroy(&actions);
+  if (rc != 0) {
+    ADD_FAILURE() << "cannot start " << RAFTKV_NODE_BIN << ": " << std::strerror(rc);
+    return r;
   }
-  return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+  int status = 0;
+  const auto deadline = std::chrono::steady_clock::now() + kProgramDeadline;
+  pid_t done = 0;
+  while ((done = ::waitpid(pid, &status, WNOHANG)) == 0 && std::chrono::steady_clock::now() < deadline) {
+    ::usleep(2000);  // poll for the exit; the limit above is what bounds the wait
+  }
+  if (done == 0) {
+    r.timed_out = true;
+    ::kill(pid, SIGKILL);
+    ::waitpid(pid, &status, 0);
+    ADD_FAILURE() << "raftkv_node did not exit within " << kProgramDeadline.count() << " ms; killed";
+  } else if (WIFEXITED(status)) {
+    r.code = WEXITSTATUS(status);
+  }
+  r.out = ReadFile(out_path);
+  r.err = ReadFile(err_path);
+  return r;
 }
 
 TEST(NodeProgram, TheFlagIsDocumentedInTheHelp) {
-  TempDir scratch;
-  const std::string out = scratch.path + "/help";
-  ASSERT_EQ(std::system((std::string(RAFTKV_NODE_BIN) + " --help >" + out).c_str()), 0);
-  FILE* f = std::fopen(out.c_str(), "r");
-  ASSERT_NE(f, nullptr);
-  std::string text;
-  char buf[256];
-  size_t n;
-  while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
-  std::fclose(f);
-  EXPECT_NE(text.find("--block-cache-bytes"), std::string::npos);
+  const ProgramResult r = RunNode({"--help"});
+  ASSERT_FALSE(r.timed_out);
+  EXPECT_EQ(r.code, 0);
+  EXPECT_NE(r.out.find("--block-cache-bytes"), std::string::npos);
 }
 
 TEST(NodeProgram, InvalidBlockCacheValuesAreRefusedBeforeAnythingStarts) {
   TempDir data;
-  const std::string base = "--id 1 --peers 1=127.0.0.1:1 --client-addr 127.0.0.1:2 --data-dir " + data.path;
+  const std::vector<std::string> base = {"--id", "1", "--peers", "1=127.0.0.1:1", "--client-addr", "127.0.0.1:2",
+                                         "--data-dir", data.path};
+  auto with = [&](std::vector<std::string> extra) {
+    std::vector<std::string> a = base;
+    a.insert(a.end(), extra.begin(), extra.end());
+    return a;
+  };
   for (const char* bad : {"-1", "abc", "1k", "1e6", "0x10", "1.5", "+5", "18446744073709551616",
                           "99999999999999999999999999"}) {
-    std::string err;
-    EXPECT_EQ(RunNode(base + " --block-cache-bytes '" + bad + "'", &err), 2) << bad;
-    EXPECT_NE(err.find("--block-cache-bytes"), std::string::npos) << bad << ": " << err;
+    const ProgramResult r = RunNode(with({"--block-cache-bytes", bad}));
+    EXPECT_EQ(r.code, 2) << bad;
+    EXPECT_NE(r.err.find("--block-cache-bytes"), std::string::npos) << bad << ": " << r.err;
   }
-  std::string err;
-  EXPECT_EQ(RunNode(base + " --block-cache-bytes", &err), 2) << "a missing value";
-  EXPECT_NE(err.find("needs a value"), std::string::npos) << err;
-  EXPECT_EQ(RunNode(base + " --block-cache-bytes ''"), 2) << "an empty value";
+  const ProgramResult missing = RunNode(with({"--block-cache-bytes"}));
+  EXPECT_EQ(missing.code, 2) << "a missing value";
+  EXPECT_NE(missing.err.find("needs a value"), std::string::npos) << missing.err;
+  EXPECT_EQ(RunNode(with({"--block-cache-bytes", ""})).code, 2) << "an empty value";
   EXPECT_FALSE(std::filesystem::exists(data.path + "/kv")) << "a refused command line touched no data";
 }
 #endif

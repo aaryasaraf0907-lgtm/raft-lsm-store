@@ -100,7 +100,7 @@ Run-to-run spread of the LSM amplification (min-max) at trigger 4: fill-seq 2.92
 
 Reading them: with compaction off every byte is written once to the WAL (1.11x: 13 bytes of header on every 116-byte pair) and once to a table (1.09x: the table adds a 9-byte record header, the Bloom filter and the
 index), and the overwrite workload leaves 136 tables because overwrites inside a 1 MiB memtable barely
-collapse. Switching compaction on adds 1-3 further writes of the data to tables, depending on the trigger
+collapse. Switching compaction on adds about 1.7-3.4 further writes of the data to tables, depending on the trigger
 and on the workload: a lower trigger merges more often and writes more (trigger 2: LSM 3.6-4.5 against 2.8-3.5
 at trigger 8), at the price of far fewer tables to read. The tiered policy also merges tables whose key
 ranges do not overlap (an ascending fill still costs 3.0 at trigger 4), which is a property of the policy,
