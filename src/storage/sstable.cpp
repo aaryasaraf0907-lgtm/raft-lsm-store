@@ -444,6 +444,7 @@ Status SSTable::Open(const std::string& path, uint64_t expected_file_number,
 
   t->meta_ = SSTableMeta{file_number, min_seq, max_seq};
   t->entry_count_ = entry_count;
+  t->file_bytes_ = file_size;
   t->index_ = std::move(entries);
   if (cache) {
     t->cache_ = std::move(cache);

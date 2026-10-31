@@ -135,6 +135,9 @@ class SSTable {
   const SSTableMeta& meta() const { return meta_; }
   uint64_t entry_count() const { return entry_count_; }
   uint64_t block_count() const { return index_.size(); }
+  // The size of the whole file in bytes (data blocks, filter, index and footer), as read at Open.
+  // The compaction policy weighs tables by it. The file is immutable, so it never changes.
+  uint64_t file_bytes() const { return file_bytes_; }
 
   // Ordered scan, tombstones included (§11.3). Holds one decoded block at a time and validates
   // each block per §10.2. When Valid() becomes false, status() says why: kOk is a clean end;
@@ -194,6 +197,7 @@ class SSTable {
   int fd_ = -1;
   SSTableMeta meta_;
   uint64_t entry_count_ = 0;
+  uint64_t file_bytes_ = 0;
   std::vector<IndexEntry> index_;
   BloomFilter filter_;
   std::shared_ptr<BlockCache> cache_;  // may be null

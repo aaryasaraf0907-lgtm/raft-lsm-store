@@ -52,12 +52,13 @@ bool DecodeIndex(const std::string& bytes, uint64_t* index) {
   return true;
 }
 
-// The compaction policy. `sizes` are the live SSTables' sizes, oldest first (at least two). Returns
-// how many of the NEWEST tables to merge: the smallest k >= 2 whose combined size is no larger than
-// the table just older than them, or all of them if there is no such k. So a large old table is not
-// rewritten just to absorb a few small new ones; it is merged once the newer data has grown as large
-// as it. The run is always a contiguous run of the newest tables (rule C5), and it includes the
-// oldest table, which is what allows dropping tombstones (C7), only when k is everything.
+// The compaction policy. `sizes` are the live SSTables' sizes in bytes (SSTable::file_bytes()),
+// oldest first (at least two). Returns how many of the NEWEST tables to merge: the smallest k >= 2
+// whose combined size is no larger than the table just older than them, or all of them if there is
+// no such k. So a large old table is not rewritten just to absorb a few small new ones; it is merged
+// once the newer data has grown as large as it. The run is always a contiguous run of the newest
+// tables (rule C5), and it includes the oldest table, which is what allows dropping tombstones (C7),
+// only when k is everything.
 size_t NewestRunToCompact(const std::vector<uint64_t>& sizes) {
   const size_t n = sizes.size();
   uint64_t run = sizes[n - 1];
@@ -778,7 +779,7 @@ void KVEngine::FlushLoop() {
 }
 
 // Merges a run of the newest live SSTables when there are too many (SSTable mode). Which run is the
-// policy above (NewestRunToCompact), sized by each table's entry count.
+// policy above (NewestRunToCompact), sized by each table's file size in bytes.
 //   1. Compact() writes the merged output (published atomically); inputs are untouched
 //   2. store the manifest with the inputs replaced by the output, in their place   <- the commit point
 //   3. delete the input files (readers that already hold them keep reading them)
@@ -806,7 +807,7 @@ void KVEngine::CompactLoop() {
     if (stop_ || dead_) return;
     const size_t n = sstables_.size();
     std::vector<uint64_t> sizes;
-    for (const auto& t : sstables_) sizes.push_back(std::max<uint64_t>(1, t->entry_count()));
+    for (const auto& t : sstables_) sizes.push_back(t->file_bytes());
     const size_t k = NewestRunToCompact(sizes);
     const size_t first = n - k;  // position of the oldest input in sstables_ / manifest_.files
     std::vector<std::shared_ptr<SSTable>> inputs(sstables_.begin() + static_cast<std::ptrdiff_t>(first), sstables_.end());
